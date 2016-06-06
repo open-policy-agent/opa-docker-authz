@@ -1,0 +1,14 @@
+[
+    {
+        "op": "add",
+        "path": "/",
+        "value": {
+            "alice": {
+                "readOnly": false
+            },
+            "bob": {
+                "readOnly": true
+            }
+        }
+    }
+]
