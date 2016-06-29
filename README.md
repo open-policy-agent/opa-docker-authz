@@ -1,8 +1,8 @@
 # Docker Authorization Plugin
 
-This project is used to show how OPA can help policy enable an existing service.
+This project is used to show how OPA can help policy-enable an existing service.
 
-In this example, we policy enable the authorization functionality available in Docker 1.10 and later.
+In this example, we policy-enable the authorization functionality available in Docker 1.10 and later.
 
 ## Usage
 
