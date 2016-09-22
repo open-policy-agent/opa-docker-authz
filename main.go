@@ -81,20 +81,7 @@ func IsAllowed(opaURL string, r authorization.Request) (b bool, e error) {
 // IsUndefined returns true if the http.Response resp from OPA indicates
 // an undefined query result
 func IsUndefined(resp *http.Response) bool {
-
-	if resp.StatusCode == 404 {
-		var v interface{}
-		d := json.NewDecoder(resp.Body)
-		if err := d.Decode(&v); err == nil {
-			if v, ok := v.(map[string]interface{}); ok {
-				if v["IsUndefined"] != nil {
-					return true
-				}
-			}
-		}
-	}
-
-	return false
+	return resp.StatusCode == 404
 }
 
 // LoadPolicy reads the policy definition from the path f and upserts it into OPA.
