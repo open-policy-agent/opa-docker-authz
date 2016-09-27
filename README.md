@@ -6,10 +6,7 @@ In this example, we policy-enable the authorization functionality available in D
 
 ## Usage
 
-### Prerequisites
-
-- GNU Make (optional, required to build the plugin)
-- Docker (1.10 or newer)
+See the [detailed example](http://www.openpolicyagent.org/examples/docker-authorization/) to setup a running example of this plugin.
 
 ### Build
 
