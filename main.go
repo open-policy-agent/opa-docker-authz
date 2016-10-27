@@ -189,7 +189,7 @@ func main() {
 	bindAddr := flag.String("bind-addr", ":8080", "sets the address the plugin will bind to")
 	pluginName := flag.String("plugin-name", "docker-authz-plugin", "sets the plugin name that will be registered with Docker")
 	opaURL := flag.String("opa-url", "http://localhost:8181/v1", "sets the base URL of OPA's HTTP API")
-	policyFile := flag.String("policy-file", "example.rego", "sets the path of the policy file to load")
+	policyFile := flag.String("policy-file", "", "sets the path of the policy file to load")
 	vers := flag.Bool("version", false, "print the version of the plugin")
 
 	flag.Parse()
@@ -202,14 +202,16 @@ func main() {
 	p := DockerAuthZPlugin{*opaURL}
 	h := authorization.NewHandler(p)
 
-	if err := LoadPolicy(*opaURL, *policyFile); err != nil {
-		fmt.Println("Error while loading policy:", err)
-		os.Exit(1)
-	}
+	if *policyFile != "" {
+		if err := LoadPolicy(*opaURL, *policyFile); err != nil {
+			fmt.Println("Error while loading policy:", err)
+			os.Exit(1)
+		}
 
-	if err := WatchPolicy(*opaURL, *policyFile); err != nil {
-		fmt.Println("Error while starting watch:", err)
-		os.Exit(1)
+		if err := WatchPolicy(*opaURL, *policyFile); err != nil {
+			fmt.Println("Error while starting watch:", err)
+			os.Exit(1)
+		}
 	}
 
 	fmt.Println("Starting server.")
