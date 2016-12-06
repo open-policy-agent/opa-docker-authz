@@ -2,4 +2,4 @@
 /.vscode
 
 # Build output
-/docker-authz-plugin
+/opa-docker-authz

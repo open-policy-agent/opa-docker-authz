@@ -1,4 +1,4 @@
-# Docker Authorization Plugin
+# opa-docker-authz
 
 This project is used to show how OPA can help policy-enable an existing service.
 
@@ -13,29 +13,29 @@ See the [detailed example](http://www.openpolicyagent.org/examples/docker-author
 To build the plugin, just run:
 
     $ go get ./...
-    $ go build -o docker-authz-plugin
+    $ go build -o opa-docker-authz
 
 This assumes you are running on Linux and have Go 1.6 or later on your machine. You must have $GOPATH set.
 
 If you are running on OS X and want to cross compile for Linux, you can do so as follows:
 
-    $ docker run -it --rm -v $PWD:/go/src/github.com/open-policy-agent/docker-authz-plugin golang:1.6 bash
-    $ cd /go/src/github.com/open-policy-agent/docker-authz-plugin/
+    $ docker run -it --rm -v $PWD:/go/src/github.com/open-policy-agent/opa-docker-authz golang:1.6 bash
+    $ cd /go/src/github.com/open-policy-agent/opa-docker-authz/
     $ go get ./...
-    $ go build -o docker-authz-plugin
+    $ go build -o opa-docker-authz
     $ exit
 
 ### Install
 
 The plugin can be started with no options. It may require sudo depending on your machine's Docker configuration permissions:
 
-    $ docker-authz-plugin
+    $ opa-docker-authz
 
 - By default, the plugin will listen for requests (from Docker) on :8080 and contacts OPA on :8181.
 
 The following command line argument enables the authorization plugin within Docker:
 
-    --authorization-plugin=docker-authz-plugin
+    --authorization-plugin=opa-docker-authz
 
 On Ubuntu 16.04 this is done by overriding systemd configuration (requires root):
 
@@ -43,7 +43,7 @@ On Ubuntu 16.04 this is done by overriding systemd configuration (requires root)
     $ sudo tee -a /etc/systemd/system/docker.service.d/override.conf > /dev/null <<EOF
     [Service]
     ExecStart=
-    ExecStart=/usr/bin/docker daemon -H fd:// --authorization-plugin=docker-authz-plugin
+    ExecStart=/usr/bin/docker daemon -H fd:// --authorization-plugin=opa-docker-authz
     EOF
     $ sudo systemctl daemon-reload
     $ sudo service docker restart

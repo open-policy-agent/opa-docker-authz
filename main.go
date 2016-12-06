@@ -181,13 +181,13 @@ func QueryDataAPI(opaURL string, doc string, r authorization.Request) (*http.Res
 }
 
 const (
-	version = "0.1.1"
+	version = "0.1.2"
 )
 
 func main() {
 
 	bindAddr := flag.String("bind-addr", ":8080", "sets the address the plugin will bind to")
-	pluginName := flag.String("plugin-name", "docker-authz-plugin", "sets the plugin name that will be registered with Docker")
+	pluginName := flag.String("plugin-name", "opa-docker-authz", "sets the plugin name that will be registered with Docker")
 	opaURL := flag.String("opa-url", "http://localhost:8181/v1", "sets the base URL of OPA's HTTP API")
 	policyFile := flag.String("policy-file", "", "sets the path of the policy file to load")
 	vers := flag.Bool("version", false, "print the version of the plugin")
@@ -216,7 +216,8 @@ func main() {
 
 	fmt.Println("Starting server.")
 
-	if err := h.ServeTCP(*pluginName, *bindAddr); err != nil {
+	// No TLS configuration given for now.
+	if err := h.ServeTCP(*pluginName, *bindAddr, nil); err != nil {
 		fmt.Println("Error while serving HTTP:", err)
 		os.Exit(1)
 	}
