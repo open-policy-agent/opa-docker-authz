@@ -171,17 +171,14 @@ func QueryDataAPI(opaURL string, doc string, r authorization.Request) (*http.Res
 		return nil, err
 	}
 
-	global := url.QueryEscape(string(bs))
-
-	// The policy declares an input named "request" that is intended to contain
-	// the Docker API request.
-	url := fmt.Sprintf("%s/data%s?global=request:%s", opaURL, doc, global)
+	// Set the request document to the Docker request content.
+	url := fmt.Sprintf("%s/data%s?request=:%s", opaURL, doc, url.QueryEscape(string(bs)))
 
 	return http.Get(url)
 }
 
 const (
-	version = "0.1.2"
+	version = "0.1.3"
 )
 
 func main() {
