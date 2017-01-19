@@ -8,9 +8,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
-	"net/url"
 	"os"
+
+	"bytes"
 
 	"github.com/docker/go-plugins-helpers/authorization"
 	"github.com/fsnotify/fsnotify"
@@ -107,7 +109,7 @@ func LoadPolicy(opaURL, f string) error {
 		if err := d.Decode(&e); err != nil {
 			return err
 		}
-		return fmt.Errorf("upsert failed (code: %v): %v", e["Code"], e["Message"])
+		return fmt.Errorf("policy PUT failed (code: %v): %v", e["Code"], e["Message"])
 	}
 
 	return nil
@@ -144,12 +146,25 @@ func WatchPolicy(opaURL, f string) error {
 	return nil
 }
 
-// QueryDataAPI executes a GET request against OPA's Data API. If successful, an http.Response is
-// returned. The doc parameter identifies the document defined by the authorization policy. The
-// query includes the authorization.Request r as input.
+// QueryDataAPI performs a POST against OPA's Data API. If successful, an
+// http.Response is returned. The POST operation is a read-only operation that
+// allows callers to supply an input document. OPA will include the input
+// document when evaluating policies.
 func QueryDataAPI(opaURL string, doc string, r authorization.Request) (*http.Response, error) {
 
-	m := map[string]interface{}{
+	url := fmt.Sprintf("%s/data%s", opaURL, doc)
+	body, err := encodeRequest(r)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return http.Post(url, "application/json", body)
+}
+
+func encodeRequest(r authorization.Request) (io.Reader, error) {
+
+	request := map[string]interface{}{
 		"Headers":    r.RequestHeaders,
 		"Path":       r.RequestURI,
 		"Method":     r.RequestMethod,
@@ -163,22 +178,24 @@ func QueryDataAPI(opaURL string, doc string, r authorization.Request) (*http.Res
 		if err := json.Unmarshal(r.RequestBody, &body); err != nil {
 			return nil, err
 		}
-		m["Body"] = body
+		request["Body"] = body
 	}
 
-	bs, err := json.Marshal(m)
+	var body bytes.Buffer
+
+	err := json.NewEncoder(&body).Encode(map[string]interface{}{
+		"input": request,
+	})
+
 	if err != nil {
 		return nil, err
 	}
 
-	// Set the request document to the Docker request content.
-	url := fmt.Sprintf("%s/data%s?request=:%s", opaURL, doc, url.QueryEscape(string(bs)))
-
-	return http.Get(url)
+	return &body, nil
 }
 
 const (
-	version = "0.1.3"
+	version = "0.1.4"
 )
 
 func main() {
