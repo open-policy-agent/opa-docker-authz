@@ -6,6 +6,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -104,12 +105,27 @@ func LoadPolicy(opaURL, f string) error {
 	}
 
 	if resp.StatusCode != 200 {
-		d := json.NewDecoder(resp.Body)
+
 		var e map[string]interface{}
-		if err := d.Decode(&e); err != nil {
+
+		if err := json.NewDecoder(resp.Body).Decode(&e); err != nil {
 			return err
 		}
-		return fmt.Errorf("policy PUT failed (code: %v): %v", e["Code"], e["Message"])
+
+		msg := fmt.Sprintf("policy upsert failed (code %v): %v", e["code"], e["message"])
+
+		if errs, ok := e["errors"].([]interface{}); ok {
+			msg += ":\n"
+			for i := range errs {
+				bs, err := json.Marshal(errs[i])
+				if err != nil {
+					return err
+				}
+				msg += string(bs) + "\n"
+			}
+		}
+
+		return errors.New(msg)
 	}
 
 	return nil
