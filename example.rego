@@ -10,8 +10,7 @@ package opa.example
 
 # The "import" directive declares a dependency on a document outside this
 # package. The import directive is used to declare dependencies on both
-# input documents AND documents stored in OPA (e.g., data.users below).
-import request as req
+# input documents and documents stored in OPA (e.g., data.users below).
 import data.users
 
 # allow_request defines a document that is the boolean value true if (and only if)
@@ -27,21 +26,21 @@ invalid_network :-
     # These expressions assert that a container with a special label must be
     # connected to a specific network.
     labels["com.example/deployment"] = "prod",
-    req.Path = "/v1.23/containers/create",
-    req.Body.HostConfig.NetworkMode != "prod-network"
+    input.Path = "/v1.23/containers/create",
+    input.Body.HostConfig.NetworkMode != "prod-network"
 
 seccomp_unconfined :-
     # This expression asserts that the string on the right hand side exists
     # within the array SecurityOpt referenced on the left hand side.
-    req.Path = "/v1.23/containers/create",
-    req.Body.HostConfig.SecurityOpt[_] = "seccomp=unconfined"
+    input.Path = "/v1.23/containers/create",
+    input.Body.HostConfig.SecurityOpt[_] = "seccomp=unconfined"
 
 # valid_user_role defines a document that is the boolean value true if this is
 # a write request and the user is allowed to perform writes.
 valid_user_role :-
-    req.Headers["Authz-User"] = user_id,
+    input.Headers["Authz-User"] = user_id,
     users[user_id] = user,
-    req.Method != "GET",
+    input.Method != "GET",
     user.readOnly = false
 
 # valid_user_role is defined again here to handle read requests. When a rule
@@ -49,10 +48,10 @@ valid_user_role :-
 # only one instance evaluates successfully in a given query. If multiple
 # instances evaluated successfully, it indicates a conflict.
 valid_user_role :-
-    req.Headers["Authz-User"] = user_id,
-    req.Method = "GET",
+    input.Headers["Authz-User"] = user_id,
+    input.Method = "GET",
     users[user_id] = user
 
 # labels defines an object document that simply contains the labels from the
 # requested container.
-labels[key] = value :- req.Body.Labels[key] = value
+labels[key] = value :- input.Body.Labels[key] = value

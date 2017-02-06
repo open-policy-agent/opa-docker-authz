@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 
 	"bytes"
 
@@ -57,34 +58,22 @@ func (p DockerAuthZPlugin) AuthZRes(r authorization.Request) authorization.Respo
 // occurs, the request will be rejected.
 func IsAllowed(opaURL string, r authorization.Request) (b bool, e error) {
 
-	// Query OPA to see if the request should be allowed.
-	resp, err := QueryDataAPI(opaURL, "/opa/example/allow_request", r)
+	doc, err := GetDocument(opaURL, "/opa/example/allow_request", r)
+
 	if err != nil {
+		if _, ok := err.(Undefined); ok {
+			return false, nil
+		}
 		return false, err
 	}
 
-	// If the request succeeded, the request should be allowed.
-	if resp.StatusCode == 200 {
-		return true, nil
+	b, ok := doc.(bool)
+
+	if !ok {
+		return false, fmt.Errorf("unexpected result of type %T", doc)
 	}
 
-	// If the response is undefined, the request should be rejected.
-	if IsUndefined(resp) {
-		return false, nil
-	}
-
-	// Othewrise, an error occured so reject the request and include an error message.
-	if resp.StatusCode == 404 {
-		return false, fmt.Errorf("policy does not exist")
-	}
-
-	return false, fmt.Errorf("unexpected error: %v", resp)
-}
-
-// IsUndefined returns true if the http.Response resp from OPA indicates
-// an undefined query result
-func IsUndefined(resp *http.Response) bool {
-	return resp.StatusCode == 404
+	return b, nil
 }
 
 // LoadPolicy reads the policy definition from the path f and upserts it into OPA.
@@ -162,20 +151,52 @@ func WatchPolicy(opaURL, f string) error {
 	return nil
 }
 
-// QueryDataAPI performs a POST against OPA's Data API. If successful, an
-// http.Response is returned. The POST operation is a read-only operation that
-// allows callers to supply an input document. OPA will include the input
-// document when evaluating policies.
-func QueryDataAPI(opaURL string, doc string, r authorization.Request) (*http.Response, error) {
+// Undefined signals that the document is not defined.
+type Undefined struct{}
 
-	url := fmt.Sprintf("%s/data%s", opaURL, doc)
+func (Undefined) Error() string {
+	return "<undefined>"
+}
+
+// GetDocument returns the document referred to by path. The input document will
+// be set to r. If the document referred to by path is undefined, the error will
+// be set to Undefined.
+func GetDocument(opaURL string, path string, r authorization.Request) (interface{}, error) {
+
+	url := fmt.Sprintf("%s/data%s", opaURL, path)
 	body, err := encodeRequest(r)
 
 	if err != nil {
 		return nil, err
 	}
 
-	return http.Post(url, "application/json", body)
+	resp, err := http.Post(url, "application/json", body)
+
+	if err != nil {
+		return nil, err
+	}
+
+	contentType := resp.Header.Get("content-type")
+
+	if !strings.Contains(contentType, "application/json") {
+		return nil, fmt.Errorf("unexpected content-type: %v", contentType)
+	}
+
+	var result dataResponseV1
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	if result.Result == nil {
+		return nil, Undefined{}
+	}
+
+	return *result.Result, nil
+}
+
+type dataResponseV1 struct {
+	Result *interface{} `json:"result"`
 }
 
 func encodeRequest(r authorization.Request) (io.Reader, error) {
