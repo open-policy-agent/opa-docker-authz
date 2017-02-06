@@ -10,20 +10,9 @@ See the [detailed example](http://www.openpolicyagent.org/examples/docker-author
 
 ### Build
 
-To build the plugin, just run:
+To build the plugin, run (requires Docker):
 
-    $ go get ./...
-    $ go build -o opa-docker-authz
-
-This assumes you are running on Linux and have Go 1.6 or later on your machine. You must have $GOPATH set.
-
-If you are running on OS X and want to cross compile for Linux, you can do so as follows:
-
-    $ docker run -it --rm -v $PWD:/go/src/github.com/open-policy-agent/opa-docker-authz golang:1.6 bash
-    $ cd /go/src/github.com/open-policy-agent/opa-docker-authz/
-    $ go get ./...
-    $ go build -o opa-docker-authz
-    $ exit
+    $ make
 
 ### Install
 
