@@ -1,0 +1,8 @@
+package: github.com/open-policy-agent/opa-docker-authz
+import:
+- package: github.com/docker/go-plugins-helpers
+  version: bd8c600f0cdd76c7a57ff6aa86bd2b423868c688
+  subpackages:
+  - authorization
+- package: github.com/fsnotify/fsnotify
+  version: 4da3e2cfbabc9f751898f250b49f2439785783a1

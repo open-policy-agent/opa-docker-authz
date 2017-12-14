@@ -268,7 +268,7 @@ func main() {
 	fmt.Println("Starting server.")
 
 	// No TLS configuration given for now.
-	if err := h.ServeTCP(*pluginName, *bindAddr, nil); err != nil {
+	if err := h.ServeTCP(*pluginName, *bindAddr, "", nil); err != nil {
 		fmt.Println("Error while serving HTTP:", err)
 		os.Exit(1)
 	}
