@@ -3,3 +3,4 @@
 
 # Build output
 /opa-docker-authz
+/vendor
