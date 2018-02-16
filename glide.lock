@@ -1,12 +1,14 @@
-hash: 19c9a06c02290bc91bdfd7361eb8121aa59cff9ce991565ce35c32688d476bf9
-updated: 2017-12-14T10:50:28.969428519-08:00
+hash: 19293eb44aec5bcb77cdc582c3444febeb25d7270c904516d01cafc56719260d
+updated: 2018-02-16T08:20:55.852826-08:00
 imports:
 - name: github.com/coreos/go-systemd
-  version: c966a8af8422394b2e370d90e2101adba21c14be
+  version: 25fe332a900022d06a189ce01108392854c59df1
   subpackages:
   - activation
+- name: github.com/dchest/siphash
+  version: 4ebf1de738443ea7f45f02dc394c4df1942a126d
 - name: github.com/docker/go-connections
-  version: 3ede32e2033de7505e6500d6c868c2b9ed9f169d
+  version: 7beb39f0b969b075d1325fecb092faf27fd357b6
   subpackages:
   - sockets
 - name: github.com/docker/go-plugins-helpers
@@ -16,15 +18,32 @@ imports:
   - sdk
 - name: github.com/fsnotify/fsnotify
   version: 4da3e2cfbabc9f751898f250b49f2439785783a1
+- name: github.com/ghodss/yaml
+  version: 0ca9ea5df5451ffdf184b4428c902747c2c11cd7
 - name: github.com/Microsoft/go-winio
-  version: 78439966b38d69bf38227fbf57ac8a6fee70f69a
+  version: 7da180ee92d8bd8bb8c37fc560e673e6557c392f
+- name: github.com/open-policy-agent/opa
+  version: 43fcc6ae25d1aacab0649caf022d7e6209d7f8a7
+  subpackages:
+  - ast
+  - metrics
+  - rego
+  - storage
+  - storage/inmem
+  - topdown
+  - topdown/builtins
+  - types
+  - util
+- name: github.com/pkg/errors
+  version: 30136e27e2ac8d167177e8a583aa4c3fea5be833
 - name: golang.org/x/net
-  version: d866cfc389cec985d6fda2859936a575a55a3ab6
+  version: 1c05540f6879653db88113bc4a2b70aec4bd491f
   subpackages:
   - proxy
 - name: golang.org/x/sys
-  version: 1d2aa6dbdea45adaaebb9905d0666e4537563829
+  version: 37707fdb30a5b38865cfb95e5aab41707daec7fd
   subpackages:
-  - unix
   - windows
+- name: gopkg.in/yaml.v2
+  version: d670f9405373e636a5a2765eea47fac0c9bc91a4
 testImports: []

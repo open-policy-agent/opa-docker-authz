@@ -5,39 +5,37 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
+	"io/ioutil"
+	"log"
 	"os"
-	"strings"
-
-	"bytes"
 
 	"github.com/docker/go-plugins-helpers/authorization"
-	"github.com/fsnotify/fsnotify"
+	"github.com/open-policy-agent/opa/rego"
 )
 
-// DockerAuthZPlugin implements the authorization.Plugin interface.
-// Every request received by the Docker daemon will be forwarded to the
-// AuthZReq function. The AuthZReq function returns a response that indicates
-// whether the request should be allowed or denied.
+// DockerAuthZPlugin implements the authorization.Plugin interface. Every
+// request received by the Docker daemon will be forwarded to the AuthZReq
+// function. The AuthZReq function returns a response that indicates whether
+// the request should be allowed or denied.
 type DockerAuthZPlugin struct {
-	opaURL string
+	policyFile string
+	allowPath  string
 }
 
-// AuthZReq is called when the Docker daemon receives an API request.
-// AuthZReq returns an authorization.Response that indicates whether the request should be
-// allowed or denied.
+// AuthZReq is called when the Docker daemon receives an API request. AuthZReq
+// returns an authorization.Response that indicates whether the request should
+// be allowed or denied.
 func (p DockerAuthZPlugin) AuthZReq(r authorization.Request) authorization.Response {
 
-	fmt.Println("Received request from Docker:", r)
+	ctx := context.Background()
 
-	b, err := IsAllowed(p.opaURL, r)
+	allowed, err := p.evaluate(ctx, r)
 
-	if b {
+	if allowed {
 		return authorization.Response{Allow: true}
 	} else if err != nil {
 		return authorization.Response{Err: err.Error()}
@@ -52,224 +50,102 @@ func (p DockerAuthZPlugin) AuthZRes(r authorization.Request) authorization.Respo
 	return authorization.Response{Allow: true}
 }
 
-// IsAllowed queries the policy that was loaded into OPA and returns (true, nil) if the
-// request should be allowed. If the request is not allowed, b will be false and e will
-// be set to indicate if an error occurred. This function "fails closed" meaning if an error
-// occurs, the request will be rejected.
-func IsAllowed(opaURL string, r authorization.Request) (b bool, e error) {
+func (p DockerAuthZPlugin) evaluate(ctx context.Context, r authorization.Request) (bool, error) {
 
-	doc, err := GetDocument(opaURL, "/opa/example/allow_request", r)
-
+	bs, err := ioutil.ReadFile(p.policyFile)
 	if err != nil {
-		if _, ok := err.(Undefined); ok {
-			return false, nil
-		}
 		return false, err
 	}
 
-	b, ok := doc.(bool)
-
-	if !ok {
-		return false, fmt.Errorf("unexpected result of type %T", doc)
-	}
-
-	return b, nil
-}
-
-// LoadPolicy reads the policy definition from the path f and upserts it into OPA.
-func LoadPolicy(opaURL, f string) error {
-	r, err := os.Open(f)
+	input, err := makeInput(r)
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	req, err := http.NewRequest("PUT", opaURL+"/policies/example_policy", r)
-	if err != nil {
-		return err
-	}
+	pretty, _ := json.MarshalIndent(input, "", "  ")
+	log.Printf("Querying OPA policy %v. Input: %s", p.allowPath, pretty)
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
+	allowed, err := func() (bool, error) {
 
-	if resp.StatusCode != 200 {
+		eval := rego.New(
+			rego.Query(p.allowPath),
+			rego.Input(input),
+			rego.Module(p.policyFile, string(bs)),
+		)
 
-		var e map[string]interface{}
-
-		if err := json.NewDecoder(resp.Body).Decode(&e); err != nil {
-			return err
+		rs, err := eval.Eval(ctx)
+		if err != nil {
+			return false, err
 		}
 
-		msg := fmt.Sprintf("policy upsert failed (code %v): %v", e["code"], e["message"])
-
-		if errs, ok := e["errors"].([]interface{}); ok {
-			msg += ":\n"
-			for i := range errs {
-				bs, err := json.Marshal(errs[i])
-				if err != nil {
-					return err
-				}
-				msg += string(bs) + "\n"
-			}
+		if len(rs) == 0 {
+			// Decision is undefined. Fallback to deny.
+			return false, nil
 		}
 
-		return errors.New(msg)
-	}
-
-	return nil
-}
-
-// WatchPolicy creates a filesystem watch on the path f and waits for changes. When the
-// file changes, LoadPolicy is called with the path f.
-func WatchPolicy(opaURL, f string) error {
-
-	w, err := fsnotify.NewWatcher()
-	if err != nil {
-		return err
-	}
-
-	go func() {
-		for {
-			select {
-			case evt := <-w.Events:
-				if evt.Op&fsnotify.Write != 0 {
-					if err := LoadPolicy(opaURL, f); err != nil {
-						fmt.Println("Error reloading policy definition:", err)
-					} else {
-						fmt.Println("Reloaded policy definition.")
-					}
-				}
-			}
+		allowed, ok := rs[0].Expressions[0].Value.(bool)
+		if !ok {
+			return false, fmt.Errorf("administrative policy decision invalid")
 		}
+
+		return allowed, nil
+
 	}()
 
-	if err := w.Add(f); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// Undefined signals that the document is not defined.
-type Undefined struct{}
-
-func (Undefined) Error() string {
-	return "<undefined>"
-}
-
-// GetDocument returns the document referred to by path. The input document will
-// be set to r. If the document referred to by path is undefined, the error will
-// be set to Undefined.
-func GetDocument(opaURL string, path string, r authorization.Request) (interface{}, error) {
-
-	url := fmt.Sprintf("%s/data%s", opaURL, path)
-	body, err := encodeRequest(r)
-
 	if err != nil {
-		return nil, err
+		log.Printf("Returning OPA policy decision: %v (error: %v)", allowed, err)
+	} else {
+		log.Printf("Returning OPA policy decision: %v", allowed)
 	}
 
-	resp, err := http.Post(url, "application/json", body)
-
-	if err != nil {
-		return nil, err
-	}
-
-	contentType := resp.Header.Get("content-type")
-
-	if !strings.Contains(contentType, "application/json") {
-		return nil, fmt.Errorf("unexpected content-type: %v", contentType)
-	}
-
-	var result dataResponseV1
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-
-	if result.Result == nil {
-		return nil, Undefined{}
-	}
-
-	return *result.Result, nil
+	return allowed, err
 }
 
-type dataResponseV1 struct {
-	Result *interface{} `json:"result"`
-}
+func makeInput(r authorization.Request) (interface{}, error) {
 
-func encodeRequest(r authorization.Request) (io.Reader, error) {
+	var body interface{}
 
-	request := map[string]interface{}{
+	if r.RequestHeaders["Content-Type"] == "application/json" {
+		if err := json.Unmarshal(r.RequestBody, &body); err != nil {
+			return nil, err
+		}
+	}
+
+	input := map[string]interface{}{
 		"Headers":    r.RequestHeaders,
 		"Path":       r.RequestURI,
 		"Method":     r.RequestMethod,
-		"Body":       r.RequestBody,
+		"Body":       body,
 		"User":       r.User,
 		"AuthMethod": r.UserAuthNMethod,
 	}
 
-	if r.RequestHeaders["Content-Type"] == "application/json" {
-		var body interface{}
-		if err := json.Unmarshal(r.RequestBody, &body); err != nil {
-			return nil, err
-		}
-		request["Body"] = body
-	}
-
-	var body bytes.Buffer
-
-	err := json.NewEncoder(&body).Encode(map[string]interface{}{
-		"input": request,
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	return &body, nil
+	return input, nil
 }
 
-const (
-	version = "0.1.6"
-)
+// Version is set by the build.
+var Version = ""
 
 func main() {
 
-	bindAddr := flag.String("bind-addr", ":8080", "sets the address the plugin will bind to")
 	pluginName := flag.String("plugin-name", "opa-docker-authz", "sets the plugin name that will be registered with Docker")
-	opaURL := flag.String("opa-url", "http://localhost:8181/v1", "sets the base URL of OPA's HTTP API")
-	policyFile := flag.String("policy-file", "", "sets the path of the policy file to load")
-	vers := flag.Bool("version", false, "print the version of the plugin")
+	allowPath := flag.String("allowPath", "data.docker.authz.allow", "sets the path of the allow decision in OPA")
+	policyFile := flag.String("policy-file", "policy.rego", "sets the path of the policy file to load")
+	version := flag.Bool("version", false, "print the version of the plugin")
 
 	flag.Parse()
 
-	if *vers {
-		fmt.Println(version)
+	if *version {
+		fmt.Println(Version)
 		os.Exit(0)
 	}
 
-	p := DockerAuthZPlugin{*opaURL}
+	p := DockerAuthZPlugin{
+		policyFile: *policyFile,
+		allowPath:  *allowPath,
+	}
+
 	h := authorization.NewHandler(p)
-
-	if *policyFile != "" {
-		if err := LoadPolicy(*opaURL, *policyFile); err != nil {
-			fmt.Println("Error while loading policy:", err)
-			os.Exit(1)
-		}
-
-		if err := WatchPolicy(*opaURL, *policyFile); err != nil {
-			fmt.Println("Error while starting watch:", err)
-			os.Exit(1)
-		}
-	}
-
-	fmt.Println("Starting server.")
-
-	// No TLS configuration given for now.
-	if err := h.ServeTCP(*pluginName, *bindAddr, "", nil); err != nil {
-		fmt.Println("Error while serving HTTP:", err)
-		os.Exit(1)
-	}
+	log.Println("Starting server.")
+	h.ServeUnix(*pluginName, 0)
 }
