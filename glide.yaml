@@ -6,3 +6,5 @@ import:
   - authorization
 - package: github.com/fsnotify/fsnotify
   version: 4da3e2cfbabc9f751898f250b49f2439785783a1
+- package: github.com/open-policy-agent/opa
+  version: v0.6.0
