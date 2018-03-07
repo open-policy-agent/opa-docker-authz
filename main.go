@@ -105,7 +105,7 @@ func makeInput(r authorization.Request) (interface{}, error) {
 
 	var body interface{}
 
-	if r.RequestHeaders["Content-Type"] == "application/json" {
+	if r.RequestHeaders["Content-Type"] == "application/json" && len(r.RequestBody) > 0 {
 		if err := json.Unmarshal(r.RequestBody, &body); err != nil {
 			return nil, err
 		}

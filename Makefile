@@ -1,6 +1,6 @@
 .PHONY: all build
 
-VERSION := 0.2
+VERSION := 0.2.1
 
 all: build
 
