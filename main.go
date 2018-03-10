@@ -15,6 +15,8 @@ import (
 
 	"github.com/docker/go-plugins-helpers/authorization"
 	"github.com/open-policy-agent/opa/rego"
+	"github.com/open-policy-agent/opa/ast"
+	"github.com/open-policy-agent/opa/loader"
 )
 
 // DockerAuthZPlugin implements the authorization.Plugin interface. Every
@@ -123,6 +125,34 @@ func makeInput(r authorization.Request) (interface{}, error) {
 	return input, nil
 }
 
+func regoSyntax(p string) int {
+
+	stuffs := []string{p}
+
+	result, err := loader.AllRegos(stuffs)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+
+	modules := map[string]*ast.Module{}
+
+	for _,m := range result.Modules {
+		modules[m.Name] = m.Parsed
+	}
+
+	compiler := ast.NewCompiler().SetErrorLimit(0)
+
+	if compiler.Compile(modules); compiler.Failed() {
+		for _, err := range compiler.Errors {
+			fmt.Fprintln(os.Stderr, err)
+		}
+		return 1
+	}
+
+	return 0
+}
+
 // Version is set by the build.
 var Version = ""
 
@@ -132,6 +162,7 @@ func main() {
 	allowPath := flag.String("allowPath", "data.docker.authz.allow", "sets the path of the allow decision in OPA")
 	policyFile := flag.String("policy-file", "policy.rego", "sets the path of the policy file to load")
 	version := flag.Bool("version", false, "print the version of the plugin")
+	check := flag.Bool("check", false , "checks the syntax of the policy-file")
 
 	flag.Parse()
 
@@ -143,6 +174,10 @@ func main() {
 	p := DockerAuthZPlugin{
 		policyFile: *policyFile,
 		allowPath:  *allowPath,
+	}
+
+	if *check {
+		os.Exit(regoSyntax(*policyFile))
 	}
 
 	h := authorization.NewHandler(p)
