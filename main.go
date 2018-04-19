@@ -14,9 +14,10 @@ import (
 	"os"
 
 	"github.com/docker/go-plugins-helpers/authorization"
-	"github.com/open-policy-agent/opa/rego"
+	version_pkg "github.com/open-policy-agent/opa-docker-authz/version"
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/loader"
+	"github.com/open-policy-agent/opa/rego"
 )
 
 // DockerAuthZPlugin implements the authorization.Plugin interface. Every
@@ -137,7 +138,7 @@ func regoSyntax(p string) int {
 
 	modules := map[string]*ast.Module{}
 
-	for _,m := range result.Modules {
+	for _, m := range result.Modules {
 		modules[m.Name] = m.Parsed
 	}
 
@@ -153,21 +154,19 @@ func regoSyntax(p string) int {
 	return 0
 }
 
-// Version is set by the build.
-var Version = ""
-
 func main() {
 
 	pluginName := flag.String("plugin-name", "opa-docker-authz", "sets the plugin name that will be registered with Docker")
 	allowPath := flag.String("allowPath", "data.docker.authz.allow", "sets the path of the allow decision in OPA")
 	policyFile := flag.String("policy-file", "policy.rego", "sets the path of the policy file to load")
 	version := flag.Bool("version", false, "print the version of the plugin")
-	check := flag.Bool("check", false , "checks the syntax of the policy-file")
+	check := flag.Bool("check", false, "checks the syntax of the policy-file")
 
 	flag.Parse()
 
 	if *version {
-		fmt.Println(Version)
+		fmt.Println("Version:", version_pkg.Version)
+		fmt.Println("OPA Version:", version_pkg.OPAVersion)
 		os.Exit(0)
 	}
 
