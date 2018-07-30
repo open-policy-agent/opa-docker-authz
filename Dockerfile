@@ -1,7 +1,18 @@
-FROM alpine
+FROM alpine AS default-policy
 
-MAINTAINER Torin Sandall <torinsandall@gmail.com>
+RUN echo -e 'package docker.authz\n\
+allow = true'\
+>> /default.rego
 
-ADD opa-docker-authz /opa-docker-authz
+FROM scratch AS image
+
+LABEL maintainer="Torin Sandall <torinsandall@gmail.com>"
+
+COPY opa-docker-authz /opa-docker-authz
 
 ENTRYPOINT ["/opa-docker-authz"]
+
+FROM image
+
+COPY --from=default-policy /default.rego /default.rego
+

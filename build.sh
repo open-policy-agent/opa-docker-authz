@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 
-set -ex
+set -e
 
-echo "building version: $VERSION"
+echo "Building opa-docker-authz version: $VERSION"
 
-cd /go/src/github.com/open-policy-agent/opa-docker-authz
+echo -e "\nInstalling glide ..."
+curl -s https://glide.sh/get | sh
 
-echo "install glide"
-curl https://glide.sh/get | sh
-
-echo "install all the dependencies"
+echo -e "\nInstalling all the dependencies ..."
 glide install
 
-OPA_VERSION=$(grep 'package: github.com/open-policy-agent/opa$' glide.yaml -A 1 | tail -n 1 | awk '{print $2}')
+echo -e "\nSetting OPA version to $OPA_VERSION ..."
+sed -i "s/\(  version: v\)[0-9]\.[0-9]\.[0-9]/\1$OPA_VERSION/g" glide.yaml
 
-echo "build opa-docker-authz"
-CGO_ENABLED=0 go build -ldflags "-X github.com/open-policy-agent/opa-docker-authz/version.Version=$VERSION -X github.com/open-policy-agent/opa-docker-authz/version.OPAVersion=$OPA_VERSION" -o opa-docker-authz
+echo -e "\nBuilding opa-docker-authz ..."
+CGO_ENABLED=0 go build -ldflags \
+    "-X github.com/open-policy-agent/opa-docker-authz/version.Version=$VERSION -X github.com/open-policy-agent/opa-docker-authz/version.OPAVersion=$OPA_VERSION" \
+    -o opa-docker-authz
+
+echo -e "\n... done!"
