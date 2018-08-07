@@ -8,7 +8,7 @@
         "name": "opa-args",
         "description": "Arguments for opa-docker-authz",
         "settable": ["value"],
-        "value": ["-policy-file", "/default.rego"]
+        "value": ["-policy-file", "policy.rego"]
     },
     "interface": {
         "socket": "opa-docker-authz.sock",
@@ -23,5 +23,6 @@
             "options": ["bind", "ro"],
             "settable": ["source"]
        } 
-    ]
+    ],
+    "workdir": "/opa"
 }

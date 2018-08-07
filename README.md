@@ -24,20 +24,26 @@ To make use of the `opa-docker-authz` plugin, [TLS must be enabled](https://docs
 
 **Managed Plugin**
 
-The managed plugin is configured with some default policy, which simply allows all Docker client API calls, irrespective of user. The following steps detail how to install the managed plugin.
+The managed plugin is a special pre-built Docker image, and as such, has no prior knowledge of the user's intended policy. OPA policy is defined using the [Rego language](https://www.openpolicyagent.org/docs/language-reference.html), which for the purposes of the `opa-docker-authz` plugin, is contained within a file. The plugin needs to be made aware of the location of the policy file, during its installation.
 
-Download the `opa-docker-authz` plugin from the Docker Hub (depending on how your Docker environment is configured, you may need to execute the following commands using the `sudo` utility):
+ In order to provide user-defined OPA policy, the plugin is configured with a bind mount; `/etc/docker` is mounted at `/opa` inside the plugin's container, which is its working directory. If you define your policy in a file located at the path `/etc/docker/policies/authz.rego`, for example, it will be available to the plugin at `/opa/policies/authz.rego`.
+
+If the plugin is installed without a reference to a Rego policy file, all authorization requests sent to the plugin by the Docker daemon, fail open, and are authorized by the plugin.
+
+The following steps detail how to install the managed plugin.
+
+Download the `opa-docker-authz` plugin from the Docker Hub (depending on how your Docker environment is configured, you may need to execute the following commands using the `sudo` utility), and specify the location of the policy file, using the `opa-args` key, and an appropriate value:
 
 ```
-$ docker plugin install openpolicyagent/opa-docker-authz:0.2.2 --alias opa-docker-authz
-Plugin "openpolicyagent/opa-docker-authz:0.2.2" is requesting the following privileges:
+$ docker plugin install --alias opa-docker-authz openpolicyagent/opa-docker-authz-v2:0.2.2 opa-args="-policy-file /opa/policies/authz.rego"
+Plugin "openpolicyagent/opa-docker-authz-v2:0.2.2" is requesting the following privileges:
  - mount: [/etc/docker]
 Do you grant the above permissions? [y/N] y
-0.2.2: Pulling from openpolicyagent/opa-docker-authz
-63ee1bb73b80: Download complete 
-Digest: sha256:f76ed8a2fa08d1c144ddf14b9c872590bc5021482602b182b7035255fc8975ab
-Status: Downloaded newer image for openpolicyagent/opa-docker-authz:0.2.2
-Installed plugin openpolicyagent/opa-docker-authz:0.2.2
+0.2.2: Pulling from openpolicyagent/opa-docker-authz-v2
+76fd01afa06c: Download complete
+Digest: sha256:268b679ce15f299ef10a9894d2db5fb1b56a8de9b86348454de6feb27b52c907
+Status: Downloaded newer image for openpolicyagent/opa-docker-authz-v2:0.2.2
+Installed plugin openpolicyagent/opa-docker-authz-v2:0.2.2
 ```
 
 Check the plugin is installed and enabled:
@@ -45,7 +51,7 @@ Check the plugin is installed and enabled:
 ```
 $ docker plugin ls --format 'table {{.ID}}\t{{.Name}}\t{{.Enabled}}'
 ID                  NAME                      ENABLED
-ef6e3b335fa9        opa-docker-authz:latest   true
+cab1329e2a5a        opa-docker-authz:latest   true
 ```
 
 With the plugin installed and enabled, the Docker daemon needs to be configured to make use of the plugin. There are a couple of ways of doing this, but perhaps the easiest is to add a configuration option to the daemon's configuration file (usually `/etc/docker/daemon.json`):
@@ -64,23 +70,14 @@ $ sudo kill -HUP $(pidof dockerd)
 
 The Docker daemon will now send authorization requests for all Docker client API calls, to the `opa-docker-authz` plugin, for evaluation.
 
-Of course, the default policy is of little use, as it simply allows all requests to be authorized. To enable custom policy use for `opa-docker-authz`, the plugin is configured with a bind mount; `/etc/docker` is mounted at `/opa` inside the plugin's container. If you define your policy in a file located at the path `/etc/docker/policies/authz.rego`, for example, it will be available to the plugin at `/opa/policies/authz.rego`.
-
-To have the `opa-docker-authz` plugin make use of the user-defined policy, specify the additional arguments during plugin installation:
-
-```
-$ docker plugin install openpolicyagent/opa-docker-authz:0.2.2 \
-    opa-args="-policy-file /opa/policies/authz.rego" \
-    --alias opa-docker-authz
-```
-
 If an alternate host location is preferred for the bind mount, then it's possible to set the source during plugin installation. For example, if policy files are located in `$HOME/opa/policies`, then a policy file called `authz.rego` can be made available to the plugin, with the following:
 
 ```
-$ docker plugin install openpolicyagent/opa-docker-authz:0.2.2 \
+$ docker plugin install --alias opa-docker-authz \
+    openpolicyagent-v2/opa-docker-authz:0.2.2 \
     policy.source=$HOME/opa/policies \
-    opa-args="-policy-file /opa/authz.rego" \
-    --alias opa-docker-authz
+    opa-args="-policy-file /opa/authz.rego"
+
 ```
 
 **Legacy Plugin**
@@ -94,8 +91,41 @@ $ docker container run -d --restart=always --name opa-docker-authz \
     openpolicyagent/opa-docker-authz:0.2.2 -policy-file /opa/authz.rego
 ```
 
+### Logs
+
+The activity describing the interaction between the Docker daemon and the authorization plugin, and the authorization decisions made by OPA, can be found in the daemon's logs. Their [location](https://docs.docker.com/config/daemon/#read-the-logs) is dependent on the host operating system configuration.
+
+The following is an abbreviated extract from a Docker daemon log, showing the `opa-docker-authz` plugin evaluating an authorization request sent by the Docker daemon, in response to a user issuing the `docker info` command:
+
+```
+msg="2018/08/07 14:33:48 Querying OPA policy data.docker.authz.allow. Input: {" plugin=cab132....
+msg="  \"AuthMethod\": \"TLS\"," plugin=cab132....
+msg="  \"Body\": null," plugin=cab132....
+msg="  \"Headers\": {" plugin=cab132....
+msg="    \"Accept-Encoding\": \"gzip\"," plugin=cab132....
+msg="    \"User-Agent\": \"Docker-Client/18.06.0-ce (linux)\"" plugin=cab132....
+msg="  }," plugin=cab132....
+msg="  \"Method\": \"GET\"," plugin=cab132....
+msg="  \"Path\": \"/_ping\"," plugin=cab132....
+msg="  \"User\": \"rackham\"" plugin=cab132....
+msg="}" plugin=cab132....
+msg="2018/08/07 14:33:48 Returning OPA policy decision: true" plugin=cab132....
+msg="2018/08/07 14:33:48 Querying OPA policy data.docker.authz.allow. Input: {" plugin=cab132....
+msg="  \"AuthMethod\": \"TLS\"," plugin=cab132....
+msg="  \"Body\": null," plugin=cab132....
+msg="  \"Headers\": {" plugin=cab132....
+msg="    \"Accept-Encoding\": \"gzip\"," plugin=cab132....
+msg="    \"User-Agent\": \"Docker-Client/18.06.0-ce (linux)\"" plugin=cab132....
+msg="  }," plugin=cab132....
+msg="  \"Method\": \"GET\"," plugin=cab132....
+msg="  \"Path\": \"/v1.38/info\"," plugin=cab132....
+msg="  \"User\": \"rackham\"" plugin=cab132....
+msg="}" plugin=cab132....
+msg="2018/08/07 14:33:48 Returning OPA policy decision: true" plugin=cab132....
+```
+
 ### Uninstall
 
 Uninstalling the `opa-docker-authz` plugin is the reverse of installing. First, remove the configuration applied to the Docker daemon, not forgetting to send a `HUP` signal to the daemon's process.
 
-If you're using the legacy plugin, use the `docker container rm -f opa-docker-authz` command to remove the plugin. Otherwise, use the `docker plugin rm -f opa-docker-authz` to remove the managed plugin.
+If you're using the legacy plugin, use the `docker container rm -f opa-docker-authz` command to remove the plugin. Otherwise, use the `docker plugin rm -f opa-docker-authz` command to remove the managed plugin.

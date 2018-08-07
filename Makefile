@@ -4,6 +4,7 @@ VERSION := 0.2.2
 OPA_VERSION := 0.8.0
 GO_VERSION := 1.10
 REPO := openpolicyagent/opa-docker-authz
+DOCKER_VERSION := $(shell docker version --format '{{.Server.Version}}')
 
 all: build
 
@@ -15,32 +16,41 @@ build:
 		-w /go/src/github.com/open-policy-agent/opa-docker-authz \
 		golang:$(GO_VERSION) \
 		./build.sh
-	@sudo rm -rf ./vendor
 
 image: build
 	@docker image build \
-		--target image \
 		--tag $(REPO):$(VERSION) \
 		.
  
 plugin: build
-	@mkdir ./rootfs
-	@echo "\nCreating root filesystem for plugin ..."
-	@docker image build -t rootfsimage .
-	@id=$$(docker container create rootfsimage true) && \
-	sudo docker container export $$id | sudo tar -x -C ./rootfs && \
-	docker container rm -f $$id
-	@docker image rm -f rootfsimage
-	@echo "\nCreating plugin $(REPO):$(VERSION) ..."
-	@sudo docker plugin create $(REPO):$(VERSION) .
-	@sudo rm -rf ./rootfs
+	@docker container run --rm \
+		-e DOCKER_VERSION=$(DOCKER_VERSION) \
+		-e REPO=$(REPO) \
+		-e VERSION=$(VERSION) \
+		-v /var/run/docker.sock:/var/run/docker.sock \
+		-v $(PWD):/opa-docker-authz \
+		-w /opa-docker-authz \
+		buildpack-deps:curl \
+		./plugin.sh
 
-plugin-push: plugin
-	@echo "\nPushing plugin $(REPO):$(VERSION) ..."
-	@docker plugin push $(REPO):$(VERSION)
+plugin-push:
+	@for plugin in `docker plugin ls --format '{{.Name}}'`; do \
+		if [ "$$plugin" = "$(REPO)-v2:$(VERSION)" ]; then \
+		    echo "\nPushing plugin $(REPO)-v2:$(VERSION) ..."; \
+            docker plugin push $(REPO)-v2:$(VERSION); \
+			exit; \
+		fi \
+	done; \
+	echo "\nNo local copy of $(REPO)-v2:$(VERSION) exists, create it before attempting push"
 
 clean:
-	@echo "\nRemoving opa-docker-authz binary ..."
-	@rm -rfv ./opa-docker-authz
-	@echo "\nRemoving local copy of plugin $(REPO):$(VERSION) ..."
-	@docker plugin rm -f $(REPO):$(VERSION)
+	@if [ -f ./opa-docker-authz ]; then \
+		echo "\nRemoving opa-docker-authz binary ..."; \
+		rm -rvf ./opa-docker-authz; \
+	fi
+	@for plugin in `docker plugin ls --format '{{.Name}}'`; do \
+		if [ "$$plugin" = "$(REPO)-v2:$(VERSION)" ]; then \
+		    echo "\nRemoving local copy of plugin $(REPO):$(VERSION) ..."; \
+            docker plugin rm -f $(REPO)-v2:$(VERSION); \
+		fi \
+	done
