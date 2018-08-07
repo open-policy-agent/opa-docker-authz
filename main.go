@@ -55,6 +55,11 @@ func (p DockerAuthZPlugin) AuthZRes(r authorization.Request) authorization.Respo
 
 func (p DockerAuthZPlugin) evaluate(ctx context.Context, r authorization.Request) (bool, error) {
 
+	if _, err := os.Stat(p.policyFile); os.IsNotExist(err) {
+		log.Printf("OPA policy file %s does not exist, failing open and allowing request", p.policyFile)
+		return true, err
+	}
+
 	bs, err := ioutil.ReadFile(p.policyFile)
 	if err != nil {
 		return false, err

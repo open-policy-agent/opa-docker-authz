@@ -1,7 +1,7 @@
-FROM alpine
+FROM scratch
 
-MAINTAINER Torin Sandall <torinsandall@gmail.com>
+LABEL maintainer="Torin Sandall <torinsandall@gmail.com>"
 
-ADD opa-docker-authz /opa-docker-authz
+COPY opa-docker-authz /opa-docker-authz
 
 ENTRYPOINT ["/opa-docker-authz"]
