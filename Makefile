@@ -1,6 +1,6 @@
 .PHONY: all build
 
-VERSION := 0.2.2
+VERSION := 0.3
 OPA_VERSION := 0.8.0
 GO_VERSION := 1.10
 REPO := openpolicyagent/opa-docker-authz
@@ -21,7 +21,7 @@ image: build
 	@docker image build \
 		--tag $(REPO):$(VERSION) \
 		.
- 
+
 plugin: build
 	@docker container run --rm \
 		-e DOCKER_VERSION=$(DOCKER_VERSION) \
