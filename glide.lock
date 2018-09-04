@@ -1,14 +1,14 @@
-hash: 19293eb44aec5bcb77cdc582c3444febeb25d7270c904516d01cafc56719260d
-updated: 2018-02-16T08:20:55.852826-08:00
+hash: a3e20fb1f9177b74c95e4665a7d5881594f956149fb149e4ab5fe2b5a75a7d73
+updated: 2018-09-04T15:06:13.378934-07:00
 imports:
 - name: github.com/coreos/go-systemd
-  version: 25fe332a900022d06a189ce01108392854c59df1
+  version: eee3db372b31153ca0b90702e165948699803fd0
   subpackages:
   - activation
 - name: github.com/dchest/siphash
-  version: 4ebf1de738443ea7f45f02dc394c4df1942a126d
+  version: 34f201214d993633bb24f418ba11736ab8b55aa7
 - name: github.com/docker/go-connections
-  version: 7beb39f0b969b075d1325fecb092faf27fd357b6
+  version: 97c2040d34dfae1d1b1275fa3a78dbdd2f41cf7e
   subpackages:
   - sockets
 - name: github.com/docker/go-plugins-helpers
@@ -19,31 +19,39 @@ imports:
 - name: github.com/fsnotify/fsnotify
   version: 4da3e2cfbabc9f751898f250b49f2439785783a1
 - name: github.com/ghodss/yaml
-  version: 0ca9ea5df5451ffdf184b4428c902747c2c11cd7
+  version: c7ce16629ff4cd059ed96ed06419dd3856fd3577
 - name: github.com/Microsoft/go-winio
-  version: 7da180ee92d8bd8bb8c37fc560e673e6557c392f
+  version: 97e4973ce50b2ff5f09635a57e2b88a037aae829
 - name: github.com/open-policy-agent/opa
-  version: 43fcc6ae25d1aacab0649caf022d7e6209d7f8a7
+  version: d5ba22b70a13a5afce4d2ea7103f2ac2d300bc48
   subpackages:
   - ast
+  - bundle
+  - loader
   - metrics
   - rego
   - storage
   - storage/inmem
   - topdown
   - topdown/builtins
+  - topdown/copypropagation
   - types
   - util
 - name: github.com/pkg/errors
-  version: 30136e27e2ac8d167177e8a583aa4c3fea5be833
+  version: 816c9085562cd7ee03e7f8188a1cfd942858cded
+- name: github.com/rcrowley/go-metrics
+  version: e2704e165165ec55d062f5919b4b29494e9fa790
+- name: github.com/yashtewari/glob-intersection
+  version: 7af743e8ec8480fee1932a737a406f7ec817f910
 - name: golang.org/x/net
-  version: 1c05540f6879653db88113bc4a2b70aec4bd491f
+  version: a680a1efc54dd51c040b3b5ce4939ea3cf2ea0d1
   subpackages:
+  - internal/socks
   - proxy
 - name: golang.org/x/sys
-  version: 37707fdb30a5b38865cfb95e5aab41707daec7fd
+  version: ac767d655b305d4e9612f5f6e33120b9176c4ad4
   subpackages:
   - windows
 - name: gopkg.in/yaml.v2
-  version: d670f9405373e636a5a2765eea47fac0c9bc91a4
+  version: 5420a8b6744d3b0345ab293f6fcba19c978f1183
 testImports: []

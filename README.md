@@ -35,7 +35,7 @@ The following steps detail how to install the managed plugin.
 Download the `opa-docker-authz` plugin from the Docker Hub (depending on how your Docker environment is configured, you may need to execute the following commands using the `sudo` utility), and specify the location of the policy file, using the `opa-args` key, and an appropriate value:
 
 ```
-$ docker plugin install --alias opa-docker-authz openpolicyagent/opa-docker-authz-v2:0.3 opa-args="-policy-file /opa/policies/authz.rego"
+$ docker plugin install --alias opa-docker-authz openpolicyagent/opa-docker-authz-v2:0.4 opa-args="-policy-file /opa/policies/authz.rego"
 Plugin "openpolicyagent/opa-docker-authz-v2:<VERSION>" is requesting the following privileges:
  - mount: [/etc/docker]
 Do you grant the above permissions? [y/N] y
@@ -67,16 +67,6 @@ $ sudo kill -HUP $(pidof dockerd)
 
 The Docker daemon will now send authorization requests for all Docker client API calls, to the `opa-docker-authz` plugin, for evaluation.
 
-If an alternate host location is preferred for the bind mount, then it's possible to set the source during plugin installation. For example, if policy files are located in `$HOME/opa/policies`, then a policy file called `authz.rego` can be made available to the plugin, with the following:
-
-```
-$ docker plugin install --alias opa-docker-authz \
-    openpolicyagent-v2/opa-docker-authz:0.3 \
-    policy.source=$HOME/opa/policies \
-    opa-args="-policy-file /opa/authz.rego"
-
-```
-
 **Legacy Plugin**
 
 If you prefer to use the legacy plugin, it needs to be started as a container, before applying the same configuration to the Docker daemon, as detailed above:
@@ -85,7 +75,7 @@ If you prefer to use the legacy plugin, it needs to be started as a container, b
 $ docker container run -d --restart=always --name opa-docker-authz \
     -v /run/docker/plugins:/run/docker/plugins \
     -v $HOME/opa/policies:/opa \
-    openpolicyagent/opa-docker-authz:0.3 -policy-file /opa/authz.rego
+    openpolicyagent/opa-docker-authz:0.4 -policy-file /opa/authz.rego
 ```
 
 ### Logs

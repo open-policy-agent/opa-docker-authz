@@ -1,0 +1,20 @@
+{
+  "plugins": [
+    "header",
+    "addcssjs",
+    "collapsible-menu",
+    "custom-favicon",
+    "ga",
+    "-fontsettings",
+    "ace"
+  ],
+  "pluginsConfig": {
+    "layout": {
+      "headerPath" : "layouts/header.html"
+    },
+    "favicon": "images/favicon.png",
+    "ga": {
+      "token": "UA-84550302-1"
+    }
+  }
+}
