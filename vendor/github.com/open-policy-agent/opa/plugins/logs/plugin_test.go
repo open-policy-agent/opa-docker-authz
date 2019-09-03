@@ -11,16 +11,170 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/open-policy-agent/opa/ast"
+	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/plugins"
 	"github.com/open-policy-agent/opa/server"
+	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/storage/inmem"
+	"github.com/open-policy-agent/opa/util"
+	"github.com/open-policy-agent/opa/version"
 )
 
+func TestMain(m *testing.M) {
+	// call flag.Parse() here if TestMain uses flags
+	setVersion("XY.Z")
+	os.Exit(m.Run())
+}
+
+type testPlugin struct {
+	events []EventV1
+}
+
+func (p *testPlugin) Start(context.Context) error {
+	return nil
+}
+
+func (p *testPlugin) Stop(context.Context) {
+}
+
+func (p *testPlugin) Reconfigure(context.Context, interface{}) {
+}
+
+func (p *testPlugin) Log(_ context.Context, event EventV1) error {
+	p.events = append(p.events, event)
+	return nil
+}
+
+func TestPluginCustomBackend(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := plugins.New(nil, "test-instance-id", inmem.New())
+
+	backend := &testPlugin{}
+	manager.Register("test_plugin", backend)
+
+	config, err := ParseConfig([]byte(`{"plugin": "test_plugin"}`), nil, []string{"test_plugin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	plugin := New(config, manager)
+	plugin.Log(ctx, &server.Info{Revision: "A"})
+	plugin.Log(ctx, &server.Info{Revision: "B"})
+
+	if len(backend.events) != 2 || backend.events[0].Revision != "A" || backend.events[1].Revision != "B" {
+		t.Fatal("Unexpected events:", backend.events)
+	}
+
+	// Server events with only `Revision` should not include bundles in the EventV1 struct
+	for _, e := range backend.events {
+		if len(e.Bundles) > 0 {
+			t.Errorf("Unexpected `bundles` in event")
+		}
+	}
+}
+
+func TestPluginSingleBundle(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := plugins.New(nil, "test-instance-id", inmem.New())
+
+	backend := &testPlugin{}
+	manager.Register("test_plugin", backend)
+
+	config, err := ParseConfig([]byte(`{"plugin": "test_plugin"}`), nil, []string{"test_plugin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	plugin := New(config, manager)
+	plugin.Log(ctx, &server.Info{Bundles: map[string]server.BundleInfo{"b1": {Revision: "A"}}})
+
+	// Server events with `Bundles` should *not* have `Revision` set
+	if len(backend.events) != 1 {
+		t.Fatalf("Unexpected number of events: %v", backend.events)
+	}
+
+	if backend.events[0].Revision != "" || backend.events[0].Bundles["b1"].Revision != "A" {
+		t.Fatal("Unexpected events: ", backend.events)
+	}
+}
+
+func TestPluginMultiBundle(t *testing.T) {
+
+}
+
+func TestPluginErrorNoResult(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := plugins.New(nil, "test-instance-id", inmem.New())
+
+	backend := &testPlugin{}
+	manager.Register("test_plugin", backend)
+
+	config, err := ParseConfig([]byte(`{"plugin": "test_plugin"}`), nil, []string{"test_plugin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	plugin := New(config, manager)
+	plugin.Log(ctx, &server.Info{Error: fmt.Errorf("some error")})
+	plugin.Log(ctx, &server.Info{Error: ast.Errors{&ast.Error{
+		Code: "some_error",
+	}}})
+
+	if len(backend.events) != 2 || backend.events[0].Error == nil || backend.events[1].Error == nil {
+		t.Fatal("Unexpected events:", backend.events)
+	}
+}
+
+func TestPluginQueriesAndPaths(t *testing.T) {
+	ctx := context.Background()
+	manager, _ := plugins.New(nil, "test-instance-id", inmem.New())
+
+	backend := &testPlugin{}
+	manager.Register("test_plugin", backend)
+
+	config, err := ParseConfig([]byte(`{"plugin": "test_plugin"}`), nil, []string{"test_plugin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	plugin := New(config, manager)
+	plugin.Log(ctx, &server.Info{Path: "data.foo"})
+	plugin.Log(ctx, &server.Info{Path: "data.foo.bar"})
+	plugin.Log(ctx, &server.Info{Query: "a = data.foo"})
+
+	exp := []struct {
+		query string
+		path  string
+	}{
+		// TODO(tsandall): we need to fix how POST /v1/data (and
+		// friends) are represented here. Currently we can't tell the
+		// difference between /v1/data and /v1/data/data. The decision
+		// log event paths should be slash prefixed to avoid ambiguity.
+		//		{path: "data"},
+		{path: "foo"},
+		{path: "foo/bar"},
+		{query: "a = data.foo"},
+	}
+
+	if len(exp) != len(backend.events) {
+		t.Fatalf("Expected %d events but got %v", len(exp), len(backend.events))
+	}
+
+	for i, e := range exp {
+		if e.query != backend.events[i].Query || e.path != backend.events[i].Path {
+			t.Fatalf("Unexpected event %d, want %v but got %v", i, e, backend.events[i])
+		}
+	}
+}
+
 func TestPluginStartSameInput(t *testing.T) {
+
 	ctx := context.Background()
 
 	fixture := newTestFixture(t)
@@ -34,15 +188,20 @@ func TestPluginStartSameInput(t *testing.T) {
 		panic(err)
 	}
 
-	for i := 0; i < 500; i++ {
+	testMetrics := getWellKnownMetrics()
+
+	var input interface{} = map[string]interface{}{"method": "GET"}
+
+	for i := 0; i < 400; i++ {
 		fixture.plugin.Log(ctx, &server.Info{
 			Revision:   fmt.Sprint(i),
 			DecisionID: fmt.Sprint(i),
-			Query:      "data.tda.bar",
-			Input:      map[string]interface{}{"method": "GET"},
+			Path:       "data.tda.bar",
+			Input:      &input,
 			Results:    &result,
 			RemoteAddr: "test",
 			Timestamp:  ts,
+			Metrics:    testMetrics,
 		})
 	}
 
@@ -55,29 +214,36 @@ func TestPluginStartSameInput(t *testing.T) {
 	chunk2 := <-fixture.server.ch
 	chunk3 := <-fixture.server.ch
 	chunk4 := <-fixture.server.ch
-	expLen1 := 152
-	expLen2 := 151
-	expLen3 := 151
-	expLen4 := 46
+	expLen1 := 122
+	expLen2 := 121
+	expLen3 := 121
+	expLen4 := 36
 
-	if len(chunk1) != expLen1 || len(chunk2) != expLen2 || len((chunk3)) != expLen3 || len(chunk4) != expLen4 {
+	if len(chunk1) != expLen1 || len(chunk2) != expLen2 || len(chunk3) != expLen3 || len(chunk4) != expLen4 {
 		t.Fatalf("Expected chunk lens %v, %v, %v and %v but got: %v, %v, %v and %v", expLen1, expLen2, expLen3, expLen4, len(chunk1), len(chunk2), len(chunk3), len(chunk4))
 	}
 
 	var expInput interface{} = map[string]interface{}{"method": "GET"}
 
+	msAsFloat64 := map[string]interface{}{}
+	for k, v := range testMetrics.All() {
+		msAsFloat64[k] = float64(v.(uint64))
+	}
+
 	exp := EventV1{
 		Labels: map[string]string{
-			"id":  "test-instance-id",
-			"app": "example-app",
+			"id":      "test-instance-id",
+			"app":     "example-app",
+			"version": getVersion(),
 		},
-		Revision:    "499",
-		DecisionID:  "499",
+		Revision:    "399",
+		DecisionID:  "399",
 		Path:        "tda/bar",
 		Input:       &expInput,
 		Result:      &result,
 		RequestedBy: "test",
 		Timestamp:   ts,
+		Metrics:     msAsFloat64,
 	}
 
 	if !reflect.DeepEqual(chunk4[expLen4-1], exp) {
@@ -86,6 +252,7 @@ func TestPluginStartSameInput(t *testing.T) {
 }
 
 func TestPluginStartChangingInputValues(t *testing.T) {
+
 	ctx := context.Background()
 
 	fixture := newTestFixture(t)
@@ -99,16 +266,16 @@ func TestPluginStartChangingInputValues(t *testing.T) {
 		panic(err)
 	}
 
-	var input map[string]interface{}
+	var input interface{}
 
-	for i := 0; i < 500; i++ {
+	for i := 0; i < 400; i++ {
 		input = map[string]interface{}{"method": getValueForMethod(i), "path": getValueForPath(i), "user": getValueForUser(i)}
 
 		fixture.plugin.Log(ctx, &server.Info{
 			Revision:   fmt.Sprint(i),
 			DecisionID: fmt.Sprint(i),
-			Query:      "data.foo.bar",
-			Input:      input,
+			Path:       "data.foo.bar",
+			Input:      &input,
 			Results:    &result,
 			RemoteAddr: "test",
 			Timestamp:  ts,
@@ -124,10 +291,10 @@ func TestPluginStartChangingInputValues(t *testing.T) {
 	chunk2 := <-fixture.server.ch
 	chunk3 := <-fixture.server.ch
 	chunk4 := <-fixture.server.ch
-	expLen1 := 133
-	expLen2 := 132
-	expLen3 := 132
-	expLen4 := 103
+	expLen1 := 124
+	expLen2 := 123
+	expLen3 := 123
+	expLen4 := 30
 
 	if len(chunk1) != expLen1 || len(chunk2) != expLen2 || len((chunk3)) != expLen3 || len(chunk4) != expLen4 {
 		t.Fatalf("Expected chunk lens %v, %v, %v and %v but got: %v, %v, %v and %v", expLen1, expLen2, expLen3, expLen4, len(chunk1), len(chunk2), len(chunk3), len(chunk4))
@@ -137,11 +304,12 @@ func TestPluginStartChangingInputValues(t *testing.T) {
 
 	exp := EventV1{
 		Labels: map[string]string{
-			"id":  "test-instance-id",
-			"app": "example-app",
+			"id":      "test-instance-id",
+			"app":     "example-app",
+			"version": getVersion(),
 		},
-		Revision:    "499",
-		DecisionID:  "499",
+		Revision:    "399",
+		DecisionID:  "399",
 		Path:        "foo/bar",
 		Input:       &expInput,
 		Result:      &result,
@@ -155,6 +323,7 @@ func TestPluginStartChangingInputValues(t *testing.T) {
 }
 
 func TestPluginStartChangingInputKeysAndValues(t *testing.T) {
+
 	ctx := context.Background()
 
 	fixture := newTestFixture(t)
@@ -168,7 +337,7 @@ func TestPluginStartChangingInputKeysAndValues(t *testing.T) {
 		panic(err)
 	}
 
-	var input map[string]interface{}
+	var input interface{}
 
 	for i := 0; i < 250; i++ {
 		input = generateInputMap(i)
@@ -176,8 +345,8 @@ func TestPluginStartChangingInputKeysAndValues(t *testing.T) {
 		fixture.plugin.Log(ctx, &server.Info{
 			Revision:   fmt.Sprint(i),
 			DecisionID: fmt.Sprint(i),
-			Query:      "data.foo.bar",
-			Input:      input,
+			Path:       "data.foo.bar",
+			Input:      &input,
 			Results:    &result,
 			RemoteAddr: "test",
 			Timestamp:  ts,
@@ -196,8 +365,9 @@ func TestPluginStartChangingInputKeysAndValues(t *testing.T) {
 
 	exp := EventV1{
 		Labels: map[string]string{
-			"id":  "test-instance-id",
-			"app": "example-app",
+			"id":      "test-instance-id",
+			"app":     "example-app",
+			"version": getVersion(),
 		},
 		Revision:    "249",
 		DecisionID:  "249",
@@ -214,6 +384,7 @@ func TestPluginStartChangingInputKeysAndValues(t *testing.T) {
 }
 
 func TestPluginRequeue(t *testing.T) {
+
 	ctx := context.Background()
 
 	fixture := newTestFixture(t)
@@ -221,12 +392,13 @@ func TestPluginRequeue(t *testing.T) {
 
 	fixture.server.ch = make(chan []EventV1, 1)
 
+	var input interface{} = map[string]interface{}{"method": "GET"}
 	var result1 interface{} = false
 
 	fixture.plugin.Log(ctx, &server.Info{
 		DecisionID: "abc",
-		Query:      "data.foo.bar",
-		Input:      map[string]interface{}{"method": "GET"},
+		Path:       "data.foo.bar",
+		Input:      &input,
 		Results:    &result1,
 		RemoteAddr: "test",
 		Timestamp:  time.Now().UTC(),
@@ -257,6 +429,414 @@ func TestPluginRequeue(t *testing.T) {
 	if uploaded || err != nil {
 		t.Fatalf("Unexpected error or upload, err: %v", err)
 	}
+}
+
+func TestPluginReconfigure(t *testing.T) {
+
+	ctx := context.Background()
+	fixture := newTestFixture(t)
+	defer fixture.server.stop()
+
+	if err := fixture.plugin.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	minDelay := 2
+	maxDelay := 3
+
+	pluginConfig := []byte(fmt.Sprintf(`{
+			"service": "example",
+			"reporting": {
+				"min_delay_seconds": %v,
+				"max_delay_seconds": %v
+			}
+		}`, minDelay, maxDelay))
+
+	config, _ := ParseConfig(pluginConfig, fixture.manager.Services(), nil)
+
+	fixture.plugin.Reconfigure(ctx, config)
+	fixture.plugin.Stop(ctx)
+
+	actualMin := time.Duration(*fixture.plugin.config.Reporting.MinDelaySeconds) / time.Nanosecond
+	expectedMin := time.Duration(minDelay) * time.Second
+
+	if actualMin != expectedMin {
+		t.Fatalf("Expected minimum polling interval: %v but got %v", expectedMin, actualMin)
+	}
+
+	actualMax := time.Duration(*fixture.plugin.config.Reporting.MaxDelaySeconds) / time.Nanosecond
+	expectedMax := time.Duration(maxDelay) * time.Second
+
+	if actualMax != expectedMax {
+		t.Fatalf("Expected maximum polling interval: %v but got %v", expectedMax, actualMax)
+	}
+}
+
+func TestPluginMasking(t *testing.T) {
+
+	// Setup masking fixture. Populate store with simple masking policy.
+	ctx := context.Background()
+	store := inmem.New()
+
+	err := storage.Txn(ctx, store, storage.WriteParams, func(txn storage.Transaction) error {
+		if err := store.UpsertPolicy(ctx, txn, "test.rego", []byte(`
+			package system.log
+			mask["/input/password"] {
+				input.input.is_sensitive
+			}
+		`)); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create and start manager. Start is required so that stored policies
+	// get compiled and made available to the plugin.
+	manager, err := plugins.New(nil, "test", store)
+	if err != nil {
+		t.Fatal(err)
+	} else if err := manager.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Instantiate the plugin.
+	cfg := &Config{Service: "svc"}
+	cfg.validateAndInjectDefaults([]string{"svc"}, nil)
+	plugin := New(cfg, manager)
+
+	if err := plugin.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Test input that requires masking.
+	var input interface{} = map[string]interface{}{
+		"is_sensitive": true,
+		"password":     "secret",
+	}
+	event := &EventV1{
+		Input: &input,
+	}
+	if err := plugin.maskEvent(ctx, nil, event); err != nil {
+		t.Fatal(err)
+	}
+
+	var exp interface{} = map[string]interface{}{
+		"is_sensitive": true,
+	}
+
+	if !reflect.DeepEqual(exp, *event.Input) {
+		t.Fatalf("Expected %v but got %v:", exp, *event.Input)
+	}
+
+	expErased := []string{"/input/password"}
+
+	if !reflect.DeepEqual(expErased, event.Erased) {
+		t.Fatalf("Expected %v but got %v:", expErased, event.Erased)
+	}
+
+	// Test input that DOES NOT require masking.
+	input = map[string]interface{}{
+		"password": "secret", // is_sensitive not set.
+	}
+
+	event = &EventV1{
+		Input: &input,
+	}
+
+	if err := plugin.maskEvent(ctx, nil, event); err != nil {
+		t.Fatal(err)
+	}
+
+	exp = map[string]interface{}{
+		"password": "secret",
+	}
+
+	if !reflect.DeepEqual(exp, *event.Input) {
+		t.Fatalf("Expected %v but got %v:", exp, *event.Input)
+	}
+
+	if len(event.Erased) != 0 {
+		t.Fatalf("Expected empty set but got %v", event.Erased)
+	}
+
+	// Update policy to mask all of input and exercise.
+	err = storage.Txn(ctx, store, storage.WriteParams, func(txn storage.Transaction) error {
+		if err := store.UpsertPolicy(ctx, txn, "test.rego", []byte(`
+			package system.log
+			mask["/input"]
+		`)); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	event = &EventV1{
+		Input: &input,
+	}
+
+	if err := plugin.maskEvent(ctx, nil, event); err != nil {
+		t.Fatal(err)
+	}
+
+	if event.Input != nil {
+		t.Fatalf("Expected input to be nil but got: %v", *event.Input)
+	}
+
+	// Reconfigure and ensure that mask is invalidated.
+	maskDecision := "dead/beef"
+	newConfig := &Config{Service: "svc", MaskDecision: &maskDecision}
+	if err := newConfig.validateAndInjectDefaults([]string{"svc"}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	plugin.Reconfigure(ctx, newConfig)
+
+	input = map[string]interface{}{
+		"password":     "secret",
+		"is_sensitive": true,
+	}
+
+	event = &EventV1{
+		Input: &input,
+	}
+
+	if err := plugin.maskEvent(ctx, nil, event); err != nil {
+		t.Fatal(err)
+	}
+
+	exp = map[string]interface{}{
+		"password":     "secret",
+		"is_sensitive": true,
+	}
+
+	if !reflect.DeepEqual(exp, input) {
+		t.Fatalf("Expected %v but got modified input %v", exp, input)
+	}
+
+}
+
+const largeEvent = `{
+	"_id": "15596749567705615560",
+	"decision_id": "0e67fda0-170b-454d-9f5e-29691073f97e",
+	"input": {
+	  "apiVersion": "admission.k8s.io/v1beta1",
+	  "kind": "AdmissionReview",
+	  "request": {
+		"kind": {
+		  "group": "",
+		  "kind": "Pod",
+		  "version": "v1"
+		},
+		"namespace": "demo",
+		"object": {
+		  "metadata": {
+			"creationTimestamp": "2019-06-04T19:02:35Z",
+			"labels": {
+			  "run": "nginx"
+			},
+			"name": "nginx",
+			"namespace": "demo",
+			"uid": "507e4c3c-86fb-11e9-b289-42010a8000b2"
+		  },
+		  "spec": {
+			"containers": [
+			  {
+				"image": "nginx",
+				"imagePullPolicy": "Always",
+				"name": "nginx",
+				"resources": {},
+				"terminationMessagePath": "/dev/termination-log",
+				"terminationMessagePolicy": "File",
+				"volumeMounts": [
+				  {
+					"mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+					"name": "default-token-5vjbc",
+					"readOnly": true
+				  }
+				]
+			  }
+			],
+			"dnsPolicy": "ClusterFirst",
+			"priority": 0,
+			"restartPolicy": "Never",
+			"schedulerName": "default-scheduler",
+			"securityContext": {},
+			"serviceAccount": "default",
+			"serviceAccountName": "default",
+			"terminationGracePeriodSeconds": 30,
+			"tolerations": [
+			  {
+				"effect": "NoExecute",
+				"key": "node.kubernetes.io/not-ready",
+				"operator": "Exists",
+				"tolerationSeconds": 300
+			  },
+			  {
+				"effect": "NoExecute",
+				"key": "node.kubernetes.io/unreachable",
+				"operator": "Exists",
+				"tolerationSeconds": 300
+			  }
+			],
+			"volumes": [
+			  {
+				"name": "default-token-5vjbc",
+				"secret": {
+				  "secretName": "default-token-5vjbc"
+				}
+			  }
+			]
+		  },
+		  "status": {
+			"phase": "Pending",
+			"qosClass": "BestEffort"
+		  }
+		},
+		"oldObject": null,
+		"operation": "CREATE",
+		"resource": {
+		  "group": "",
+		  "resource": "pods",
+		  "version": "v1"
+		},
+		"userInfo": {
+		  "groups": [
+			"system:serviceaccounts",
+			"system:serviceaccounts:opa-system",
+			"system:authenticated"
+		  ],
+		  "username": "system:serviceaccount:opa-system:default"
+		}
+	  }
+	},
+	"labels": {
+	  "id": "462a43bd-6a5f-4530-9386-30b0f4e0c8af",
+	  "policy-type": "kubernetes/admission_control",
+	  "system-type": "kubernetes",
+	  "version": "0.10.5"
+	},
+	"metrics": {
+	  "timer_rego_module_compile_ns": 222,
+	  "timer_rego_module_parse_ns": 313,
+	  "timer_rego_query_compile_ns": 121360,
+	  "timer_rego_query_eval_ns": 923279,
+	  "timer_rego_query_parse_ns": 287152,
+	  "timer_server_handler_ns": 2563846
+	},
+	"path": "admission_control/main",
+	"requested_by": "10.52.0.1:53848",
+	"result": {
+	  "apiVersion": "admission.k8s.io/v1beta1",
+	  "kind": "AdmissionReview",
+	  "response": {
+		"allowed": false,
+		"status": {
+		  "reason": "Resource Pod/demo/nginx includes container image 'nginx' from prohibited registry"
+		}
+	  }
+	},
+	"revision": "jafsdkjfhaslkdfjlaksdjflaksjdflkajsdlkfjasldkfjlaksdjflkasdjflkasjdflkajsdflkjasdklfjalsdjf",
+	"timestamp": "2019-06-04T19:02:35.692Z"
+  }`
+
+func BenchmarkMaskingNop(b *testing.B) {
+
+	ctx := context.Background()
+	store := inmem.New()
+
+	manager, err := plugins.New(nil, "test", store)
+	if err != nil {
+		b.Fatal(err)
+	} else if err := manager.Start(ctx); err != nil {
+		b.Fatal(err)
+	}
+
+	cfg := &Config{Service: "svc"}
+	cfg.validateAndInjectDefaults([]string{"svc"}, nil)
+	plugin := New(cfg, manager)
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+
+		b.StopTimer()
+
+		var event EventV1
+
+		if err := util.UnmarshalJSON([]byte(largeEvent), &event); err != nil {
+			b.Fatal(err)
+		}
+
+		b.StartTimer()
+
+		if err := plugin.maskEvent(ctx, nil, &event); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+}
+
+func BenchmarkMaskingErase(b *testing.B) {
+
+	ctx := context.Background()
+	store := inmem.New()
+
+	err := storage.Txn(ctx, store, storage.WriteParams, func(txn storage.Transaction) error {
+		if err := store.UpsertPolicy(ctx, txn, "test.rego", []byte(`
+			package system.log
+
+			mask["/input"] {
+				input.input.request.kind.kind == "Pod"
+			}
+		`)); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	manager, err := plugins.New(nil, "test", store)
+	if err != nil {
+		b.Fatal(err)
+	} else if err := manager.Start(ctx); err != nil {
+		b.Fatal(err)
+	}
+
+	cfg := &Config{Service: "svc"}
+	cfg.validateAndInjectDefaults([]string{"svc"}, nil)
+	plugin := New(cfg, manager)
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+
+		b.StopTimer()
+
+		var event EventV1
+
+		if err := util.UnmarshalJSON([]byte(largeEvent), &event); err != nil {
+			b.Fatal(err)
+		}
+
+		b.StartTimer()
+
+		if err := plugin.maskEvent(ctx, nil, &event); err != nil {
+			b.Fatal(err)
+		}
+
+		if event.Input != nil {
+			b.Fatal("Expected input to be erased")
+		}
+	}
+
 }
 
 type testFixture struct {
@@ -300,10 +880,9 @@ func newTestFixture(t *testing.T) testFixture {
 			"service": "example",
 		}`))
 
-	p, err := New(pluginConfig, manager)
-	if err != nil {
-		t.Fatal(err)
-	}
+	config, _ := ParseConfig([]byte(pluginConfig), manager.Services(), nil)
+
+	p := New(config, manager)
 
 	return testFixture{
 		manager: manager,
@@ -311,6 +890,60 @@ func newTestFixture(t *testing.T) testFixture {
 		server:  &ts,
 	}
 
+}
+
+func TestParseConfigUseDefaultServiceNoConsole(t *testing.T) {
+	services := []string{
+		"s0",
+		"s1",
+		"s3",
+	}
+
+	loggerConfig := []byte(fmt.Sprintf(`{
+		"console": false
+	}`))
+
+	config, err := ParseConfig([]byte(loggerConfig), services, nil)
+
+	if err != nil {
+		t.Errorf("Unexpected error: %s", err)
+	}
+
+	if config.Service != services[0] {
+		t.Errorf("Expected %s service in config, actual = '%s'", services[0], config.Service)
+	}
+}
+
+func TestParseConfigDefaultServiceWithConsole(t *testing.T) {
+	services := []string{
+		"s0",
+		"s1",
+		"s3",
+	}
+
+	loggerConfig := []byte(fmt.Sprintf(`{
+		"console": true
+	}`))
+
+	config, err := ParseConfig([]byte(loggerConfig), services, nil)
+
+	if err != nil {
+		t.Errorf("Unexpected error: %s", err)
+	}
+
+	if config.Service != "" {
+		t.Errorf("Expected no service in config, actual = '%s'", config.Service)
+	}
+}
+
+func TestParseConfigDefaultServiceWithNoServiceOrConsole(t *testing.T) {
+	loggerConfig := []byte(fmt.Sprintf(`{}`))
+
+	_, err := ParseConfig([]byte(loggerConfig), []string{}, nil)
+
+	if err == nil {
+		t.Errorf("Expected an error but err==nil")
+	}
 }
 
 type testServer struct {
@@ -332,6 +965,7 @@ func (t *testServer) handle(w http.ResponseWriter, r *http.Request) {
 	if err := gr.Close(); err != nil {
 		t.t.Fatal(err)
 	}
+	t.t.Logf("decision log test server received %d events", len(events))
 	t.ch <- events
 	w.WriteHeader(t.expCode)
 }
@@ -370,4 +1004,20 @@ func generateInputMap(idx int) map[string]interface{} {
 	}
 	return result
 
+}
+
+func setVersion(opaVersion string) {
+	if version.Version == "" {
+		version.Version = opaVersion
+	}
+}
+
+func getVersion() string {
+	return version.Version
+}
+
+func getWellKnownMetrics() metrics.Metrics {
+	m := metrics.New()
+	m.Counter("test_counter").Incr()
+	return m
 }

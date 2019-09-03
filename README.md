@@ -35,7 +35,7 @@ The following steps detail how to install the managed plugin.
 Download the `opa-docker-authz` plugin from the Docker Hub (depending on how your Docker environment is configured, you may need to execute the following commands using the `sudo` utility), and specify the location of the policy file, using the `opa-args` key, and an appropriate value:
 
 ```
-$ docker plugin install --alias opa-docker-authz openpolicyagent/opa-docker-authz-v2:0.4 opa-args="-policy-file /opa/policies/authz.rego"
+$ docker plugin install --alias opa-docker-authz openpolicyagent/opa-docker-authz-v2:0.5 opa-args="-policy-file /opa/policies/authz.rego"
 Plugin "openpolicyagent/opa-docker-authz-v2:<VERSION>" is requesting the following privileges:
  - mount: [/etc/docker]
 Do you grant the above permissions? [y/N] y
@@ -75,7 +75,7 @@ If you prefer to use the legacy plugin, it needs to be started as a container, b
 $ docker container run -d --restart=always --name opa-docker-authz \
     -v /run/docker/plugins:/run/docker/plugins \
     -v $HOME/opa/policies:/opa \
-    openpolicyagent/opa-docker-authz:0.4 -policy-file /opa/authz.rego
+    openpolicyagent/opa-docker-authz:0.5 -policy-file /opa/authz.rego
 ```
 
 ### Logs

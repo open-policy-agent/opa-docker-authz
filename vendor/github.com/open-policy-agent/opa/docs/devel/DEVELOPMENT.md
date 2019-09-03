@@ -1,10 +1,3 @@
----
-layout: docs
-title: Development
-section: references
-sort_order: 100
----
-
 ## Development
 
 OPA is written in the [Go](https://golang.org) programming language.
@@ -16,7 +9,7 @@ Requirements:
 
 - Git
 - GitHub account (if you are contributing)
-- Go (version 1.10 is supported though older versiosn are likely to work)
+- Go (version 1.11 is supported though older versions are likely to work)
 - GNU Make
 
 ## Getting Started
@@ -27,6 +20,19 @@ After cloning the repository, just run `make`. This will:
 - Build the OPA binary.
 - Run all of the tests.
 - Run all of the static analysis checks.
+
+If `make` fails with `main.go:20: running "pigeon": exec: "pigeon":
+executable file not found in $PATH` make sure that `$GOPATH/bin` is
+in `$PATH`. If `$GOPATH` is undefined, it defaults to
+`$HOME/go/bin`:
+
+```
+export PATH=$PATH:$GOPATH/bin
+
+# OR
+
+export PATH=$PATH:$HOME/go/bin
+```
 
 If the build was successful, a binary will be produced in the top directory (`opa_<OS>_<ARCH>`).
 
@@ -118,3 +124,11 @@ parser generation explicitly you can run `make generate`.
 If you are modifying the Rego syntax you must commit the parser source file
 (ast/parser.go) that `make generate` produces when you are done. The generated
 code is kept in the repository so that commands such as `go get` work.
+
+## Go
+
+If you need to update the version of Go used to build OPA you must update two
+files in the root of this repository:
+
+* `.travis.yml` which is used to configure the Travis CI build environment.
+* `Makefile`- which is used to produce releases locally. Update the `GOVERSION` variable.

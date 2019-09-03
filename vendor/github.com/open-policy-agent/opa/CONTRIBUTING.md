@@ -36,17 +36,48 @@ OPA slack or submit an issue on GitHub.
 If you are contributing code, please consider the following:
 
 - Most changes should be accompanied with tests.
-- Commit messages should explain *why* the changes were made and should probably look like this:
-
-        Description of the change in 50 characters or less
-
-        More detail on what was changed. Provide some background on the issue
-        and describe how the changes address the issue. Feel free to use multiple
-        paragraphs but please keep each line under 72 characters or so.
-
 - All commits must be signed off (see next section).
 - Related commits must be squashed before they are merged.
-- All tests must pass and there must be no warnings from the `make check` target.
+- All tests must pass and there must be no warnings from the `make
+  check` target.
+
+If you are new to Go, consider reading [Effective
+Go](https://golang.org/doc/effective_go.html) and [Go Code Review
+Comments](https://github.com/golang/go/wiki/CodeReviewComments) for
+guidance on writing idiomatic Go code.
+
+When you implement new features in OPA, consider whether the
+types/functions you are adding need to be exported. Prefer
+unexported types and functions as much as possible.
+
+If you need to share logic across multiple OPA packages, consider
+implementing it inside of the
+`github.com/open-policy-agent/opa/internal` package. The `internal`
+package is not visible outside of OPA.
+
+Avoid adding thirdparty dependencies (vendoring). OPA is designed to be minimal,
+lightweight, and easily embedded. Vendoring may make features _easier_ to
+implement however they come with their own cost for both OPA developers and
+OPA users (e.g., vendoring conflicts, security, debugging, etc.)
+
+## Commit Messages
+
+Commit messages should explain *why* the changes were made and should probably look like this:
+
+```
+Description of the change in 50 characters or less
+
+More detail on what was changed. Provide some background on the issue
+and describe how the changes address the issue. Feel free to use multiple
+paragraphs but please keep each line under 72 characters or so.
+```
+
+If your changes are related to an open issue (bug or feature), please include
+the following line at the end of your commit message:
+
+```
+Fixes #<ISSUE_NUMBER>
+```
 
 ## Developer Certificate Of Origin
 

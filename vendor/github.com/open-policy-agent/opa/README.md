@@ -1,17 +1,19 @@
 # ![logo](./logo/logo.png) Open Policy Agent
 
-[![Slack Status](http://slack.openpolicyagent.org/badge.svg)](http://slack.openpolicyagent.org) [![Build Status](https://travis-ci.org/open-policy-agent/opa.svg?branch=master)](https://travis-ci.org/open-policy-agent/opa) [![Go Report Card](https://goreportcard.com/badge/open-policy-agent/opa)](https://goreportcard.com/report/open-policy-agent/opa)
-[![FOSSA Status](https://app.fossa.io/api/projects/git%2Bgithub.com%2Fopen-policy-agent%2Fopa.svg?type=shield)](https://app.fossa.io/projects/git%2Bgithub.com%2Fopen-policy-agent%2Fopa?ref=badge_shield) [![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/1768/badge)](https://bestpractices.coreinfrastructure.org/projects/1768)
+[![Slack Status](http://slack.openpolicyagent.org/badge.svg)](https://slack.openpolicyagent.org) [![Build Status](https://travis-ci.org/open-policy-agent/opa.svg?branch=master)](https://travis-ci.org/open-policy-agent/opa) [![Go Report Card](https://goreportcard.com/badge/open-policy-agent/opa)](https://goreportcard.com/report/open-policy-agent/opa) [![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/1768/badge)](https://bestpractices.coreinfrastructure.org/projects/1768) [![Netlify Status](https://api.netlify.com/api/v1/badges/4a0a092a-8741-4826-a28f-826d4a576cab/deploy-status)](https://app.netlify.com/sites/openpolicyagent/deploys)
 
 The Open Policy Agent (OPA) is an open source, general-purpose policy engine that enables unified, context-aware policy enforcement across the entire stack.
 
-OPA is hosted by the [Cloud Native Computing Foundation](https://cncf.io) (CNCF) as a sandbox level project. If you are an organization that wants to help shape the evolution of technologies that are container-packaged, dynamically-scheduled and microservices-oriented, consider joining the CNCF. For details read the CNCF [announcement](https://www.cncf.io/blog/2018/03/29/cncf-to-host-open-policy-agent-opa/).
+OPA is hosted by the [Cloud Native Computing Foundation](https://cncf.io) (CNCF) as an incubating-level project. If you are an organization that wants to help shape the evolution of technologies that are container-packaged, dynamically-scheduled and microservices-oriented, consider joining the CNCF. For details read the CNCF [announcement](https://www.cncf.io/blog/2019/04/02/toc-votes-to-move-opa-into-cncf-incubator/).
 
 ## Want to learn more about OPA?
 
-- See [openpolicyagent.org](http://www.openpolicyagent.org) to get started with documentation and tutorials.
+- See [openpolicyagent.org](https://www.openpolicyagent.org) to get started with documentation and tutorials.
 - See [blog.openpolicyagent.org](https://blog.openpolicyagent.org) for blog posts about OPA and policy.
-- Join the conversation on [Slack](http://slack.openpolicyagent.org).
+- See [ADOPTERS.md](./ADOPTERS.md) for a list of production OPA adopters and use cases.
+- See [the Roadmap slides](https://docs.google.com/presentation/d/16QV6gvLDOV3I0_guPC3_19g6jHkEg3X9xqMYgtoCKrs/edit?usp=sharing) for a snapshot of high-level OPA features in-progress and planned.
+- Try [play.openpolicyagent.org](https://play.openpolicyagent.org) to experiment with OPA policies.
+- Join the conversation on [Slack](https://slack.openpolicyagent.org).
 
 ## Want to get OPA?
 
@@ -23,7 +25,7 @@ OPA is hosted by the [Cloud Native Computing Foundation](https://cncf.io) (CNCF)
 * See
   [![GoDoc](https://godoc.org/github.com/open-policy-agent/opa?status.svg)](https://godoc.org/github.com/open-policy-agent/opa/rego)
   to integrate OPA with services written in Go.
-* See [REST API](http://www.openpolicyagent.org/docs/rest-api.html) to
+* See [REST API](https://www.openpolicyagent.org/docs/rest-api.html) to
   integrate OPA with services written in other languages.
 
 
@@ -34,8 +36,8 @@ OPA is hosted by the [Cloud Native Computing Foundation](https://cncf.io) (CNCF)
 * Use [GitHub Issues](https://github.com/open-policy-agent/opa/issues) to request features or file bugs.
 * Join bi-weekly meetings every other Tuesday at 10:00 (Pacific Timezone):
     * [Meeting Notes](https://docs.google.com/document/d/1v6l2gmkRKAn5UIg3V2QdeeCcXMElxsNzEzDkVlWDVg8/edit?usp=sharing)
-    * [Google Hangouts](https://plus.google.com/hangouts/_/styra.com/opa-weekly)
-    * [Calendar Invite](https://calendar.google.com/event?action=TEMPLATE&tmeid=NHY2YmpnYjVwcjU3Y21mNHE0dWFodHU5czRfMjAxODA2MjZUMTcwMDAwWiB0b3JpbkBzdHlyYS5jb20&tmsrc=torin%40styra.com&scp=ALL)
+    * [Google Hangouts](https://meet.google.com/mkq-wdrh-ydw)
+    * [Calendar Invite](https://calendar.google.com/event?action=TEMPLATE&tmeid=MnRvb2M4amtldXBuZ2E1azY0MTJndjh0ODRfMjAxODA5MThUMTcwMDAwWiBzdHlyYS5jb21fY28zOXVzc3VobnE2amUzN2l2dHQyYmNiZGdAZw&tmsrc=styra.com_co39ussuhnq6je37ivtt2bcbdg%40group.calendar.google.com&scp=ALL)
 
 ## How does OPA work?
 
@@ -67,10 +69,10 @@ For example, in a simple API authorization use case:
 The examples below show different kinds of policies you can define with OPA as
 well as different kinds of queries your system can execute against OPA. The
 example queries are executed inside OPA's
-[REPL](http://www.openpolicyagent.org/docs/get-started.html) which was built to
+[REPL](https://www.openpolicyagent.org/docs/get-started.html) which was built to
 make it easy to develop and test policies.
 
-For concrete examples of how to integrate OPA with systems like [Kubernetes](http://www.openpolicyagent.org/docs/kubernetes-admission-control.html), [Terraform](http://www.openpolicyagent.org/docs/terraform.html), [Docker](http://www.openpolicyagent.org/docs/docker-authorization.html), [SSH](http://www.openpolicyagent.org/docs/ssh-and-sudo-authorization.html), and more, see [openpolicyagent.org](http://www.openpolicyagent.org).
+For concrete examples of how to integrate OPA with systems like [Kubernetes](https://www.openpolicyagent.org/docs/kubernetes-admission-control.html), [Terraform](https://www.openpolicyagent.org/docs/terraform.html), [Docker](https://www.openpolicyagent.org/docs/docker-authorization.html), [SSH](https://www.openpolicyagent.org/docs/ssh-and-sudo-authorization.html), and more, see [openpolicyagent.org](https://www.openpolicyagent.org).
 
 ### Example: API Authorization
 
@@ -78,7 +80,33 @@ This example shows how you can enforce access controls over salary information
 served by a simple HTTP API. In this example, users are allowed to access their
 own salary as well as the salary of anyone who reports to them.
 
+The management chain is represented in JSON and stored in a file (`data.json`):
+
+```json
+{
+    "management_chain": {
+        "bob": [
+            "ken",
+            "janet"
+        ],
+        "alice": [
+            "janet"
+        ]
+    }
+}
+```
+
+Start OPA and load the `data.json` file:
+
+```bash
+opa run data.json
+```
+
+Inside the REPL you can define rules and execute queries. Paste the following rules into the REPL.
+
 ```ruby
+default allow = false
+
 allow {
     input.method = "GET"
     input.path = ["salary", id]
@@ -89,7 +117,7 @@ allow {
     input.method = "GET"
     input.path = ["salary", id]
     managers = data.management_chain[id]
-    id = managers[_]
+    input.user_id = managers[_]
 }
 ```
 
@@ -98,7 +126,7 @@ allow {
 **Is someone allowed to access their own salary?**
 
 ```ruby
-> input = {"method": "GET", "path": ["salary", "bob"], "user_id": "bob"}
+> input := {"method": "GET", "path": ["salary", "bob"], "user_id": "bob"}
 > allow
 true
 ```
@@ -116,7 +144,7 @@ true
 **Is Alice allowed to access Bob's salary?**
 
 ```ruby
-> input = {"method": "GET", "path": ["salary", "bob"], "user_id": "alice"}
+> input := {"method": "GET", "path": ["salary", "bob"], "user_id": "alice"}
 > allow
 false
 ```
@@ -124,7 +152,7 @@ false
 **Is Janet allowed to access Bob's salary?**
 
 ```ruby
-> input = {"method": "GET", "path": ["salary", "alice"], "user_id": "janet"}
+> input := {"method": "GET", "path": ["salary", "bob"], "user_id": "janet"}
 > allow
 true
 ```
@@ -166,7 +194,7 @@ satisfies_pci(app, cluster) {
 **Where will this app be deployed?**
 
 ```ruby
-> input = {"app": {"tags": {"requires-pci-level": "3", "requires-eu": "true"}}}
+> input := {"app": {"tags": {"requires-pci-level": "3", "requires-eu": "true"}}}
 > app_placement
 [
     "prod-eu"
@@ -288,13 +316,15 @@ true
 - Enforcing Bespoke Policies In Kubernetes @ KubeCon US 2017: [video](https://www.youtube.com/watch?v=llDI8VvkUj8), [slides](https://www.slideshare.net/TorinSandall/enforcing-bespoke-policies-in-kubernetes).
 - Istio's Mixer: Policy Enforcement with Custom Adapters @ CloudNativeCon US 2017: [video](https://www.youtube.com/watch?v=czZLXUqzd24), [slides](https://www.slideshare.net/TorinSandall/istios-mixer-policy-enforcement-with-custom-adapters-cloud-nativecon-17).
 
-## Reporting Security Vulnerabilities
+## Security
+
+### Security Audit
+
+A third party security audit was performed by Cure53, you can see the full report [here](SECURITY_AUDIT.pdf)
+
+### Reporting Security Vulnerabilities
 
 Please report vulnerabilities by email to [open-policy-agent-security](mailto:open-policy-agent-security@googlegroups.com).
 We will send a confirmation message to acknowledge that we have received the
 report and then we will send additional messages to follow up once the issue
 has been investigated.
-
-## License
-
-[![FOSSA Status](https://app.fossa.io/api/projects/git%2Bgithub.com%2Fopen-policy-agent%2Fopa.svg?type=large)](https://app.fossa.io/projects/git%2Bgithub.com%2Fopen-policy-agent%2Fopa?ref=badge_large)

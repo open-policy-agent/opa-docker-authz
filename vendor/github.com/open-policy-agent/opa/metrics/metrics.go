@@ -7,6 +7,9 @@ package metrics
 
 import (
 	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	go_metrics "github.com/rcrowley/go-metrics"
@@ -14,12 +17,14 @@ import (
 
 // Well-known metric names.
 const (
+	ServerHandler     = "server_handler"
 	RegoQueryCompile  = "rego_query_compile"
 	RegoQueryEval     = "rego_query_eval"
 	RegoQueryParse    = "rego_query_parse"
 	RegoModuleParse   = "rego_module_parse"
 	RegoModuleCompile = "rego_module_compile"
 	RegoPartialEval   = "rego_partial_eval"
+	RegoInputParse    = "rego_input_parse"
 )
 
 // Metrics defines the interface for a collection of performance metrics in the
@@ -44,6 +49,35 @@ func New() Metrics {
 	m := &metrics{}
 	m.Clear()
 	return m
+}
+
+type metric struct {
+	Key   string
+	Value interface{}
+}
+
+func (m *metrics) String() string {
+
+	all := m.All()
+	sorted := make([]metric, 0, len(all))
+
+	for key, value := range all {
+		sorted = append(sorted, metric{
+			Key:   key,
+			Value: value,
+		})
+	}
+
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Key < sorted[j].Key
+	})
+
+	buf := make([]string, len(sorted))
+	for i := range sorted {
+		buf[i] = fmt.Sprintf("%v:%v", sorted[i].Key, sorted[i].Value)
+	}
+
+	return strings.Join(buf, " ")
 }
 
 func (m *metrics) MarshalJSON() ([]byte, error) {
@@ -206,5 +240,5 @@ func (c *counter) Incr() {
 }
 
 func (c *counter) Value() interface{} {
-	return *c
+	return uint64(*c)
 }

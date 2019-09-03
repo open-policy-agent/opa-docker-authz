@@ -81,6 +81,8 @@ func WalkBeforeAndAfter(v BeforeAndAfterVisitor, x interface{}) {
 		}
 	case *Expr:
 		switch ts := x.Terms.(type) {
+		case *SomeDecl:
+			Walk(w, ts)
 		case []*Term:
 			for _, t := range ts {
 				Walk(w, t)
@@ -220,7 +222,24 @@ func WalkBodies(x interface{}, f func(Body) bool) {
 func WalkRules(x interface{}, f func(*Rule) bool) {
 	vis := &GenericVisitor{func(x interface{}) bool {
 		if r, ok := x.(*Rule); ok {
-			return f(r)
+			stop := f(r)
+			// NOTE(tsandall): since rules cannot be embedded inside of queries
+			// we can stop early if there is no else block.
+			if stop || r.Else == nil {
+				return true
+			}
+		}
+		return false
+	}}
+	Walk(vis, x)
+}
+
+// WalkNodes calls the function f on all nodes under x. If the function f
+// returns true, AST nodes under the last node will not be visited.
+func WalkNodes(x interface{}, f func(Node) bool) {
+	vis := &GenericVisitor{func(x interface{}) bool {
+		if n, ok := x.(Node); ok {
+			return f(n)
 		}
 		return false
 	}}
@@ -320,19 +339,29 @@ func (vis *VarVisitor) Visit(v interface{}) Visitor {
 		}
 	}
 	if vis.params.SkipRefCallHead {
-		if expr, ok := v.(*Expr); ok {
-			if terms, ok := expr.Terms.([]*Term); ok {
+		switch v := v.(type) {
+		case *Expr:
+			if terms, ok := v.Terms.([]*Term); ok {
 				for _, t := range terms[0].Value.(Ref)[1:] {
 					Walk(vis, t)
 				}
 				for i := 1; i < len(terms); i++ {
 					Walk(vis, terms[i])
 				}
-				for _, w := range expr.With {
+				for _, w := range v.With {
 					Walk(vis, w)
 				}
 				return nil
 			}
+		case Call:
+			operator := v[0].Value.(Ref)
+			for i := 1; i < len(operator); i++ {
+				Walk(vis, operator[i])
+			}
+			for i := 1; i < len(v); i++ {
+				Walk(vis, v[i])
+			}
+			return nil
 		}
 	}
 	if v, ok := v.(Var); ok {

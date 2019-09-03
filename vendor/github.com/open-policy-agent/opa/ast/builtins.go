@@ -27,7 +27,6 @@ func RegisterBuiltin(b *Builtin) {
 // by default. When adding a new built-in function to OPA, update this
 // list.
 var DefaultBuiltins = [...]*Builtin{
-
 	// Unification/equality ("=")
 	Equality,
 
@@ -66,9 +65,12 @@ var DefaultBuiltins = [...]*Builtin{
 
 	// Arrays
 	ArrayConcat,
+	ArraySlice,
 
-	// Casting
+	// Conversions
 	ToNumber,
+
+	// Casts (DEPRECATED)
 	CastObject,
 	CastNull,
 	CastBoolean,
@@ -80,6 +82,8 @@ var DefaultBuiltins = [...]*Builtin{
 	RegexMatch,
 	RegexSplit,
 	GlobsMatch,
+	RegexTemplateMatch,
+	RegexFind,
 
 	// Sets
 	SetDiff,
@@ -120,6 +124,9 @@ var DefaultBuiltins = [...]*Builtin{
 	JWTVerifyPS256,
 	JWTVerifyES256,
 	JWTVerifyHS256,
+	JWTDecodeVerify,
+	JWTEncodeSignRaw,
+	JWTEncodeSign,
 
 	// Time
 	NowNanos,
@@ -155,8 +162,20 @@ var DefaultBuiltins = [...]*Builtin{
 	// Rego
 	RegoParseModule,
 
+	// OPA
+	OPARuntime,
+
 	// Tracing
 	Trace,
+
+	// CIDR
+	NetCIDROverlap,
+	NetCIDRIntersects,
+	NetCIDRContains,
+
+	// Glob
+	GlobMatch,
+	GlobQuoteMeta,
 }
 
 // BuiltinMap provides a convenient mapping of built-in names to
@@ -493,8 +512,21 @@ var ArrayConcat = &Builtin{
 	),
 }
 
+// ArraySlice returns a slice of a given array
+var ArraySlice = &Builtin{
+	Name: "array.slice",
+	Decl: types.NewFunction(
+		types.Args(
+			types.NewArray(nil, types.A),
+			types.NewNumber(),
+			types.NewNumber(),
+		),
+		types.NewArray(nil, types.A),
+	),
+}
+
 /**
- * Casting
+ * Conversions
  */
 
 // ToNumber takes a string, bool, or number value and converts it to a number.
@@ -515,65 +547,6 @@ var ToNumber = &Builtin{
 	),
 }
 
-// CastArray checks the underlying type of the input. If it is array or set, an array
-// containing the values is returned. If it is not an array, an error is thrown.
-var CastArray = &Builtin{
-	Name: "cast_array",
-	Decl: types.NewFunction(
-		types.Args(types.A),
-		types.NewArray(nil, types.A),
-	),
-}
-
-// CastSet checks the underlying type of the input.
-// If it is a set, the set is returned.
-// If it is an array, the array is returned in set form (all duplicates removed)
-// If neither, an error is thrown
-var CastSet = &Builtin{
-	Name: "cast_set",
-	Decl: types.NewFunction(
-		types.Args(types.A),
-		types.NewSet(types.A),
-	),
-}
-
-// CastString returns input if it is a string; if not returns error.
-// For formatting variables, see sprintf
-var CastString = &Builtin{
-	Name: "cast_string",
-	Decl: types.NewFunction(
-		types.Args(types.A),
-		types.S,
-	),
-}
-
-// CastBoolean returns input if it is a boolean; if not returns error.
-var CastBoolean = &Builtin{
-	Name: "cast_boolean",
-	Decl: types.NewFunction(
-		types.Args(types.A),
-		types.B,
-	),
-}
-
-// CastNull returns null if input is null; if not returns error.
-var CastNull = &Builtin{
-	Name: "cast_null",
-	Decl: types.NewFunction(
-		types.Args(types.A),
-		types.NewNull(),
-	),
-}
-
-// CastObject returns the given object if it is null; throws an error otherwise
-var CastObject = &Builtin{
-	Name: "cast_object",
-	Decl: types.NewFunction(
-		types.Args(types.A),
-		types.NewObject(nil, types.NewDynamicProperty(types.A, types.A)),
-	),
-}
-
 /**
  * Regular Expressions
  */
@@ -591,13 +564,42 @@ var RegexMatch = &Builtin{
 	),
 }
 
-// RegexSplit splits the input string by the occurences of the given pattern.
+// RegexTemplateMatch takes two strings and evaluates to true if the string in the second
+// position matches the pattern in the first position.
+var RegexTemplateMatch = &Builtin{
+	Name: "regex.template_match",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+			types.S,
+			types.S,
+			types.S,
+		),
+		types.B,
+	),
+}
+
+// RegexSplit splits the input string by the occurrences of the given pattern.
 var RegexSplit = &Builtin{
 	Name: "regex.split",
 	Decl: types.NewFunction(
 		types.Args(
 			types.S,
 			types.S,
+		),
+		types.NewArray(nil, types.S),
+	),
+}
+
+// RegexFind takes two strings and a number, the pattern, the value and number of match values to
+// return, -1 means all match values.
+var RegexFind = &Builtin{
+	Name: "regex.find_n",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+			types.S,
+			types.N,
 		),
 		types.NewArray(nil, types.S),
 	),
@@ -957,6 +959,50 @@ var JWTVerifyHS256 = &Builtin{
 	),
 }
 
+// JWTDecodeVerify verifies a JWT signature under parameterized constraints and decodes the claims if it is valid.
+var JWTDecodeVerify = &Builtin{
+	Name: "io.jwt.decode_verify",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+			types.NewObject(nil, types.NewDynamicProperty(types.S, types.A)),
+		),
+		types.NewArray([]types.Type{
+			types.B,
+			types.NewObject(nil, types.NewDynamicProperty(types.A, types.A)),
+			types.NewObject(nil, types.NewDynamicProperty(types.A, types.A)),
+		}, nil),
+	),
+}
+
+// JWTEncodeSignRaw encodes and optionally sign  a JSON Web Token.
+// Inputs are protected headers, payload, secret
+var JWTEncodeSignRaw = &Builtin{
+	Name: "io.jwt.encode_sign_raw",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+			types.S,
+			types.S,
+		),
+		types.S,
+	),
+}
+
+// JWTEncodeSign encodes and optionally sign  a JSON Web Token.
+// Inputs are protected headers, payload, secret
+var JWTEncodeSign = &Builtin{
+	Name: "io.jwt.encode_sign",
+	Decl: types.NewFunction(
+		types.Args(
+			types.NewObject(nil, types.NewDynamicProperty(types.S, types.A)),
+			types.NewObject(nil, types.NewDynamicProperty(types.S, types.A)),
+			types.NewObject(nil, types.NewDynamicProperty(types.S, types.A)),
+		),
+		types.S,
+	),
+}
+
 /**
  * Time
  */
@@ -1005,7 +1051,12 @@ var ParseDurationNanos = &Builtin{
 var Date = &Builtin{
 	Name: "time.date",
 	Decl: types.NewFunction(
-		types.Args(types.N),
+		types.Args(
+			types.NewAny(
+				types.N,
+				types.NewArray([]types.Type{types.N, types.S}, nil),
+			),
+		),
 		types.NewArray([]types.Type{types.N, types.N, types.N}, nil),
 	),
 }
@@ -1014,7 +1065,12 @@ var Date = &Builtin{
 var Clock = &Builtin{
 	Name: "time.clock",
 	Decl: types.NewFunction(
-		types.Args(types.N),
+		types.Args(
+			types.NewAny(
+				types.N,
+				types.NewArray([]types.Type{types.N, types.S}, nil),
+			),
+		),
 		types.NewArray([]types.Type{types.N, types.N, types.N}, nil),
 	),
 }
@@ -1023,7 +1079,12 @@ var Clock = &Builtin{
 var Weekday = &Builtin{
 	Name: "time.weekday",
 	Decl: types.NewFunction(
-		types.Args(types.N),
+		types.Args(
+			types.NewAny(
+				types.N,
+				types.NewArray([]types.Type{types.N, types.S}, nil),
+			),
+		),
 		types.S,
 	),
 }
@@ -1213,6 +1274,20 @@ var RegoParseModule = &Builtin{
 }
 
 /**
+ * OPA
+ */
+
+// OPARuntime returns an object containing OPA runtime information such as the
+// configuration that OPA was booted with.
+var OPARuntime = &Builtin{
+	Name: "opa.runtime",
+	Decl: types.NewFunction(
+		nil,
+		types.NewObject(nil, types.NewDynamicProperty(types.S, types.A)),
+	),
+}
+
+/**
  * Trace
  */
 
@@ -1254,6 +1329,62 @@ var Union = &Builtin{
 }
 
 /**
+ * Glob
+ */
+
+// GlobMatch - not to be confused with regex.globs_match - parses and matches strings against the glob notation.
+var GlobMatch = &Builtin{
+	Name: "glob.match",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+			types.NewArray(nil, types.S),
+			types.S,
+		),
+		types.B,
+	),
+}
+
+// GlobQuoteMeta returns a string which represents a version of the pattern where all asterisks have been escaped.
+var GlobQuoteMeta = &Builtin{
+	Name: "glob.quote_meta",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+		),
+		types.S,
+	),
+}
+
+/**
+ * Net CIDR
+ */
+
+// NetCIDRIntersects checks if a cidr intersects with another cidr and returns true or false
+var NetCIDRIntersects = &Builtin{
+	Name: "net.cidr_intersects",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+			types.S,
+		),
+		types.B,
+	),
+}
+
+// NetCIDRContains checks if a cidr or ip is contained within another cidr and returns true or false
+var NetCIDRContains = &Builtin{
+	Name: "net.cidr_contains",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+			types.S,
+		),
+		types.B,
+	),
+}
+
+/**
  * Deprecated built-ins.
  */
 
@@ -1266,6 +1397,77 @@ var SetDiff = &Builtin{
 			types.NewSet(types.A),
 		),
 		types.NewSet(types.A),
+	),
+}
+
+// NetCIDROverlap has been replaced by the `net.cidr_contains` built-in.
+var NetCIDROverlap = &Builtin{
+	Name: "net.cidr_overlap",
+	Decl: types.NewFunction(
+		types.Args(
+			types.S,
+			types.S,
+		),
+		types.B,
+	),
+}
+
+// CastArray checks the underlying type of the input. If it is array or set, an array
+// containing the values is returned. If it is not an array, an error is thrown.
+var CastArray = &Builtin{
+	Name: "cast_array",
+	Decl: types.NewFunction(
+		types.Args(types.A),
+		types.NewArray(nil, types.A),
+	),
+}
+
+// CastSet checks the underlying type of the input.
+// If it is a set, the set is returned.
+// If it is an array, the array is returned in set form (all duplicates removed)
+// If neither, an error is thrown
+var CastSet = &Builtin{
+	Name: "cast_set",
+	Decl: types.NewFunction(
+		types.Args(types.A),
+		types.NewSet(types.A),
+	),
+}
+
+// CastString returns input if it is a string; if not returns error.
+// For formatting variables, see sprintf
+var CastString = &Builtin{
+	Name: "cast_string",
+	Decl: types.NewFunction(
+		types.Args(types.A),
+		types.S,
+	),
+}
+
+// CastBoolean returns input if it is a boolean; if not returns error.
+var CastBoolean = &Builtin{
+	Name: "cast_boolean",
+	Decl: types.NewFunction(
+		types.Args(types.A),
+		types.B,
+	),
+}
+
+// CastNull returns null if input is null; if not returns error.
+var CastNull = &Builtin{
+	Name: "cast_null",
+	Decl: types.NewFunction(
+		types.Args(types.A),
+		types.NewNull(),
+	),
+}
+
+// CastObject returns the given object if it is null; throws an error otherwise
+var CastObject = &Builtin{
+	Name: "cast_object",
+	Decl: types.NewFunction(
+		types.Args(types.A),
+		types.NewObject(nil, types.NewDynamicProperty(types.A, types.A)),
 	),
 }
 

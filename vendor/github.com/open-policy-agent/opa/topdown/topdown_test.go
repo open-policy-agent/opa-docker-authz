@@ -6,14 +6,12 @@ package topdown
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
-
 	"time"
 
 	"github.com/open-policy-agent/opa/ast"
@@ -700,6 +698,12 @@ iterate_ground[x] { data.topdown.virtual.constants[x] = 1 }
 		`package topdown.conflicts
 
 		k = "bar"`,
+		`package enum_errors.a.b.c
+
+p = x { x = 1/0 }`,
+		`package enum_errors.caller
+
+p[x] = y { data.enum_errors.a[x] = y }`,
 	})
 
 	store := inmem.NewFromObject(data)
@@ -748,7 +752,8 @@ iterate_ground[x] { data.topdown.virtual.constants[x] = 1 }
 	assertTopDownWithPath(t, compiler, store, "base/virtual: undefined-2", []string{"topdown", "v"}, "{}", `{"h": {"k": [1,2,3]}}`)
 	assertTopDownWithPath(t, compiler, store, "base/virtual: missing input value", []string{"topdown", "u"}, "{}", "{}")
 	assertTopDownWithPath(t, compiler, store, "iterate ground", []string{"topdown", "iterate_ground"}, "{}", `["p", "r"]`)
-	assertTopDownWithPath(t, compiler, store, "base/virtual: conflicts", []string{"topdown.conflicts"}, "{}", fmt.Errorf("base and virtual document keys must be disjoint"))
+	assertTopDownWithPath(t, compiler, store, "base/virtual: conflicts", []string{"topdown.conflicts"}, "{}", `{"k": "foo"}`)
+	assertTopDownWithPath(t, compiler, store, "enumerate virtual errors", []string{"enum_errors", "caller", "p"}, `{}`, fmt.Errorf("divide by zero"))
 }
 
 func TestTopDownNestedReferences(t *testing.T) {
@@ -1050,6 +1055,7 @@ func TestTopDownArithmetic(t *testing.T) {
 		{"abs", []string{`p = true { abs(-10, x); x = 10 }`}, "true"},
 		{"remainder", []string{`p = x { x = 7 % 4 }`}, "3"},
 		{"remainder+error", []string{`p = x { x = 7 % 0 }`}, fmt.Errorf("modulo by zero")},
+		{"remainder+error+floating", []string{`p = x { x = 1.1 % 1 }`}, fmt.Errorf("modulo on floating-point number")},
 		{"arity 1 ref dest", []string{`p = true { abs(-4, a[3]) }`}, "true"},
 		{"arity 1 ref dest (2)", []string{`p = true { not abs(-5, a[3]) }`}, "true"},
 		{"arity 2 ref dest", []string{`p = true { a[2] = 1 + 2 }`}, "true"},
@@ -1186,19 +1192,19 @@ func TestTopDownTypeNameBuiltin(t *testing.T) {
 		expected interface{}
 	}{
 		{"type_name", []string{
-			`p = x { type_name(null, x) }`}, ast.String("null")},
+			`p = x { type_name(null, x) }`}, `"null"`},
 		{"type_name", []string{
-			`p = x { type_name(true, x) }`}, ast.String("boolean")},
+			`p = x { type_name(true, x) }`}, `"boolean"`},
 		{"type_name", []string{
-			`p = x { type_name(100, x) }`}, ast.String("number")},
+			`p = x { type_name(100, x) }`}, `"number"`},
 		{"type_name", []string{
-			`p = x { type_name("Hello", x) }`}, ast.String("string")},
+			`p = x { type_name("Hello", x) }`}, `"string"`},
 		{"type_name", []string{
-			`p = x { type_name([1,2,3], x) }`}, ast.String("array")},
+			`p = x { type_name([1,2,3], x) }`}, `"array"`},
 		{"type_name", []string{
-			`p = x { type_name({1,2,3}, x) }`}, ast.String("set")},
+			`p = x { type_name({1,2,3}, x) }`}, `"set"`},
 		{"type_name", []string{
-			`p = x { type_name({"foo": yy | yy = 1}, x) }`}, ast.String("object")},
+			`p = x { type_name({"foo": yy | yy = 1}, x) }`}, `"object"`},
 	}
 
 	data := loadSmallTestData()
@@ -1313,6 +1319,9 @@ func TestTopDownStrings(t *testing.T) {
 		{"substring", []string{`p = x { substring("abcdefgh", 2, 3, x) }`}, `"cde"`},
 		{"substring: remainder", []string{`p = x { substring("abcdefgh", 2, -1, x) }`}, `"cdefgh"`},
 		{"substring: too long", []string{`p = x { substring("abcdefgh", 2, 10000, x) }`}, `"cdefgh"`},
+		{"substring: offset negative", []string{`p = x { substring("aaa", -1, -1, x) }`}, fmt.Errorf("negative offset")},
+		{"substring: offset too long", []string{`p = x { substring("aaa", 3, -1, x) }`}, `""`},
+		{"substring: offset too long 2", []string{`p = x { substring("aaa", 4, -1, x) }`}, `""`},
 		{"contains", []string{`p = true { contains("abcdefgh", "defg") }`}, "true"},
 		{"contains: undefined", []string{`p = true { contains("abcdefgh", "ac") }`}, ""},
 		{"startswith", []string{`p = true { startswith("abcdefgh", "abcd") }`}, "true"},
@@ -1436,318 +1445,6 @@ func TestTopDownURLBuiltins(t *testing.T) {
 	}
 }
 
-func TestTopDownJWTBuiltins(t *testing.T) {
-	params := []struct {
-		note      string
-		input     string
-		header    string
-		payload   string
-		signature string
-		err       string
-	}{
-		{
-			"simple",
-			`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwIiwiaXNzIjoib3BhIn0.XmVoLoHI3pxMtMO_WRONMSJzGUDP9pDjy8Jp0_tdRXY`,
-			`{ "alg": "HS256", "typ": "JWT" }`,
-			`{ "sub": "0", "iss": "opa" }`,
-			`5e65682e81c8de9c4cb4c3bf59138d3122731940cff690e3cbc269d3fb5d4576`,
-			"",
-		},
-		{
-			"simple-non-registered",
-			`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuZXciOiJJIGFtIGEgdXNlciBjcmVhdGVkIGZpZWxkIiwiaXNzIjoib3BhIn0.6UmjsclVDGD9jcmX_F8RJzVgHtUZuLu2pxkF_UEQCrE`,
-			`{ "alg": "HS256", "typ": "JWT" }`,
-			`{ "new": "I am a user created field", "iss": "opa" }`,
-			`e949a3b1c9550c60fd8dc997fc5f112735601ed519b8bbb6a71905fd41100ab1`,
-			"",
-		},
-		{
-			"no-support-jwe",
-			`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImVuYyI6ImJsYWgifQ.eyJuZXciOiJJIGFtIGEgdXNlciBjcmVhdGVkIGZpZWxkIiwiaXNzIjoib3BhIn0.McGUb1e-UviZKy6UyQErNNQzEUgeV25Buwk7OHOa8U8`,
-			``,
-			``,
-			``,
-			"JWT is a JWE object, which is not supported",
-		},
-		{
-			"no-periods",
-			`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9eyJzdWIiOiIwIiwiaXNzIjoib3BhIn0XmVoLoHI3pxMtMO_WRONMSJzGUDP9pDjy8Jp0_tdRXY`,
-			``,
-			``,
-			``,
-			"encoded JWT had no period separators",
-		},
-		{
-			"wrong-period-count",
-			`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXV.CJ9eyJzdWIiOiIwIiwiaXNzIjoib3BhIn0XmVoLoHI3pxMtMO_WRONMSJzGUDP9pDjy8Jp0_tdRXY`,
-			``,
-			``,
-			``,
-			"encoded JWT must have 3 sections, found 2",
-		},
-		{
-			"bad-header-encoding",
-			`eyJhbGciOiJIU^%zI1NiI+sInR5cCI6IkpXVCJ9.eyJzdWIiOiIwIiwiaXNzIjoib3BhIn0.XmVoLoHI3pxMtMO_WRONMSJzGUDP9pDjy8Jp0_tdRXY`,
-			``,
-			``,
-			``,
-			"JWT header had invalid encoding: illegal base64 data at input byte 13",
-		},
-		{
-			"bad-payload-encoding",
-			`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwIiwia/XNzIjoib3BhIn0.XmVoLoHI3pxMtMO_WRONMSJzGUDP9pDjy8Jp0_tdRXY`,
-			``,
-			``,
-			``,
-			"JWT payload had invalid encoding: illegal base64 data at input byte 17",
-		},
-		{
-			"bad-signature-encoding",
-			`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwIiwiaXNzIjoib3BhIn0.XmVoLoHI3pxMtMO(_WRONMSJzGUDP9pDjy8Jp0_tdRXY`,
-			``,
-			``,
-			``,
-			"JWT signature had invalid encoding: illegal base64 data at input byte 15",
-		},
-		{
-			"nested",
-			`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImN0eSI6IkpXVCJ9.ImV5SmhiR2NpT2lKSVV6STFOaUlzSW5SNWNDSTZJa3BYVkNKOS5leUp6ZFdJaU9pSXdJaXdpYVhOeklqb2liM0JoSW4wLlhtVm9Mb0hJM3B4TXRNT19XUk9OTVNKekdVRFA5cERqeThKcDBfdGRSWFki.8W0qx4mLxslmZl7wEMUWBxH7tST3XsEuWXxesXqFnRI`,
-			`{ "alg": "HS256", "typ": "JWT" }`,
-			`{ "sub": "0", "iss": "opa" }`,
-			`5e65682e81c8de9c4cb4c3bf59138d3122731940cff690e3cbc269d3fb5d4576`,
-			"",
-		},
-		{
-			"double-nested",
-			`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImN0eSI6IkpXVCJ9.ImV5SmhiR2NpT2lKSVV6STFOaUlzSW5SNWNDSTZJa3BYVkNJc0ltTjBlU0k2SWtwWFZDSjkuSW1WNVNtaGlSMk5wVDJsS1NWVjZTVEZPYVVselNXNVNOV05EU1RaSmEzQllWa05LT1M1bGVVcDZaRmRKYVU5cFNYZEphWGRwWVZoT2VrbHFiMmxpTTBKb1NXNHdMbGh0Vm05TWIwaEpNM0I0VFhSTlQxOVhVazlPVFZOS2VrZFZSRkE1Y0VScWVUaEtjREJmZEdSU1dGa2kuOFcwcXg0bUx4c2xtWmw3d0VNVVdCeEg3dFNUM1hzRXVXWHhlc1hxRm5SSSI.U8rwnGAJ-bJoGrAYKEzNtbJQWd3x1eW0Y25nLKHDCgo`,
-			`{ "alg": "HS256", "typ": "JWT" }`,
-			`{ "sub": "0", "iss": "opa" }`,
-			`5e65682e81c8de9c4cb4c3bf59138d3122731940cff690e3cbc269d3fb5d4576`,
-			"",
-		},
-		{
-			"complex-values",
-			`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwIiwiaXNzIjoib3BhIiwiZXh0Ijp7ImFiYyI6IjEyMyIsImNiYSI6WzEwLCIxMCJdfX0.IIxF-uJ6i4K5Dj71xNLnUeqB9jmujl6ujTInhii1PxE`,
-			`{ "alg": "HS256", "typ": "JWT" }`,
-			`{ "sub": "0", "iss": "opa", "ext": { "abc": "123", "cba": [10, "10"] } }`,
-			`208c45fae27a8b82b90e3ef5c4d2e751ea81f639ae8e5eae8d32278628b53f11`,
-			"",
-		},
-		// The test below checks that payloads with duplicate keys
-		// in their encoding produce a token object that binds the key
-		// to the last occurring value, as per RFC 7519 Section 4.
-		// It tests a payload encoding that has 3 duplicates of the
-		// "iss" key, with the values "not opa", "also not opa" and
-		// "opa", in that order.
-		// Go's json.Unmarshal exhibits this behavior, but it is not
-		// documented, so this test is meant to catch that behavior
-		// if it changes.
-		{
-			"duplicate-keys",
-			`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiAiMCIsImlzcyI6ICJub3Qgb3BhIiwgImlzcyI6ICJhbHNvIG5vdCBvcGEiLCAiaXNzIjogIm9wYSJ9.XmVoLoHI3pxMtMO_WRONMSJzGUDP9pDjy8Jp0_tdRXY`,
-			`{ "alg": "HS256", "typ": "JWT" }`,
-			`{ "sub": "0", "iss": "opa" }`,
-			`5e65682e81c8de9c4cb4c3bf59138d3122731940cff690e3cbc269d3fb5d4576`,
-			"",
-		},
-	}
-
-	type test struct {
-		note     string
-		rules    []string
-		expected interface{}
-	}
-	tests := []test{}
-
-	for _, p := range params {
-		var exp interface{}
-		exp = fmt.Sprintf(`[%s, %s, "%s"]`, p.header, p.payload, p.signature)
-		if p.err != "" {
-			exp = errors.New(p.err)
-		}
-
-		tests = append(tests, test{
-			p.note,
-			[]string{fmt.Sprintf(`p = [x, y, z] { io.jwt.decode("%s", [x, y, z]) }`, p.input)},
-			exp,
-		})
-	}
-
-	data := loadSmallTestData()
-
-	for _, tc := range tests {
-		runTopDownTestCase(t, data, tc.note, tc.rules, tc.expected)
-	}
-}
-
-func TestTopDownJWTVerifyRSA(t *testing.T) {
-	const certPem = `-----BEGIN CERTIFICATE-----\nMIIFiDCCA3ACCQCGV6XsfG/oRTANBgkqhkiG9w0BAQUFADCBhTELMAkGA1UEBhMC\nVVMxEzARBgNVBAgMCkNhbGlmb3JuaWExFTATBgNVBAcMDFJlZHdvb2QgQ2l0eTEO\nMAwGA1UECgwFU3R5cmExDDAKBgNVBAsMA0RldjESMBAGA1UEAwwJbG9jYWxob3N0\nMRgwFgYJKoZIhvcNAQkBFglhc2hAc3R5cmEwHhcNMTgwMzA2MDAxNTU5WhcNMTkw\nMzA2MDAxNTU5WjCBhTELMAkGA1UEBhMCVVMxEzARBgNVBAgMCkNhbGlmb3JuaWEx\nFTATBgNVBAcMDFJlZHdvb2QgQ2l0eTEOMAwGA1UECgwFU3R5cmExDDAKBgNVBAsM\nA0RldjESMBAGA1UEAwwJbG9jYWxob3N0MRgwFgYJKoZIhvcNAQkBFglhc2hAc3R5\ncmEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQDucnAwTRA0zqDQ671L\nKWOVwhjhycFyzyhZUd7vhsnslOBiYM6TYIDXhETfAk2RQoRE/9xF16woMD8FOglc\nlSuhi+GNfFRif6LfArm84ZFj1ZS1MX2logikhXhRJQ7AOHe5+ED0re3KH5lWyqfz\nR6bQuPYwTQSBJy6Tq7T9RiOM29yadCX64OaCEbzEFmHtNlbb5px4zCVvgskg/fpV\nGGCMpAYjGDatbxE5eAloVs1EJuI5RSqWr1JRm6EejxM04BFdfGn1HgWrsKXtlvBa\n00/AC0zXL5n6LK7+L3WbRguVTZcE4Yu70gDwhmM+VsKeT9LKClX003BNj0NJDRB9\ndw9MaWxsXDNHNOWEfbnASXeP7ZRv3D81ftij6P8SL14ZnxyrRty8TAN4ij3wd41l\nastRQCtrJFi+HzO606XOp6HDzBoWT0DGl8Sn2hZ6RLPyBnD04vvvcSGeCVjHGOQ8\nc3OTroK58u5MR/q4T00sTkeeVAxuKoEWKsjIBYYrJTe/a2mEq9yiDGbPNYDnWnQZ\njSUZm+Us23Y2sm/agZ5zKXcEuoecGL6sYCixr/xeB9BPxEiTthH+0M8OY99qpIhz\nSmj41wdgQfzZi/6B8pIr77V/KywYKxJEmzw8Uy48aC/rZ8WsT8QdKwclo1aiNJhx\n79OvGbZFoeHD/w7igpx+ttpF/wIDAQABMA0GCSqGSIb3DQEBBQUAA4ICAQC3wWUs\nfXz+aSfFVz+O3mLFkr65NIgazbGAySgMgMNVuadheIkPL4k21atyflfpx4pg9FGv\n40vWCLMajpvynfz4oqah0BACnpqzQ8Dx6HYkmlXK8fLB+WtPrZBeUEsGPKuJYt4M\nd5TeY3VpNgWOPXmnE4lvxHZqh/8OwmOpjBfC9E3e2eqgwiwOkXnMaZEPgKP6JiWk\nEFaQ9jgMQqJZnNcv6NmiqqsZeI0/NNjBpkmEWQl+wLegVusHiQ0FMBMQ0taEo21r\nzUwHoNJR3h3wgGQiKxKOH1FUKHBV7hEqObLraD/hfG5xYucJfvvAAP1iH0ycPs+9\nhSccrn5/HY1c9AZnW8Kh7atp/wFP+sHjtECWK/lUmXfhASS293hprCpJk2n9pkmR\nziXKJhjwkxlC8NcHuiVfaxdfDa4+1Qta2gK7GEypbvLoEmIt/dsYUsxUg84lwJJ9\nnyC/pfZ5a8wFSf186JeVH4kHd3bnkzlQz460HndOMSJ/Xi1wSfuZlOVupFf8TVKl\np4j28MTLH2Wqx50NssKThdaX6hoCiMqreYa+EVaN1f/cIGQxZSCzdzMCKqdB8lKB\n3Eax+5zsIa/UyPwGxZcyXBRHAlz5ZnkjuRxInyiMkBWWz3IZXjTe6Fq8BNd2UWNc\nw35+2nO5n1LKXgR2+nzhZUOk8TPsi9WUywRluQ==\n-----END CERTIFICATE-----`
-	const certPemPs = `-----BEGIN CERTIFICATE-----\nMIIC/DCCAeSgAwIBAgIJAJRvYDU3ei3EMA0GCSqGSIb3DQEBCwUAMBMxETAPBgNV\nBAMMCHdoYXRldmVyMB4XDTE4MDgxMDEwMzgxNloXDTE4MDkwOTEwMzgxNlowEzER\nMA8GA1UEAwwId2hhdGV2ZXIwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIB\nAQC4kCmzLMW/5jzkzkmN7Me8wPD+ymBUIjsGqliGfMrfFfDV2eTPVtZcYD3IXoB4\nAOUT7XJzWjOsBRFOcVKKEiCPjXiLcwLb/QWQ1x0Budft32r3+N0KQd1rgcRHTPNc\nJoeWCfOgDPp51RTzTT6HQuV4ud+CDhRJP7QMVMIgal9Nuzs49LLZaBPW8/rFsHjk\nJQ4kDujSrpcT6F2FZY3SmWsOJgP7RjVKk5BheYeFKav5ZV4p6iHn/TN4RVpvpNBh\n5z/XoHITJ6lpkHSDpbIaQUTpobU2um8N3biz+HsEAmD9Laa27WUpYSpiM6DDMSXl\ndBDJdumerVRJvXYCtfXqtl17AgMBAAGjUzBRMB0GA1UdDgQWBBRz74MkVzT2K52/\nFJC4mTa9coM/DTAfBgNVHSMEGDAWgBRz74MkVzT2K52/FJC4mTa9coM/DTAPBgNV\nHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAD1ZE4IaIAetqGG+vt9oz1\nIx0j4EPok0ONyhhmiSsF6rSv8zlNWweVf5y6Z+AoTNY1Fym0T7dbpbqIox0EdKV3\nFLzniWOjznupbnqfXwHX/g1UAZSyt3akSatVhvNpGlnd7efTIAiNinX/TkzIjhZ7\nihMIZCGykT1P0ys1OaeEf57wAzviatD4pEMTIW0OOqY8bdRGhuJR1kKUZ/2Nm8Ln\ny7E0y8uODVbH9cAwGyzWB/QFc+bffNgi9uJaPQQc5Zxwpu9utlqyzFvXgV7MBYUK\nEYSLyxp4g4e5aujtLugaC8H6n9vP1mEBr/+T8HGynBZHNTKlDhhL9qDbpkkNB6/w\n-----END CERTIFICATE-----`
-	const certPemEs256 = `-----BEGIN CERTIFICATE-----\nMIIBcDCCARagAwIBAgIJAMZmuGSIfvgzMAoGCCqGSM49BAMCMBMxETAPBgNVBAMM\nCHdoYXRldmVyMB4XDTE4MDgxMDE0Mjg1NFoXDTE4MDkwOTE0Mjg1NFowEzERMA8G\nA1UEAwwId2hhdGV2ZXIwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATPwn3WCEXL\nmjp/bFniDwuwsfu7bASlPae2PyWhqGeWwe23Xlyx+tSqxlkXYe4pZ23BkAAscpGj\nyn5gXHExyDlKo1MwUTAdBgNVHQ4EFgQUElRjSoVgKjUqY5AXz2o74cLzzS8wHwYD\nVR0jBBgwFoAUElRjSoVgKjUqY5AXz2o74cLzzS8wDwYDVR0TAQH/BAUwAwEB/zAK\nBggqhkjOPQQDAgNIADBFAiEA4yQ/88ZrUX68c6kOe9G11u8NUaUzd8pLOtkKhniN\nOHoCIHmNX37JOqTcTzGn2u9+c8NlnvZ0uDvsd1BmKPaUmjmm\n-----END CERTIFICATE-----\n`
-
-	const certPemBad = `-----BEGIN CERT-----\nMIIFiDCCA3ACCQCGV6XsfG/oRTANBgkqhkiG9w0BAQUFADCBhTELMAkGA1UEBhMC\nVVMxEzARBgNVBAgMCkNhbGlmb3JuaWExFTATBgNVBAcMDFJlZHdvb2QgQ2l0eTEO\nMAwGA1UECgwFU3R5cmExDDAKBgNVBAsMA0RldjESMBAGA1UEAwwJbG9jYWxob3N0\nMRgwFgYJKoZIhvcNAQkBFglhc2hAc3R5cmEwHhcNMTgwMzA2MDAxNTU5WhcNMTkw\nMzA2MDAxNTU5WjCBhTELMAkGA1UEBhMCVVMxEzARBgNVBAgMCkNhbGlmb3JuaWEx\nFTATBgNVBAcMDFJlZHdvb2QgQ2l0eTEOMAwGA1UECgwFU3R5cmExDDAKBgNVBAsM\nA0RldjESMBAGA1UEAwwJbG9jYWxob3N0MRgwFgYJKoZIhvcNAQkBFglhc2hAc3R5\ncmEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQDucnAwTRA0zqDQ671L\nKWOVwhjhycFyzyhZUd7vhsnslOBiYM6TYIDXhETfAk2RQoRE/9xF16woMD8FOglc\nlSuhi+GNfFRif6LfArm84ZFj1ZS1MX2logikhXhRJQ7AOHe5+ED0re3KH5lWyqfz\nR6bQuPYwTQSBJy6Tq7T9RiOM29yadCX64OaCEbzEFmHtNlbb5px4zCVvgskg/fpV\nGGCMpAYjGDatbxE5eAloVs1EJuI5RSqWr1JRm6EejxM04BFdfGn1HgWrsKXtlvBa\n00/AC0zXL5n6LK7+L3WbRguVTZcE4Yu70gDwhmM+VsKeT9LKClX003BNj0NJDRB9\ndw9MaWxsXDNHNOWEfbnASXeP7ZRv3D81ftij6P8SL14ZnxyrRty8TAN4ij3wd41l\nastRQCtrJFi+HzO606XOp6HDzBoWT0DGl8Sn2hZ6RLPyBnD04vvvcSGeCVjHGOQ8\nc3OTroK58u5MR/q4T00sTkeeVAxuKoEWKsjIBYYrJTe/a2mEq9yiDGbPNYDnWnQZ\njSUZm+Us23Y2sm/agZ5zKXcEuoecGL6sYCixr/xeB9BPxEiTthH+0M8OY99qpIhz\nSmj41wdgQfzZi/6B8pIr77V/KywYKxJEmzw8Uy48aC/rZ8WsT8QdKwclo1aiNJhx\n79OvGbZFoeHD/w7igpx+ttpF/wIDAQABMA0GCSqGSIb3DQEBBQUAA4ICAQC3wWUs\nfXz+aSfFVz+O3mLFkr65NIgazbGAySgMgMNVuadheIkPL4k21atyflfpx4pg9FGv\n40vWCLMajpvynfz4oqah0BACnpqzQ8Dx6HYkmlXK8fLB+WtPrZBeUEsGPKuJYt4M\nd5TeY3VpNgWOPXmnE4lvxHZqh/8OwmOpjBfC9E3e2eqgwiwOkXnMaZEPgKP6JiWk\nEFaQ9jgMQqJZnNcv6NmiqqsZeI0/NNjBpkmEWQl+wLegVusHiQ0FMBMQ0taEo21r\nzUwHoNJR3h3wgGQiKxKOH1FUKHBV7hEqObLraD/hfG5xYucJfvvAAP1iH0ycPs+9\nhSccrn5/HY1c9AZnW8Kh7atp/wFP+sHjtECWK/lUmXfhASS293hprCpJk2n9pkmR\nziXKJhjwkxlC8NcHuiVfaxdfDa4+1Qta2gK7GEypbvLoEmIt/dsYUsxUg84lwJJ9\nnyC/pfZ5a8wFSf186JeVH4kHd3bnkzlQz460HndOMSJ/Xi1wSfuZlOVupFf8TVKl\np4j28MTLH2Wqx50NssKThdaX6hoCiMqreYa+EVaN1f/cIGQxZSCzdzMCKqdB8lKB\n3Eax+5zsIa/UyPwGxZcyXBRHAlz5ZnkjuRxInyiMkBWWz3IZXjTe6Fq8BNd2UWNc\nw35+2nO5n1LKXgR2+nzhZUOk8TPsi9WUywRluQ==\n-----END CERT-----`
-
-	params := []struct {
-		note   string
-		alg    string
-		input1 string
-		input2 string
-		result bool
-		err    string
-	}{
-		{
-			"success",
-			"rs256",
-			`eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJmb28iOiJiYXIiLCJuYmYiOjE0NDQ0Nzg0MDB9.N0-EVdv5pvUfZYFRzMGnsWpNLHgwMEgViPwpuLBEtt32682OgnOK-N4X-2gpQEjQIbUr0IFym8YsRQU9GZvqQP72Sd6yOQNGSNeE74DpUZCAjBa9SBIb1UlD2MxZB-e7YJiEyo7pZhimaqorXrgorlaXYGMvsCFWDYmBLzGaGYaGJyEpkZHzHb7ujsDrJJjdEtDV3kh13gTHzLPvqnoXuuxelXye_8LPIhvgDy52gT4shUEso71pJCMv_IqAR19ljVE17lJzoi6VhRn6ReNUE-yg4KfCO4Ypnuu-mcQr7XtmSYoWkX72L5UQ-EyWkoz-w0SYKoJTPzHkTL2thYStksVpeNkGuck25aUdtrQgmPbao0QOWBFlkg03e6mPCD2-aXOt1ofth9mZGjxWMHX-mUqHaNmaWM3WhRztJ73hWrmB1YOdYQtOEHejfvR_td5tqIw4W6ufRy2ScOypGQe7kNaUZxpgxZ1927ZGNiQgawIOAQwXOcFx1JNSEIeg55-cYJrHPxsXGOB9ZxW-qnswmFJp474iUVXjzGhLexJDXBwvKGs_O3JFjMsvyV9_hm7bnQU0vG_HgPYs5i9VOHRMujq1vFBcm52TFVOBGdWaGfb9RRdLLYvVkJLk0Poh19rsCWb7-Vc3mAaGGpvuk4Wv-PnGGNC-V-FQqIbijHDrn_g`,
-			certPem,
-			true,
-			"",
-		},
-		{
-			"success-ps256",
-			"ps256",
-			`eyJ0eXAiOiAiSldUIiwgImFsZyI6ICJQUzI1NiJ9.eyJuYmYiOiAxNDQ0NDc4NDAwLCAiZm9vIjogImJhciJ9.i0F3MHWzOsBNLqjQzK1UVeQid9xPMowCoUsoM-C2BDxUY-FMKmCeJ1NJ4TGnS9HzFK1ftEvRnPT7EOxOkHPoCk1rz3feTFgtHtNzQqLM1IBTnz6aHHOrda_bKPHH9ZIYCRQUPXhpC90ivW_IJR-f7Z1WLrMXaJ71i1XteruENHrJJJDn0HedHG6N0VHugBHrak5k57cbE31utAdx83TEd8v2Y8wAkCJXKrdmTa-8419LNxW_yjkvoDD53n3X5CHhYkSymU77p0v6yWO38qDWeKJ-Fm_PrMAo72_rizDBj_yPa5LA3bT_EnsgZtC-sp8_SCDIH41bjiCGpRHhqgZmyw`,
-			certPemPs,
-			true,
-			"",
-		},
-		{
-			"success-es256",
-			"es256",
-			`eyJ0eXAiOiAiSldUIiwgImFsZyI6ICJFUzI1NiJ9.eyJuYmYiOiAxNDQ0NDc4NDAwLCAiaXNzIjogInh4eCJ9.lArczfN-pIL8oUU-7PU83u-zfXougXBZj6drFeKFsPEoVhy9WAyiZlRshYqjTSXdaw8yw2L-ovt4zTUZb2PWMg`,
-			certPemEs256,
-			true,
-			"",
-		},
-		{
-			"failure-bad token",
-			"rs256",
-			`eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJmb28iOiJiYXIiLCJuYmYiOjE0NDQ0Nzg0MDB9.Yt89BjaPCNgol478rYyH66-XgkHos02TsVwxLH3ZlvOoIVjbhYW8q1_MHehct1-yBf1UOX3g-lUrIjpoDtX1TfAESuaWTjYPixRvjfJ-Nn75JF8QuAl5PD27C6aJ4PjUPNfj0kwYBnNQ_oX-ZFb781xRi7qRDB6swE4eBUxzHqKUJBLaMM2r8k1-9iE3ERNeqTJUhV__p0aSyRj-i62rdZ4TC5nhxtWodiGP4e4GrYlXkdaKduK63cfdJF-kfZfTsoDs_xy84pZOkzlflxuNv9bNqd-3ISAdWe4gsEvWWJ8v70-QWkydnH8rhj95DaqoXrjfzbOgDpKtdxJC4daVPKvntykzrxKhZ9UtWzm3OvJSKeyWujFZlldiTfBLqNDgdi-Boj_VxO5Pdh-67lC3L-pBMm4BgUqf6rakBQvoH7AV6zD5CbFixh7DuqJ4eJHHItWzJwDctMrV3asm-uOE1E2B7GErGo3iX6S9Iun_kvRUp6kyvOaDq5VvXzQOKyLQIQyHGGs0aIV5cFI2IuO5Rt0uUj5mzPQrQWHgI4r6Mc5bzmq2QLxBQE8OJ1RFhRpsuoWQyDM8aRiMQIJe1g3x4dnxbJK4dYheYblKHFepScYqT1hllDp3oUNn89sIjQIhJTe8KFATu4K8ppluys7vhpE2a_tq8i5O0MFxWmsxN4Q`,
-			certPem,
-			false,
-			"",
-		},
-		{
-			"failure-wrong key",
-			"ps256",
-			`eyJ0eXAiOiAiSldUIiwgImFsZyI6ICJQUzI1NiJ9.eyJuYmYiOiAxNDQ0NDc4NDAwLCAiZm9vIjogImJhciJ9.i0F3MHWzOsBNLqjQzK1UVeQid9xPMowCoUsoM-C2BDxUY-FMKmCeJ1NJ4TGnS9HzFK1ftEvRnPT7EOxOkHPoCk1rz3feTFgtHtNzQqLM1IBTnz6aHHOrda_bKPHH9ZIYCRQUPXhpC90ivW_IJR-f7Z1WLrMXaJ71i1XteruENHrJJJDn0HedHG6N0VHugBHrak5k57cbE31utAdx83TEd8v2Y8wAkCJXKrdmTa-8419LNxW_yjkvoDD53n3X5CHhYkSymU77p0v6yWO38qDWeKJ-Fm_PrMAo72_rizDBj_yPa5LA3bT_EnsgZtC-sp8_SCDIH41bjiCGpRHhqgZmyw`,
-			certPem,
-			false,
-			"",
-		},
-		{
-			"failure-wrong alg",
-			"ps256",
-			`eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJmb28iOiJiYXIiLCJuYmYiOjE0NDQ0Nzg0MDB9.N0-EVdv5pvUfZYFRzMGnsWpNLHgwMEgViPwpuLBEtt32682OgnOK-N4X-2gpQEjQIbUr0IFym8YsRQU9GZvqQP72Sd6yOQNGSNeE74DpUZCAjBa9SBIb1UlD2MxZB-e7YJiEyo7pZhimaqorXrgorlaXYGMvsCFWDYmBLzGaGYaGJyEpkZHzHb7ujsDrJJjdEtDV3kh13gTHzLPvqnoXuuxelXye_8LPIhvgDy52gT4shUEso71pJCMv_IqAR19ljVE17lJzoi6VhRn6ReNUE-yg4KfCO4Ypnuu-mcQr7XtmSYoWkX72L5UQ-EyWkoz-w0SYKoJTPzHkTL2thYStksVpeNkGuck25aUdtrQgmPbao0QOWBFlkg03e6mPCD2-aXOt1ofth9mZGjxWMHX-mUqHaNmaWM3WhRztJ73hWrmB1YOdYQtOEHejfvR_td5tqIw4W6ufRy2ScOypGQe7kNaUZxpgxZ1927ZGNiQgawIOAQwXOcFx1JNSEIeg55-cYJrHPxsXGOB9ZxW-qnswmFJp474iUVXjzGhLexJDXBwvKGs_O3JFjMsvyV9_hm7bnQU0vG_HgPYs5i9VOHRMujq1vFBcm52TFVOBGdWaGfb9RRdLLYvVkJLk0Poh19rsCWb7-Vc3mAaGGpvuk4Wv-PnGGNC-V-FQqIbijHDrn_g`,
-			certPem,
-			false,
-			"",
-		},
-		{
-			"failure-invalid token",
-			"rs256",
-			`eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJmb28iOiJiYXIiLCJuYmYiOjE0NDQ0Nzg0MDB9`,
-			certPem,
-			false,
-			"encoded JWT must have 3 sections, found 2",
-		},
-		{
-			"failure-bad cert",
-			"rs256",
-			`eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJmb28iOiJiYXIiLCJuYmYiOjE0NDQ0Nzg0MDB9.N0-EVdv5pvUfZYFRzMGnsWpNLHgwMEgViPwpuLBEtt32682OgnOK-N4X-2gpQEjQIbUr0IFym8YsRQU9GZvqQP72Sd6yOQNGSNeE74DpUZCAjBa9SBIb1UlD2MxZB-e7YJiEyo7pZhimaqorXrgorlaXYGMvsCFWDYmBLzGaGYaGJyEpkZHzHb7ujsDrJJjdEtDV3kh13gTHzLPvqnoXuuxelXye_8LPIhvgDy52gT4shUEso71pJCMv_IqAR19ljVE17lJzoi6VhRn6ReNUE-yg4KfCO4Ypnuu-mcQr7XtmSYoWkX72L5UQ-EyWkoz-w0SYKoJTPzHkTL2thYStksVpeNkGuck25aUdtrQgmPbao0QOWBFlkg03e6mPCD2-aXOt1ofth9mZGjxWMHX-mUqHaNmaWM3WhRztJ73hWrmB1YOdYQtOEHejfvR_td5tqIw4W6ufRy2ScOypGQe7kNaUZxpgxZ1927ZGNiQgawIOAQwXOcFx1JNSEIeg55-cYJrHPxsXGOB9ZxW-qnswmFJp474iUVXjzGhLexJDXBwvKGs_O3JFjMsvyV9_hm7bnQU0vG_HgPYs5i9VOHRMujq1vFBcm52TFVOBGdWaGfb9RRdLLYvVkJLk0Poh19rsCWb7-Vc3mAaGGpvuk4Wv-PnGGNC-V-FQqIbijHDrn_g`,
-			certPemBad,
-			false,
-			"failed to decode PEM block containing certificate",
-		},
-	}
-
-	type test struct {
-		note     string
-		rules    []string
-		expected interface{}
-	}
-	tests := []test{}
-
-	for _, p := range params {
-		var exp interface{}
-		exp = fmt.Sprintf(`%t`, p.result)
-		if p.err != "" {
-			exp = errors.New(p.err)
-		}
-
-		tests = append(tests, test{
-			p.note,
-			[]string{fmt.Sprintf(`p = x { io.jwt.verify_%s("%s", "%s", x) }`, p.alg, p.input1, p.input2)},
-			exp,
-		})
-	}
-
-	data := loadSmallTestData()
-
-	for _, tc := range tests {
-		runTopDownTestCase(t, data, tc.note, tc.rules, tc.expected)
-	}
-}
-
-func TestTopDownJWTVerifyHS256(t *testing.T) {
-	params := []struct {
-		note   string
-		input1 string
-		input2 string
-		result bool
-		err    string
-	}{
-		{
-			"success",
-			`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjoiYWxpY2UiLCJhenAiOiJhbGljZSIsInN1Ym9yZGluYXRlcyI6W10sImhyIjpmYWxzZX0.rz3jTY033z-NrKfwrK89_dcLF7TN4gwCMj-fVBDyLoM`,
-			"secret",
-			true,
-			"",
-		},
-		{
-			"failure-bad token",
-			`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjoiYWxpY2UiLCJhenAiOiJhbGljZSIsInN1Ym9yZGluYXRlcyI6W10sImhyIjpmYWxzZX0.R0NDxM1gHTucWQKwayMDre2PbMNR9K9efmOfygDZWcE`,
-			"secret",
-			false,
-			"",
-		},
-		{
-			"failure-invalid token",
-			`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjoiYWxpY2UiLCJhenAiOiJhbGljZSIsInN1Ym9yZGluYXRlcyI6W10sImhyIjpmYWxzZX0`,
-			"secret",
-			false,
-			"encoded JWT must have 3 sections, found 2",
-		},
-	}
-
-	type test struct {
-		note     string
-		rules    []string
-		expected interface{}
-	}
-	tests := []test{}
-
-	for _, p := range params {
-		var exp interface{}
-		exp = fmt.Sprintf(`%t`, p.result)
-		if p.err != "" {
-			exp = errors.New(p.err)
-		}
-
-		tests = append(tests, test{
-			p.note,
-			[]string{fmt.Sprintf(`p = x { io.jwt.verify_hs256("%s", "%s", x) }`, p.input1, p.input2)},
-			exp,
-		})
-	}
-
-	data := loadSmallTestData()
-
-	for _, tc := range tests {
-		runTopDownTestCase(t, data, tc.note, tc.rules, tc.expected)
-	}
-}
-
 func TestTopDownTime(t *testing.T) {
 
 	data := loadSmallTestData()
@@ -1769,7 +1466,13 @@ func TestTopDownTime(t *testing.T) {
 	`}, "100000000")
 
 	runTopDownTestCase(t, data, "date", []string{`
-		p = [year, month, day] { [year, month, day] := time.date(1517832000*1000*1000*1000) }`}, "[2018, 2, 5]")
+		p = [year, month, day] { [year, month, day] := time.date(1517814000*1000*1000*1000) }`}, "[2018, 2, 5]")
+
+	runTopDownTestCase(t, data, "date with LA tz", []string{`
+		p = [year, month, day] { [year, month, day] := time.date([ 1517814000*1000*1000*1000, "America/Los_Angeles" ]) }`}, "[2018, 2, 4]")
+
+	runTopDownTestCase(t, data, "date with empty tz", []string{`
+		p = [year, month, day] { [year, month, day] := time.date([ 1517832000*1000*1000*1000, "" ]) }`}, "[2018, 2, 5]")
 
 	runTopDownTestCase(t, data, "date leap day", []string{`
 		p = [year, month, day] { [year, month, day] := time.date(1582977600*1000*1000*1000) }`}, "[2020, 2, 29]")
@@ -1779,6 +1482,9 @@ func TestTopDownTime(t *testing.T) {
 
 	runTopDownTestCase(t, data, "clock", []string{`
 		p = [hour, minute, second] { [hour, minute, second] := time.clock(1517832000*1000*1000*1000) }`}, "[12, 0, 0]")
+
+	runTopDownTestCase(t, data, "clock with NY tz", []string{`
+		p = [hour, minute, second] { [hour, minute, second] := time.clock([ 1517832000*1000*1000*1000, "America/New_York" ]) }`}, "[7, 0, 0]")
 
 	runTopDownTestCase(t, data, "clock leap day", []string{`
 		p = [hour, minute, second] { [hour, minute, second] := time.clock(1582977600*1000*1000*1000) }`}, "[12, 0, 0]")
@@ -1929,7 +1635,8 @@ u[x] { b[_] = x; x > 1 }
 w = [[1, 2], [3, 4]] { true }
 gt1 = true { req1 > 1 }
 keys[x] = y { data.numbers[_] = x; to_number(x, y) }
-loopback = input { true }`})
+loopback = input { true }
+sets { input.foo[{1}][1] = 1 } `})
 
 	store := inmem.NewFromObject(loadSmallTestData())
 
@@ -1965,6 +1672,8 @@ loopback = input { true }`})
 			}
 		}
 	}`, "true")
+
+	assertTopDownWithPath(t, compiler, store, "input set", []string{"z", "sets"}, `{"foo": {{1}}}`, `true`)
 }
 
 func TestTopDownPartialDocConstants(t *testing.T) {
@@ -2298,36 +2007,311 @@ func TestTopDownFunctionErrors(t *testing.T) {
 
 func TestTopDownWithKeyword(t *testing.T) {
 
-	compiler := compileModules([]string{
-		`package ex
+	tests := []struct {
+		note    string
+		rules   []string
+		modules []string
+		input   string
+		exp     interface{}
+	}{
 
-loopback = input { true }
-composite[x] { input.foo[_] = x; x > 2 }
-vars = {"foo": input.foo, "bar": input.bar} { true }
-input_eq { input.x = 1 }
-`,
+		{
+			note: "with",
+			exp:  `true`,
+			modules: []string{`package ex
+			loopback = input`},
+			rules: []string{`p { data.ex.loopback with input as true; data.ex.loopback = false with input as false }`},
+		},
+		{
+			note: "with not",
+			exp:  `true`,
+			modules: []string{`package ex
+			loopback = input`},
+			rules: []string{`p = true { not data.ex.loopback with input as false; data.ex.loopback with input as true }`},
+		},
+		{
+			note: "with composite",
+			exp:  `[3,4]`,
+			modules: []string{`package ex
+			composite[x] { input.foo[_] = x; gt(x, 2) }`},
+			rules: []string{`p[x] { data.ex.composite[x] with input.foo as [1, 2, 3, 4] }`},
+		},
+		{
+			note: "with vars",
+			exp:  `{"foo": "hello", "bar": "world"}`,
+			modules: []string{`package ex
+			vars = x { y = input.bar; z = input.foo; x = {"bar": y, "foo": z} }`},
+			rules: []string{`p = x { foo = "hello"; bar = "world"; x = data.ex.vars with input.foo as foo with input.bar as bar }`},
+		},
+		{
+			note: "with conflict",
+			exp:  fmt.Errorf("conflicting documents"),
+			modules: []string{`package ex
+			loopback = __local0__ { true; __local0__ = input }`},
+			rules: []string{`p = true { data.ex.loopback with input.foo as "x" with input.foo.bar as "y" }`},
+		},
+		{
+			note:  "with stack",
+			input: `{"a": {"d": 3}, "e": 4}`,
+			exp:   `{"a": {"b": 1, "c": 2, "d": 3}, "e": 4}`,
+			rules: []string{
+				`r = input { true }`,
+				`q = x { r = x with input.a.c as 2 }`,
+				`p = x { q = x with input.a.b as 1 }`,
+			},
+		},
+		{
+			note: "with stack (data)",
+			exp:  `{"a": {"b": 1, "c": 2, "d": 3}, "e": 4}`,
+			modules: []string{
+				`package test.a
+				d = 3`,
+				`package test
+				e = 4`,
+			},
+			rules: []string{
+				`r = data.test { true }`,
+				`q = x { r = x with data.test.a.c as 2 }`,
+				`p = x { q = x with data.test.a.b as 1 }`,
+			},
+		},
+		{
+			note:  "with stack overwrites",
+			input: `{"a": {"b": 1, "c": 2}}`,
+			exp:   `{"a": {"d": 3}}`,
+			rules: []string{
+				`q = input { true }`,
+				`p = x { q = x with input.a as {"d": 3} }`,
+			},
+		},
+		{
+			note: "with stack overwrites (data)",
+			exp:  `{"a": {"d": 3}}`,
+			modules: []string{
+				`package test
 
-		`package test
+				a = {"b": 1, "c": 2}`,
+			},
+			rules: []string{
+				`q = data.test { true }`,
+				`p = x { q = x with data.test.a as {"d": 3} }`,
+			},
+		},
+		{
+			note: "with invalidate",
+			exp:  `[2,3,4]`,
+			modules: []string{`package ex
+			input_eq = true { input.x = 1 }`},
+			rules: []string{`p[x] { data.a[_] = x; not data.ex.input_eq with input.x as x }`},
+		},
+		{
+			note:  "with invalidate input stack",
+			exp:   `["a", "b"]`,
+			input: `"b"`,
+			rules: []string{
+				`p = [x, y] { x = input with input as "a"; y = input }`,
+			},
+		},
+		{
+			note:  "with invalidate input stack iteration",
+			exp:   `[["a", "c"], ["b", "c"]]`,
+			input: `"c"`,
+			rules: []string{
+				`q[x] { input[_] = x }`,
+				`p[[x,y]] {
+					q[x] with input as ["a", "b"]
+					y = input
+				}`,
+			},
+		},
+		{
+			note:  "with invalidate virtual cache",
+			exp:   `["a", "b"]`,
+			input: "2",
+			rules: []string{
+				`q = "a" { input = x; x = 1 }`,
+				`q = "b" { input = x; x = 2 }`,
+				`p = [x, y] {
+					q = x with input as 1
+					q = y
+				}`},
+		},
+		{
+			note: "with invalidate data stack",
+			exp:  `["a", "b"]`,
+			rules: []string{
+				`q = "b" { true }`,
+				`p = [x ,y] {
+					q = x with q as "a"
+					q = y
+				}`,
+			},
+		},
+		{
+			note: "with invalidate data stack iteration",
+			exp:  `[["a", ["c"]], ["b", ["c"]]]`,
+			rules: []string{
+				`q["c"] { true }`,
+				`p[[x, y]] {
+					q[x] with q as {"a", "b"}
+					y = q
+				}`,
+			},
+		},
+		{
+			note: "with basic data",
+			exp:  `true`,
+			modules: []string{`package ex
+			allow_basic = true { data.a = "testdata" }`},
+			rules: []string{`p = true { data.ex.allow_basic = true with data.a as "testdata" }`},
+		},
+		{
+			note: "with map data overwrite",
+			exp:  `true`,
+			modules: []string{`package ex
+			allow_merge_1 = true { data.b = {"v1": "hello", "v2": "world"} }`},
+			rules: []string{`p = true { data.ex.allow_merge_1 = true with data.b.v2 as "world" }`},
+		},
+		{
+			note: "with map data new key",
+			exp:  `true`,
+			modules: []string{`package ex
+			allow_merge_2 = true { data.b = {"v1": "hello", "v2": "world", "v3": "again"} }`},
+			rules: []string{`p = true { data.ex.allow_merge_2 = true with data.b.v2 as "world" with data.b.v3 as "again" }`},
+		},
+		{
+			note: "with data conflict",
+			exp:  mergeConflictErr(nil),
+			modules: []string{`package ex
+			allow_basic = true { data.a = "testdata" }`},
+			rules: []string{`p = true { data.ex.allow_basic = true with data.a.b as 5 }`},
+		},
+		{
+			note:  "with base doc exact value",
+			exp:   `["c", "e"]`,
+			rules: []string{`p[x] { data.a.b[x] = 1 with data.a.b as {"c": 1, "d": 2, "e": 1} }`},
+		},
+		{
+			note:  "with base doc any index",
+			exp:   `["c", "d", "e"]`,
+			rules: []string{`p[x] { data.a.b[x] with data.a.b as {"c": 1, "d": 2, "e": 1} }`},
+		},
+		{
+			note:  "undefined_1",
+			exp:   "",
+			rules: []string{`p = true { data.a.b.c with data.a.b as 1 }`},
+		},
+		{
+			note:  "undefined_2",
+			exp:   "",
+			rules: []string{`p = true { data.l.a with data.l as 1 }`},
+		},
+		{
+			note: "with virtual doc exact value",
+			exp:  `[["c", "e"]]`,
+			modules: []string{`package ex
+			virtual[x] { data.a.b[x] = 1 }`},
+			rules: []string{`p[x] { data.ex.virtual = x with data.a.b as {"c": 1, "d": 2, "e": 1} }`},
+		},
+		{
+			note: "with virtual doc any index",
+			exp:  `["c", "e"]`,
+			modules: []string{`package ex
+			virtual[x] { data.a.b[x] = 1 }`},
+			rules: []string{`p[x] { data.ex.virtual[x] with data.a.b as {"c": 1, "d": 2, "e": 1} }`},
+		},
+		{
+			note: "with virtual doc specific index",
+			exp:  `"c"`,
+			modules: []string{`package ex
+			virtual[x] { data.a.b[x] = 1 }`},
+			rules: []string{`p = y { y = data.ex.virtual.c with data.a.b as {"c": 1, "d": 2, "e": 1} }`},
+		},
+		{
+			note: "with virtual doc not specific index",
+			exp:  `true`,
+			modules: []string{`package ex
+			virtual[x] { data.a.b[x] = 1 }`},
+			rules: []string{`p = true { not data.ex.virtual.d with data.a.b as {"c": 1, "d": 2, "e": 1} }`},
+		},
+		{
+			note: "with mock var",
+			exp:  `{"c": 1, "d": 2}`,
+			modules: []string{`package ex
+			mock_var = {"a": 0, "b": 0} { true }`},
+			rules: []string{`p = y { y = data.ex.mock_var with data.ex.mock_var as {"c": 1, "d": 2} }`},
+		},
+		{
+			note: "with mock rule",
+			exp:  `true`,
+			modules: []string{`package ex
+			mock_rule = false { 1 = 2 }`},
+			rules: []string{`p = true { data.ex.mock_rule with data.ex.mock_rule as true }`},
+		},
+		{
+			note: "with rule chain",
+			exp:  `true`,
+			modules: []string{`package ex
+			allow1 = true { data.label.b.c = [1, 2, 3] }
+			allow2 = true { data.label.b.c[x] = 2 }
+			allow3 = true { data.label.b[x] = 1 }
+			allow4 = true { data.label.b.c.d[x] = 1 }
+			allow = true { data.ex.allow1; data.ex.allow2; not data.ex.allow3; not data.ex.allow4 }`},
+			rules: []string{`p = true { data.ex.allow with data.label.b.c as [1, 2, 3] }`},
+		},
+		{
+			note: "with mock iteration on sets",
+			exp:  `[3,4]`,
+			rules: []string{
+				`q[1] { true }`,
+				`q[2] { true }`,
+				`p[x] { q[x] with q as {3,4} }`,
+			},
+		},
+		{
+			note: "with mock iteration on objects",
+			exp:  `{"a": 3, "c": 4}`,
+			rules: []string{
+				`q["a"] = 1 { true }`,
+				`q["b"] = 2 { true }`,
+				`p[x] = y { q[x] = y with q as {"a": 3, "c": 4} }`,
+			},
+		},
+		{
+			note: "with mock iteration on arrays",
+			exp:  `[3, 4]`,
+			rules: []string{
+				`q[1] { true }`,
+				`q[2] { true }`,
+				`p[x] { q[_] = x with q as [3,4] }`,
+			},
+		},
+		{
+			note: "bug 1083",
+			exp:  ``,
+			modules: []string{`package ex
+			input_eq = true { input.x = 1 }`},
+			rules: []string{`p = true { data.ex.input_eq with data.foo as 1 }`},
+		},
+		{
+			note: "bug 1100",
+			exp:  `true`,
+			modules: []string{`package ex
+			data_eq = true { data.a = x }`},
+			rules: []string{`p = true { data.ex.data_eq with input as {} }`},
+		},
+		{
+			note: "set lookup",
+			exp:  `true`,
+			modules: []string{`package ex
+			setl[x] { data.foo[x] }`},
+			rules: []string{`p = true { data.ex.setl[1] with data.foo as {1} }`},
+		},
+	}
 
-import data.ex
-
-basic = true { ex.loopback = true with input as true; ex.loopback = false with input as false }
-negation = true { not ex.loopback with input as false; ex.loopback with input as true }
-composite[x] { ex.composite[x] with input.foo as [1, 2, 3, 4] }
-vars = x { foo = "hello"; bar = "world"; x = ex.vars with input.foo as foo with input.bar as bar }
-conflict = true { ex.loopback with input.foo as "x" with input.foo.bar as "y" }
-negation_invalidate[x] { data.a[_] = x; not data.ex.input_eq with input.x as x }
-`,
-	})
-
-	store := inmem.NewFromObject(loadSmallTestData())
-
-	assertTopDownWithPath(t, compiler, store, "with", []string{"test", "basic"}, "", "true")
-	assertTopDownWithPath(t, compiler, store, "with not", []string{"test", "negation"}, "", "true")
-	assertTopDownWithPath(t, compiler, store, "with composite", []string{"test", "composite"}, "", "[3,4]")
-	assertTopDownWithPath(t, compiler, store, "with vars", []string{"test", "vars"}, "", `{"foo": "hello", "bar": "world"}`)
-	assertTopDownWithPath(t, compiler, store, "with conflict", []string{"test", "conflict"}, "", fmt.Errorf("conflicting input documents"))
-	assertTopDownWithPath(t, compiler, store, "With invalidate", []string{"test", "negation_invalidate"}, "", "[2,3,4]")
+	for _, tc := range tests {
+		runTopDownTestCaseWithModules(t, loadSmallTestData(), tc.note, tc.rules, tc.modules, tc.input, tc.exp)
+	}
 }
 
 func TestTopDownElseKeyword(t *testing.T) {
@@ -2674,7 +2658,7 @@ func compileModules(input []string) *ast.Compiler {
 	return c
 }
 
-func compileRules(imports []string, input []string) (*ast.Compiler, error) {
+func compileRules(imports []string, input []string, modules []string) (*ast.Compiler, error) {
 
 	p := ast.Ref{ast.DefaultRootDocument}
 
@@ -2704,8 +2688,15 @@ func compileRules(imports []string, input []string) (*ast.Compiler, error) {
 		rules[i].Module = m
 	}
 
+	mods := map[string]*ast.Module{"testMod": m}
+
+	for i, s := range modules {
+		mods[fmt.Sprintf("testMod%d", i)] = ast.MustParseModule(s)
+	}
+
 	c := ast.NewCompiler()
-	if c.Compile(map[string]*ast.Module{"testMod": m}); c.Failed() {
+
+	if c.Compile(mods); c.Failed() {
 		return nil, c.Errors
 	}
 
@@ -2781,12 +2772,16 @@ func loadSmallTestData() map[string]interface{} {
 }
 
 func runTopDownTestCase(t *testing.T, data map[string]interface{}, note string, rules []string, expected interface{}) {
+	runTopDownTestCaseWithModules(t, data, note, rules, nil, "", expected)
+}
+
+func runTopDownTestCaseWithModules(t *testing.T, data map[string]interface{}, note string, rules []string, modules []string, input string, expected interface{}) {
 	imports := []string{}
 	for k := range data {
 		imports = append(imports, "data."+k)
 	}
 
-	compiler, err := compileRules(imports, rules)
+	compiler, err := compileRules(imports, rules, modules)
 	if err != nil {
 		t.Errorf("%v: Compiler error: %v", note, err)
 		return
@@ -2794,7 +2789,7 @@ func runTopDownTestCase(t *testing.T, data map[string]interface{}, note string, 
 
 	store := inmem.NewFromObject(data)
 
-	assertTopDownWithPath(t, compiler, store, note, []string{"p"}, "", expected)
+	assertTopDownWithPath(t, compiler, store, note, []string{"p"}, input, expected)
 }
 
 func assertTopDownWithPath(t *testing.T, compiler *ast.Compiler, store storage.Store, note string, path []string, input string, expected interface{}) {
@@ -2834,6 +2829,16 @@ func assertTopDownWithPath(t *testing.T, compiler *ast.Compiler, store storage.S
 
 	testutil.Subtest(t, note, func(t *testing.T) {
 		switch e := expected.(type) {
+		case Error:
+			result, err := query.Run(ctx)
+			if err == nil {
+				t.Errorf("Expected error but got: %v", result)
+				return
+			}
+			errString := err.Error()
+			if !strings.Contains(errString, e.Code) || !strings.Contains(errString, e.Message) {
+				t.Errorf("Expected error %v but got: %v", e, err)
+			}
 		case error:
 			result, err := query.Run(ctx)
 			if err == nil {
@@ -2899,6 +2904,8 @@ func assertTopDownWithPath(t *testing.T, compiler *ast.Compiler, store storage.S
 			if len(path) > 0 {
 				runTopDownPartialTestCase(ctx, t, compiler, store, txn, inputTerm, rhs, body, requiresSort, expected)
 			}
+		default:
+			t.Fatalf("Unexpected expected value type: %+v", e)
 		}
 	})
 }

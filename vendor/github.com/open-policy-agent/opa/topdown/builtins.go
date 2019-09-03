@@ -42,14 +42,25 @@ type (
 	// framework takes care of this.
 	FunctionalBuiltin3 func(op1, op2, op3 ast.Value) (output ast.Value, err error)
 
+	// FunctionalBuiltin4 defines an interface for simple functional built-ins.
+	//
+	// Implement this interface if your built-in function takes four inputs and
+	// produces one output.
+	//
+	// If an error occurs, the functional built-in should return a descriptive
+	// message. The message should not be prefixed with the built-in name as the
+	// framework takes care of this.
+	FunctionalBuiltin4 func(op1, op2, op3, op4 ast.Value) (output ast.Value, err error)
+
 	// BuiltinContext contains context from the evaluator that may be used by
 	// built-in functions.
 	BuiltinContext struct {
-		Cache    builtins.Cache
-		Location *ast.Location
-		Tracer   Tracer
-		QueryID  uint64
-		ParentID uint64
+		Runtime  *ast.Term      // runtime information on the OPA instance
+		Cache    builtins.Cache // built-in function state cache
+		Location *ast.Location  // location of built-in call
+		Tracers  []Tracer       // tracer objects for trace() built-in function
+		QueryID  uint64         // identifies query being evaluated
+		ParentID uint64         // identifies parent of query being evaluated
 	}
 
 	// BuiltinFunc defines an interface for implementing built-in functions.
@@ -81,6 +92,12 @@ func RegisterFunctionalBuiltin2(name string, fun FunctionalBuiltin2) {
 // engine.
 func RegisterFunctionalBuiltin3(name string, fun FunctionalBuiltin3) {
 	builtinFunctions[name] = functionalWrapper3(name, fun)
+}
+
+// RegisterFunctionalBuiltin4 adds a new built-in function to the evaluation
+// engine.
+func RegisterFunctionalBuiltin4(name string, fun FunctionalBuiltin4) {
+	builtinFunctions[name] = functionalWrapper4(name, fun)
 }
 
 // BuiltinEmpty is used to signal that the built-in function evaluated, but the
@@ -132,6 +149,19 @@ func functionalWrapper3(name string, fn FunctionalBuiltin3) BuiltinFunc {
 	}
 }
 
+func functionalWrapper4(name string, fn FunctionalBuiltin4) BuiltinFunc {
+	return func(bctx BuiltinContext, args []*ast.Term, iter func(*ast.Term) error) error {
+		result, err := fn(args[0].Value, args[1].Value, args[2].Value, args[3].Value)
+		if err == nil {
+			return iter(ast.NewTerm(result))
+		}
+		if _, empty := err.(BuiltinEmpty); empty {
+			return nil
+		}
+		return handleBuiltinErr(name, bctx.Location, err)
+	}
+}
+
 func handleBuiltinErr(name string, loc *ast.Location, err error) error {
 	switch err := err.(type) {
 	case BuiltinEmpty:
@@ -144,7 +174,7 @@ func handleBuiltinErr(name string, loc *ast.Location, err error) error {
 		}
 	default:
 		return &Error{
-			Code:     InternalErr,
+			Code:     BuiltinErr,
 			Message:  fmt.Sprintf("%v: %v", string(name), err.Error()),
 			Location: loc,
 		}

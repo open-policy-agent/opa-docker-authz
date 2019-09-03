@@ -39,47 +39,33 @@ func Source(filename string, src []byte) ([]byte, error) {
 	return formatted, nil
 }
 
-// Ast formats a Rego AST element. If the passed value is not a valid AST element,
-// Ast returns nil and an error. Ast relies on all AST elements having non-nil
-// Location values, and will return an error if this is not the case.
+// MustAst is a helper function to format a Rego AST element. If any errors
+// occurs this function will panic. This is mostly used for test
+func MustAst(x interface{}) []byte {
+	bs, err := Ast(x)
+	if err != nil {
+		panic(err)
+	}
+	return bs
+}
+
+// Ast formats a Rego AST element. If the passed value is not a valid AST
+// element, Ast returns nil and an error. Ast relies on all AST elements having
+// non-nil Location values. If an AST element with a nil Location value is
+// encountered, a default location will be set on the AST node.
 func Ast(x interface{}) (formatted []byte, err error) {
-	defer func() {
-		// Ast relies on all terms in the ast element having non-nil Location
-		// values. If a location is nil, Ast will panic, so we need to recover
-		// gracefully.
-		if r := recover(); r != nil {
-			formatted = nil
-			switch r := r.(type) {
-			case nilLocationErr:
-				err = r
-			default:
-				panic(r)
+
+	ast.WalkNodes(x, func(x ast.Node) bool {
+		if b, ok := x.(ast.Body); ok {
+			if len(b) == 0 {
+				return false
 			}
 		}
-	}()
-
-	// Check all elements in the Ast interface have a location.
-	ast.Walk(ast.NewGenericVisitor(func(x interface{}) bool {
-		switch x := x.(type) {
-		case *ast.Module, ast.Value: // Pass, they don't have locations.
-		case *ast.Term:
-			switch v := x.Value.(type) {
-			case ast.Ref:
-				if h := v[0]; !ast.RootDocumentNames.Contains(h) {
-					assertHasLocation(x)
-				}
-			case ast.Var:
-				if vt := ast.VarTerm(string(v)); !ast.RootDocumentNames.Contains(vt) {
-					assertHasLocation(x)
-				}
-			default:
-				assertHasLocation(x)
-			}
-		case *ast.Package, *ast.Import, *ast.Rule, *ast.Head, ast.Body, *ast.Expr, *ast.With, *ast.Comment:
-			assertHasLocation(x)
+		if x.Loc() == nil {
+			x.SetLoc(defaultLocation(x))
 		}
 		return false
-	}), x)
+	})
 
 	w := &writer{indent: "\t"}
 	switch x := x.(type) {
@@ -108,7 +94,19 @@ func Ast(x interface{}) (formatted []byte, err error) {
 	default:
 		return nil, fmt.Errorf("not an ast element: %v", x)
 	}
-	return w.buf.Bytes(), nil
+
+	return squashTrailingNewlines(w.buf.Bytes()), nil
+}
+
+func squashTrailingNewlines(bs []byte) []byte {
+	if bytes.HasSuffix(bs, []byte("\n")) {
+		return append(bytes.TrimRight(bs, "\n"), '\n')
+	}
+	return bs
+}
+
+func defaultLocation(x ast.Node) *ast.Location {
+	return ast.NewLocation([]byte(x.String()), "", 1, 1)
 }
 
 type writer struct {
@@ -163,8 +161,11 @@ func (w *writer) writeModule(module *ast.Module) {
 		comments = w.writeRules(rules, comments)
 	}
 
-	for _, c := range comments {
+	for i, c := range comments {
 		w.writeLine(c.String())
+		if i == len(comments)-1 {
+			w.write("\n")
+		}
 	}
 }
 
@@ -256,7 +257,7 @@ func (w *writer) writeHead(head *ast.Head, isExpandedConst bool, comments []*ast
 		for _, arg := range head.Args {
 			args = append(args, arg)
 		}
-		comments = w.writeIterable(args, head.Location, comments, w.listWriter())
+		comments = w.writeIterable(args, head.Location, closingLoc(0, 0, '(', ')', head.Location), comments, w.listWriter())
 		w.write(")")
 	}
 	if head.Key != nil {
@@ -304,6 +305,8 @@ func (w *writer) writeExpr(expr *ast.Expr, comments []*ast.Comment) []*ast.Comme
 	}
 
 	switch t := expr.Terms.(type) {
+	case *ast.SomeDecl:
+		comments = w.writeSomeDecl(t, comments)
 	case []*ast.Term:
 		comments = w.writeFunctionCall(expr, comments)
 	case *ast.Term:
@@ -323,6 +326,33 @@ func (w *writer) writeExpr(expr *ast.Expr, comments []*ast.Comment) []*ast.Comme
 			w.startLine()
 		}
 		comments = w.writeWith(with, comments)
+	}
+
+	return comments
+}
+
+func (w *writer) writeSomeDecl(decl *ast.SomeDecl, comments []*ast.Comment) []*ast.Comment {
+	comments = w.insertComments(comments, decl.Location)
+	w.write("some ")
+
+	row := decl.Location.Row
+
+	for i, term := range decl.Symbols {
+
+		if term.Location.Row > row {
+			w.endLine()
+			w.startLine()
+			w.write(w.indent)
+			row = term.Location.Row
+		} else if i > 0 {
+			w.write(" ")
+		}
+
+		comments = w.writeTerm(term, comments)
+
+		if i < len(decl.Symbols)-1 {
+			w.write(",")
+		}
 	}
 
 	return comments
@@ -454,8 +484,7 @@ func (w *writer) writeObject(obj ast.Object, loc *ast.Location, comments []*ast.
 	obj.Foreach(func(k, v *ast.Term) {
 		s = append(s, ast.Item(k, v))
 	})
-	comments = w.writeIterable(s, loc, comments, w.objectWriter())
-	return w.insertComments(comments, closingLoc(0, 0, '{', '}', loc))
+	return w.writeIterable(s, loc, closingLoc(0, 0, '{', '}', loc), comments, w.objectWriter())
 }
 
 func (w *writer) writeArray(arr ast.Array, loc *ast.Location, comments []*ast.Comment) []*ast.Comment {
@@ -466,11 +495,16 @@ func (w *writer) writeArray(arr ast.Array, loc *ast.Location, comments []*ast.Co
 	for _, t := range arr {
 		s = append(s, t)
 	}
-	comments = w.writeIterable(s, loc, comments, w.listWriter())
-	return w.insertComments(comments, closingLoc(0, 0, '[', ']', loc))
+	return w.writeIterable(s, loc, closingLoc(0, 0, '[', ']', loc), comments, w.listWriter())
 }
 
 func (w *writer) writeSet(set ast.Set, loc *ast.Location, comments []*ast.Comment) []*ast.Comment {
+
+	if set.Len() == 0 {
+		w.write("set()")
+		return w.insertComments(comments, closingLoc(0, 0, '(', ')', loc))
+	}
+
 	w.write("{")
 	defer w.write("}")
 
@@ -478,8 +512,7 @@ func (w *writer) writeSet(set ast.Set, loc *ast.Location, comments []*ast.Commen
 	set.Foreach(func(t *ast.Term) {
 		s = append(s, t)
 	})
-	comments = w.writeIterable(s, loc, comments, w.listWriter())
-	return w.insertComments(comments, closingLoc(0, 0, '{', '}', loc))
+	return w.writeIterable(s, loc, closingLoc(0, 0, '{', '}', loc), comments, w.listWriter())
 }
 
 func (w *writer) writeArrayComprehension(arr *ast.ArrayComprehension, loc *ast.Location, comments []*ast.Comment) []*ast.Comment {
@@ -579,12 +612,11 @@ func (w *writer) writeImports(imports []*ast.Import, comments []*ast.Comment) []
 
 type entryWriter func(interface{}, []*ast.Comment) []*ast.Comment
 
-func (w *writer) writeIterable(elements []interface{}, last *ast.Location, comments []*ast.Comment, fn entryWriter) []*ast.Comment {
+func (w *writer) writeIterable(elements []interface{}, last *ast.Location, close *ast.Location, comments []*ast.Comment, fn entryWriter) []*ast.Comment {
 	lines := groupIterable(elements, last)
 	if len(lines) > 1 {
 		w.delayBeforeEnd()
 		w.startMultilineSeq()
-		defer w.endMultilineSeq()
 	}
 
 	i := 0
@@ -595,7 +627,17 @@ func (w *writer) writeIterable(elements []interface{}, last *ast.Location, comme
 		w.endLine()
 		w.startLine()
 	}
+
 	comments = w.writeIterableLine(lines[i], comments, fn)
+
+	if len(lines) > 1 {
+		w.write(",")
+		w.endLine()
+		comments = w.insertComments(comments, close)
+		w.down()
+		w.startLine()
+	}
+
 	return comments
 }
 
@@ -928,20 +970,4 @@ func (w *writer) down() {
 		panic("negative indentation level")
 	}
 	w.level--
-}
-
-func assertHasLocation(xs ...interface{}) {
-	for _, x := range xs {
-		if getLoc(x) == nil {
-			panic(nilLocationErr{fmt.Errorf("nil location: %v", x)})
-		}
-	}
-}
-
-type nilLocationErr struct {
-	err error
-}
-
-func (err nilLocationErr) Error() string {
-	return err.err.Error()
 }

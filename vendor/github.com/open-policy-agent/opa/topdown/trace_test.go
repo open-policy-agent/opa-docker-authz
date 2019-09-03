@@ -34,7 +34,6 @@ func TestEventEqual(t *testing.T) {
 		{&Event{Node: ast.MustParseBody("true")}, &Event{Node: ast.MustParseBody("false")}, false},
 		{&Event{Node: ast.MustParseBody("true")[0]}, &Event{Node: ast.MustParseBody("false")[0]}, false},
 		{&Event{Node: ast.MustParseRule(`p = true { true }`)}, &Event{Node: ast.MustParseRule(`p = true { false }`)}, false},
-		{&Event{Node: "foo"}, &Event{Node: "foo"}, false}, // test some unsupported node type
 	}
 
 	for _, tc := range tests {
@@ -79,45 +78,45 @@ func TestPrettyTrace(t *testing.T) {
 	expected := `Enter data.test.p = _
 | Eval data.test.p = _
 | Index data.test.p = _ (matched 1 rule)
-| Enter p = true { data.test.q[x]; plus(x, 1, n) }
+| Enter data.test.p
 | | Eval data.test.q[x]
 | | Index data.test.q[x] (matched 1 rule)
-| | Enter q[x] { x = data.a[_] }
+| | Enter data.test.q
 | | | Eval x = data.a[_]
-| | | Exit q[x] { x = data.a[_] }
+| | | Exit data.test.q
 | | Eval plus(x, 1, n)
-| | Exit p = true { data.test.q[x]; plus(x, 1, n) }
+| | Exit data.test.p
 | Exit data.test.p = _
 Redo data.test.p = _
 | Redo data.test.p = _
-| Redo p = true { data.test.q[x]; plus(x, 1, n) }
+| Redo data.test.p
 | | Redo plus(x, 1, n)
 | | Redo data.test.q[x]
-| | Redo q[x] { x = data.a[_] }
+| | Redo data.test.q
 | | | Redo x = data.a[_]
-| | | Exit q[x] { x = data.a[_] }
+| | | Exit data.test.q
 | | Eval plus(x, 1, n)
-| | Exit p = true { data.test.q[x]; plus(x, 1, n) }
-| Redo p = true { data.test.q[x]; plus(x, 1, n) }
+| | Exit data.test.p
+| Redo data.test.p
 | | Redo plus(x, 1, n)
 | | Redo data.test.q[x]
-| | Redo q[x] { x = data.a[_] }
+| | Redo data.test.q
 | | | Redo x = data.a[_]
-| | | Exit q[x] { x = data.a[_] }
+| | | Exit data.test.q
 | | Eval plus(x, 1, n)
-| | Exit p = true { data.test.q[x]; plus(x, 1, n) }
-| Redo p = true { data.test.q[x]; plus(x, 1, n) }
+| | Exit data.test.p
+| Redo data.test.p
 | | Redo plus(x, 1, n)
 | | Redo data.test.q[x]
-| | Redo q[x] { x = data.a[_] }
+| | Redo data.test.q
 | | | Redo x = data.a[_]
-| | | Exit q[x] { x = data.a[_] }
+| | | Exit data.test.q
 | | Eval plus(x, 1, n)
-| | Exit p = true { data.test.q[x]; plus(x, 1, n) }
-| Redo p = true { data.test.q[x]; plus(x, 1, n) }
+| | Exit data.test.p
+| Redo data.test.p
 | | Redo plus(x, 1, n)
 | | Redo data.test.q[x]
-| | Redo q[x] { x = data.a[_] }
+| | Redo data.test.q
 | | | Redo x = data.a[_]
 `
 
@@ -172,65 +171,65 @@ func TestTraceNote(t *testing.T) {
 	expected := `Enter data.test.p = _
 | Eval data.test.p = _
 | Index data.test.p = _ (matched 1 rule)
-| Enter p = true { data.test.q[x]; plus(x, 1, n); sprintf("n= %v", [n], __local0__); trace(__local0__) }
+| Enter data.test.p
 | | Eval data.test.q[x]
 | | Index data.test.q[x] (matched 1 rule)
-| | Enter q[x] { x = data.a[_] }
+| | Enter data.test.q
 | | | Eval x = data.a[_]
-| | | Exit q[x] { x = data.a[_] }
+| | | Exit data.test.q
 | | Eval plus(x, 1, n)
 | | Eval sprintf("n= %v", [n], __local0__)
 | | Eval trace(__local0__)
 | | Note "n= 2"
-| | Exit p = true { data.test.q[x]; plus(x, 1, n); sprintf("n= %v", [n], __local0__); trace(__local0__) }
+| | Exit data.test.p
 | Exit data.test.p = _
 Redo data.test.p = _
 | Redo data.test.p = _
-| Redo p = true { data.test.q[x]; plus(x, 1, n); sprintf("n= %v", [n], __local0__); trace(__local0__) }
+| Redo data.test.p
 | | Redo trace(__local0__)
 | | Redo sprintf("n= %v", [n], __local0__)
 | | Redo plus(x, 1, n)
 | | Redo data.test.q[x]
-| | Redo q[x] { x = data.a[_] }
+| | Redo data.test.q
 | | | Redo x = data.a[_]
-| | | Exit q[x] { x = data.a[_] }
+| | | Exit data.test.q
 | | Eval plus(x, 1, n)
 | | Eval sprintf("n= %v", [n], __local0__)
 | | Eval trace(__local0__)
 | | Note "n= 3"
-| | Exit p = true { data.test.q[x]; plus(x, 1, n); sprintf("n= %v", [n], __local0__); trace(__local0__) }
-| Redo p = true { data.test.q[x]; plus(x, 1, n); sprintf("n= %v", [n], __local0__); trace(__local0__) }
+| | Exit data.test.p
+| Redo data.test.p
 | | Redo trace(__local0__)
 | | Redo sprintf("n= %v", [n], __local0__)
 | | Redo plus(x, 1, n)
 | | Redo data.test.q[x]
-| | Redo q[x] { x = data.a[_] }
+| | Redo data.test.q
 | | | Redo x = data.a[_]
-| | | Exit q[x] { x = data.a[_] }
+| | | Exit data.test.q
 | | Eval plus(x, 1, n)
 | | Eval sprintf("n= %v", [n], __local0__)
 | | Eval trace(__local0__)
 | | Note "n= 4"
-| | Exit p = true { data.test.q[x]; plus(x, 1, n); sprintf("n= %v", [n], __local0__); trace(__local0__) }
-| Redo p = true { data.test.q[x]; plus(x, 1, n); sprintf("n= %v", [n], __local0__); trace(__local0__) }
+| | Exit data.test.p
+| Redo data.test.p
 | | Redo trace(__local0__)
 | | Redo sprintf("n= %v", [n], __local0__)
 | | Redo plus(x, 1, n)
 | | Redo data.test.q[x]
-| | Redo q[x] { x = data.a[_] }
+| | Redo data.test.q
 | | | Redo x = data.a[_]
-| | | Exit q[x] { x = data.a[_] }
+| | | Exit data.test.q
 | | Eval plus(x, 1, n)
 | | Eval sprintf("n= %v", [n], __local0__)
 | | Eval trace(__local0__)
 | | Note "n= 5"
-| | Exit p = true { data.test.q[x]; plus(x, 1, n); sprintf("n= %v", [n], __local0__); trace(__local0__) }
-| Redo p = true { data.test.q[x]; plus(x, 1, n); sprintf("n= %v", [n], __local0__); trace(__local0__) }
+| | Exit data.test.p
+| Redo data.test.p
 | | Redo trace(__local0__)
 | | Redo sprintf("n= %v", [n], __local0__)
 | | Redo plus(x, 1, n)
 | | Redo data.test.q[x]
-| | Redo q[x] { x = data.a[_] }
+| | Redo data.test.q
 | | | Redo x = data.a[_]
 `
 
@@ -255,4 +254,31 @@ Redo data.test.p = _
 	} else if len(b) < len(a) {
 		t.Fatalf("Missing lines in trace:\n%v", strings.Join(a[min:], "\n"))
 	}
+}
+
+func TestMultipleTracers(t *testing.T) {
+
+	ctx := context.Background()
+
+	buf1 := NewBufferTracer()
+	buf2 := NewBufferTracer()
+	q := NewQuery(ast.MustParseBody("a = 1")).
+		WithTracer(buf1).
+		WithTracer(buf2)
+
+	_, err := q.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(*buf1) != len(*buf2) {
+		t.Fatalf("Expected buffer lengths to be equal but got: %d and %d", len(*buf1), len(*buf2))
+	}
+
+	for i := range *buf1 {
+		if !(*buf1)[i].Equal((*buf2)[i]) {
+			t.Fatalf("Expected all events to be equal but at index %d got %v and %v", i, (*buf1)[i], (*buf2)[i])
+		}
+	}
+
 }

@@ -2,6 +2,8 @@ package topdown
 
 import (
 	"container/list"
+	"fmt"
+	"strings"
 
 	"github.com/open-policy-agent/opa/ast"
 )
@@ -12,12 +14,14 @@ import (
 // namespaced by the binding list they are added with. This means the save set
 // can be shared across queries.
 type saveSet struct {
-	l *list.List
+	instr *Instrumentation
+	l     *list.List
 }
 
-func newSaveSet(ts []*ast.Term, b *bindings) *saveSet {
+func newSaveSet(ts []*ast.Term, b *bindings, instr *Instrumentation) *saveSet {
 	ss := &saveSet{
-		l: list.New(),
+		l:     list.New(),
+		instr: instr,
 	}
 	ss.Push(ts, b)
 	return ss
@@ -36,10 +40,17 @@ func (ss *saveSet) Pop() {
 // prefix with a ref that was added (in either direction).
 func (ss *saveSet) Contains(t *ast.Term, b *bindings) bool {
 	if ss != nil {
-		for el := ss.l.Back(); el != nil; el = el.Prev() {
-			if el.Value.(*saveSetElem).Contains(t, b) {
-				return true
-			}
+		ss.instr.startTimer(partialOpSaveSetContains)
+		defer ss.instr.stopTimer(partialOpSaveSetContains)
+		return ss.contains(t, b)
+	}
+	return false
+}
+
+func (ss *saveSet) contains(t *ast.Term, b *bindings) bool {
+	for el := ss.l.Back(); el != nil; el = el.Prev() {
+		if el.Value.(*saveSetElem).Contains(t, b) {
+			return true
 		}
 	}
 	return false
@@ -49,21 +60,53 @@ func (ss *saveSet) Contains(t *ast.Term, b *bindings) bool {
 // contained in the save set. This function will close over the binding list
 // when it encounters vars.
 func (ss *saveSet) ContainsRecursive(t *ast.Term, b *bindings) bool {
-	found := false
+	if ss != nil {
+		ss.instr.startTimer(partialOpSaveSetContainsRec)
+		defer ss.instr.stopTimer(partialOpSaveSetContainsRec)
+		return ss.containsrec(t, b)
+	}
+	return false
+}
+
+func (ss *saveSet) containsrec(t *ast.Term, b *bindings) bool {
+	var found bool
 	ast.WalkTerms(t, func(x *ast.Term) bool {
 		if _, ok := x.Value.(ast.Var); ok {
 			x1, b1 := b.apply(x)
 			if x1 != x || b1 != b {
-				if ss.ContainsRecursive(x1, b1) {
+				if ss.containsrec(x1, b1) {
 					found = true
 				}
-			} else if ss.Contains(x1, b1) {
+			} else if ss.contains(x1, b1) {
 				found = true
 			}
 		}
 		return found
 	})
 	return found
+}
+
+func (ss *saveSet) Vars(caller *bindings) ast.VarSet {
+	result := ast.NewVarSet()
+	for x := ss.l.Front(); x != nil; x = x.Next() {
+		elem := x.Value.(*saveSetElem)
+		for _, v := range elem.vars {
+			if v, ok := elem.b.PlugNamespaced(v, caller).Value.(ast.Var); ok {
+				result.Add(v)
+			}
+		}
+	}
+	return result
+}
+
+func (ss *saveSet) String() string {
+	var buf []string
+
+	for x := ss.l.Front(); x != nil; x = x.Next() {
+		buf = append(buf, x.Value.(*saveSetElem).String())
+	}
+
+	return "(" + strings.Join(buf, " ") + ")"
 }
 
 type saveSetElem struct {
@@ -110,6 +153,10 @@ func (sse *saveSetElem) Contains(t *ast.Term, b *bindings) bool {
 	return false
 }
 
+func (sse *saveSetElem) String() string {
+	return fmt.Sprintf("(refs: %v, vars: %v, b: %v)", sse.refs, sse.vars, sse.b)
+}
+
 func (sse *saveSetElem) containsVar(t *ast.Term, b *bindings) bool {
 	if b == sse.b {
 		for _, v := range sse.vars {
@@ -153,6 +200,10 @@ func (s *saveStack) PopQuery() saveStackQuery {
 	return last
 }
 
+func (s *saveStack) Peek() saveStackQuery {
+	return s.Stack[len(s.Stack)-1]
+}
+
 func (s *saveStack) Push(expr *ast.Expr, b1 *bindings, b2 *bindings) {
 	idx := len(s.Stack) - 1
 	s.Stack[idx] = append(s.Stack[idx], saveStackElem{expr, b1, b2})
@@ -185,6 +236,9 @@ type saveStackElem struct {
 }
 
 func (e saveStackElem) Plug(caller *bindings) *ast.Expr {
+	if e.B1 == nil && e.B2 == nil {
+		return e.Expr
+	}
 	expr := e.Expr.Copy()
 	switch terms := expr.Terms.(type) {
 	case []*ast.Term:

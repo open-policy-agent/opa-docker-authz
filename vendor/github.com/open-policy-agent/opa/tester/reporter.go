@@ -11,6 +11,8 @@ import (
 	"io"
 	"strings"
 
+	"github.com/open-policy-agent/opa/topdown"
+
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/cover"
 )
@@ -24,8 +26,9 @@ type Reporter interface {
 
 // PrettyReporter reports test results in a simple human readable format.
 type PrettyReporter struct {
-	Output  io.Writer
-	Verbose bool
+	Output      io.Writer
+	Verbose     bool
+	FailureLine bool
 }
 
 // Report prints the test report to the reporter's output.
@@ -34,18 +37,50 @@ func (r PrettyReporter) Report(ch chan *Result) error {
 	dirty := false
 	var pass, fail, errs int
 
-	// Report individual tests.
+	var results, failures []*Result
 	for tr := range ch {
 		if tr.Pass() {
 			pass++
 		} else if tr.Error != nil {
 			errs++
-		} else if tr.Fail != nil {
+		} else if tr.Fail {
 			fail++
+			failures = append(failures, tr)
 		}
-		if !tr.Pass() || r.Verbose {
-			fmt.Fprintln(r.Output, tr)
+		results = append(results, tr)
+	}
+
+	if fail > 0 && r.Verbose {
+		fmt.Fprintln(r.Output, "FAILURES")
+		r.hl()
+
+		for _, failure := range failures {
+			fmt.Fprintln(r.Output, failure)
+			fmt.Fprintln(r.Output)
+			topdown.PrettyTrace(newIndentingWriter(r.Output), failure.Trace)
+			fmt.Fprintln(r.Output)
+		}
+
+		fmt.Fprintln(r.Output, "SUMMARY")
+		r.hl()
+	}
+
+	// Report individual tests.
+	for _, tr := range results {
+		if r.Verbose {
 			dirty = true
+			fmt.Fprintln(r.Output, tr)
+		} else if !tr.Pass() {
+			dirty = true
+			if r.FailureLine {
+				if tr.FailedAt != nil {
+					fmt.Fprintf(r.Output, "%v (%s:%d) \n", tr, tr.FailedAt.Location.File, tr.FailedAt.Location.Row)
+				} else {
+					fmt.Fprintf(r.Output, "%v (test skipped because success not possible) \n", tr)
+				}
+			} else {
+				fmt.Fprintln(r.Output, tr)
+			}
 		}
 		if tr.Error != nil {
 			fmt.Fprintf(r.Output, "  %v\n", tr.Error)
@@ -54,7 +89,7 @@ func (r PrettyReporter) Report(ch chan *Result) error {
 
 	// Report summary of test.
 	if dirty {
-		fmt.Fprintln(r.Output, strings.Repeat("-", 80))
+		r.hl()
 	}
 
 	total := pass + fail + errs
@@ -74,6 +109,10 @@ func (r PrettyReporter) Report(ch chan *Result) error {
 	return nil
 }
 
+func (r PrettyReporter) hl() {
+	fmt.Fprintln(r.Output, strings.Repeat("-", 80))
+}
+
 // JSONReporter reports test results as array of JSON objects.
 type JSONReporter struct {
 	Output io.Writer
@@ -81,11 +120,12 @@ type JSONReporter struct {
 
 // Report prints the test report to the reporter's output.
 func (r JSONReporter) Report(ch chan *Result) error {
-	var results []*Result
+	var report []*Result
 	for tr := range ch {
-		results = append(results, tr)
+		report = append(report, tr)
 	}
-	bs, err := json.MarshalIndent(results, "", "  ")
+
+	bs, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -95,9 +135,10 @@ func (r JSONReporter) Report(ch chan *Result) error {
 
 // JSONCoverageReporter reports coverage as a JSON structure.
 type JSONCoverageReporter struct {
-	Cover   *cover.Cover
-	Modules map[string]*ast.Module
-	Output  io.Writer
+	Cover     *cover.Cover
+	Modules   map[string]*ast.Module
+	Output    io.Writer
+	Threshold float64
 }
 
 // Report prints the test report to the reporter's output. If any tests fail or
@@ -112,7 +153,47 @@ func (r JSONCoverageReporter) Report(ch chan *Result) error {
 		}
 	}
 	report := r.Cover.Report(r.Modules)
+
+	if report.Coverage < r.Threshold {
+		return &cover.CoverageThresholdError{
+			Coverage:  report.Coverage,
+			Threshold: r.Threshold,
+		}
+	}
+
 	encoder := json.NewEncoder(r.Output)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(report)
+}
+
+type indentingWriter struct {
+	w io.Writer
+}
+
+func newIndentingWriter(w io.Writer) indentingWriter {
+	return indentingWriter{
+		w: w,
+	}
+}
+
+func (w indentingWriter) Write(bs []byte) (int, error) {
+	var written int
+	// insert indentation at the start of every line.
+	indent := true
+	for _, b := range bs {
+		if indent {
+			wrote, err := w.w.Write([]byte("  "))
+			if err != nil {
+				return written, err
+			}
+			written += wrote
+		}
+		wrote, err := w.w.Write([]byte{b})
+		if err != nil {
+			return written, err
+		}
+		written += wrote
+		indent = b == '\n'
+	}
+	return written, nil
 }

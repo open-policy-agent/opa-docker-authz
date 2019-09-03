@@ -48,51 +48,53 @@ func RunWithFilter(ctx context.Context, filter loader.Filter, paths ...string) (
 
 // Result represents a single test case result.
 type Result struct {
-	Location *ast.Location `json:"location"`
-	Package  string        `json:"package"`
-	Name     string        `json:"name"`
-	Fail     *interface{}  `json:"fail,omitempty"`
-	Error    error         `json:"error,omitempty"`
-	Duration time.Duration `json:"duration"`
+	Location *ast.Location    `json:"location"`
+	Package  string           `json:"package"`
+	Name     string           `json:"name"`
+	Fail     bool             `json:"fail,omitempty"`
+	Error    error            `json:"error,omitempty"`
+	Duration time.Duration    `json:"duration"`
+	Trace    []*topdown.Event `json:"trace,omitempty"`
+	FailedAt *ast.Expr        `json:"failed_at,omitempty"`
 }
 
-func newResult(loc *ast.Location, pkg, name string, duration time.Duration) *Result {
+func newResult(loc *ast.Location, pkg, name string, duration time.Duration, trace []*topdown.Event) *Result {
 	return &Result{
 		Location: loc,
 		Package:  pkg,
 		Name:     name,
 		Duration: duration,
+		Trace:    trace,
 	}
 }
 
 // Pass returns true if the test case passed.
 func (r Result) Pass() bool {
-	return r.Fail == nil && r.Error == nil
+	return !r.Fail && r.Error == nil
 }
 
 func (r *Result) String() string {
-	return fmt.Sprintf("%v.%v: %v (%v)", r.Package, r.Name, r.outcome(), r.Duration/time.Microsecond)
+	return fmt.Sprintf("%v.%v: %v (%v)", r.Package, r.Name, r.outcome(), r.Duration)
 }
 
 func (r *Result) outcome() string {
 	if r.Pass() {
 		return "PASS"
 	}
-	if r.Fail != nil {
+	if r.Fail {
 		return "FAIL"
 	}
 	return "ERROR"
 }
 
-func (r *Result) setFail(fail interface{}) {
-	r.Fail = &fail
-}
-
 // Runner implements simple test discovery and execution.
 type Runner struct {
-	compiler *ast.Compiler
-	store    storage.Store
-	tracer   topdown.Tracer
+	compiler    *ast.Compiler
+	store       storage.Store
+	cover       topdown.Tracer
+	trace       bool
+	runtime     *ast.Term
+	failureLine bool
 }
 
 // NewRunner returns a new runner.
@@ -112,14 +114,70 @@ func (r *Runner) SetStore(store storage.Store) *Runner {
 	return r
 }
 
-// SetTracer sets the tracer to use during test execution.
-func (r *Runner) SetTracer(tracer topdown.Tracer) *Runner {
-	r.tracer = tracer
+// SetCoverageTracer sets the tracer to use to compute coverage.
+func (r *Runner) SetCoverageTracer(tracer topdown.Tracer) *Runner {
+	r.cover = tracer
+	if r.cover != nil {
+		r.trace = false
+	}
 	return r
+}
+
+// EnableTracing enables tracing of evaluation and includes traces in results.
+// Tracing is currently mutually exclusive with coverage.
+func (r *Runner) EnableTracing(yes bool) *Runner {
+	r.trace = yes
+	if r.trace {
+		r.cover = nil
+	}
+	return r
+}
+
+// EnableFailureLine if set will provide the exact failure line
+func (r *Runner) EnableFailureLine(yes bool) *Runner {
+	r.failureLine = yes
+	return r
+}
+
+// SetRuntime sets runtime information to expose to the evaluation engine.
+func (r *Runner) SetRuntime(term *ast.Term) *Runner {
+	r.runtime = term
+	return r
+}
+
+func getFailedAtFromTrace(bufFailureLineTracer *topdown.BufferTracer) *ast.Expr {
+	events := *bufFailureLineTracer
+	const SecondToLast = 2
+	eventsLen := len(events)
+	for i, opFail := eventsLen-1, 0; i >= 0; i-- {
+		if events[i].Op == topdown.FailOp {
+			opFail++
+		}
+		if opFail == SecondToLast {
+			return events[i].Node.(*ast.Expr)
+		}
+	}
+	return nil
 }
 
 // Run executes all tests contained in supplied modules.
 func (r *Runner) Run(ctx context.Context, modules map[string]*ast.Module) (ch chan *Result, err error) {
+
+	// rewrite duplicate test_* rule names
+	count := map[string]int{}
+	for _, mod := range modules {
+		for _, rule := range mod.Rules {
+			name := rule.Head.Name.String()
+			if !strings.HasPrefix(name, TestPrefix) {
+				continue
+			}
+			key := rule.Path().String()
+			if k, ok := count[key]; ok {
+				rule.Head.Name = ast.Var(fmt.Sprintf("%s#%02d", name, k))
+			}
+			count[key]++
+		}
+	}
 
 	if r.compiler == nil {
 		r.compiler = ast.NewCompiler()
@@ -164,18 +222,39 @@ func (r *Runner) Run(ctx context.Context, modules map[string]*ast.Module) (ch ch
 
 func (r *Runner) runTest(ctx context.Context, mod *ast.Module, rule *ast.Rule) (*Result, bool) {
 
+	var bufferTracer *topdown.BufferTracer
+	var bufFailureLineTracer *topdown.BufferTracer
+	var tracer topdown.Tracer
+
+	if r.cover != nil {
+		tracer = r.cover
+	} else if r.trace {
+		bufferTracer = topdown.NewBufferTracer()
+		tracer = bufferTracer
+	} else if r.failureLine {
+		bufFailureLineTracer = topdown.NewBufferTracer()
+		tracer = bufFailureLineTracer
+	}
+
 	rego := rego.New(
 		rego.Store(r.store),
 		rego.Compiler(r.compiler),
 		rego.Query(rule.Path().String()),
-		rego.Tracer(r.tracer),
+		rego.Tracer(tracer),
+		rego.Runtime(r.runtime),
 	)
 
 	t0 := time.Now()
 	rs, err := rego.Eval(ctx)
 	dt := time.Since(t0)
 
-	tr := newResult(rule.Loc(), mod.Package.Path.String(), string(rule.Head.Name), dt)
+	var trace []*topdown.Event
+
+	if bufferTracer != nil {
+		trace = *bufferTracer
+	}
+
+	tr := newResult(rule.Loc(), mod.Package.Path.String(), string(rule.Head.Name), dt, trace)
 	var stop bool
 
 	if err != nil {
@@ -184,9 +263,12 @@ func (r *Runner) runTest(ctx context.Context, mod *ast.Module, rule *ast.Rule) (
 			stop = true
 		}
 	} else if len(rs) == 0 {
-		tr.setFail(false)
+		tr.Fail = true
+		if bufFailureLineTracer != nil {
+			tr.FailedAt = getFailedAtFromTrace(bufFailureLineTracer)
+		}
 	} else if b, ok := rs[0].Expressions[0].Value.(bool); !ok || !b {
-		tr.setFail(rs[0].Expressions[0].Value)
+		tr.Fail = true
 	}
 
 	return tr, stop

@@ -19,13 +19,26 @@ func TestFormatNilLocation(t *testing.T) {
 	rule := ast.MustParseRule(`r = y { y = "foo" }`)
 	rule.Head.Location = nil
 
-	_, err := Ast(rule)
-	if err == nil {
-		t.Fatal("Expected error for rule with nil Location in head")
+	bs, err := Ast(rule)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	if _, ok := err.(nilLocationErr); !ok {
-		t.Fatalf("Expected nilLocationErr, got %v", err)
+	exp := strings.Trim(`
+r = y {
+	y = "foo"
+}`, " \n")
+
+	if string(bs) != exp {
+		t.Fatalf("Expected %q but got %q", exp, string(bs))
+	}
+}
+
+func TestFormatNilLocationEmptyBody(t *testing.T) {
+	b := ast.NewBody()
+	x, err := Ast(b)
+	if len(x) != 0 || err != nil {
+		t.Fatalf("Expected empty result but got: %q, err: %v", string(x), err)
 	}
 }
 
@@ -109,7 +122,7 @@ func differsAt(a, b []byte) (int, int) {
 			return ln, i
 		}
 	}
-	return ln, minLen
+	return ln, minLen - 1
 }
 
 func prefixWithLineNumbers(bs []byte) []byte {

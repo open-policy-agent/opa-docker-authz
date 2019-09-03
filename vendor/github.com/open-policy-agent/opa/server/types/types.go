@@ -43,6 +43,11 @@ func NewErrorV1(code, f string, a ...interface{}) *ErrorV1 {
 	}
 }
 
+// This shall only used for debugging purpose.
+func (e *ErrorV1) Error() string {
+	return fmt.Sprintf("%s: %s", e.Code, e.Message)
+}
+
 // WithError updates e to include a detailed error.
 func (e *ErrorV1) WithError(err error) *ErrorV1 {
 	e.Errors = append(e.Errors, err)
@@ -75,7 +80,7 @@ const (
 	MsgUnauthorizedUndefinedError = "authorization policy missing or undefined"
 	MsgUnauthorizedError          = "request rejected by administrative policy"
 	MsgUndefinedError             = "document missing or undefined"
-	MsgDiagnosticsDisabled        = "diagnostics are not enabled"
+	MsgPluginConfigError          = "error(s) occurred while configuring plugin(s)"
 )
 
 // PatchV1 models a single patch operation against a document.
@@ -117,6 +122,21 @@ func (p PolicyV1) Equal(other PolicyV1) bool {
 	return p.ID == other.ID && p.Raw == other.Raw && p.AST.Equal(other.AST)
 }
 
+// ProvenanceV1 models a collection of build/version information.
+type ProvenanceV1 struct {
+	Version   string                        `json:"version"`
+	Vcs       string                        `json:"build_commit"`
+	Timestamp string                        `json:"build_timestamp"`
+	Hostname  string                        `json:"build_hostname"`
+	Revision  string                        `json:"revision,omitempty"` // Deprecated: Prefer `Bundles`
+	Bundles   map[string]ProvenanceBundleV1 `json:"bundles,omitempty"`
+}
+
+// ProvenanceBundleV1 models a bundle at some point in time
+type ProvenanceBundleV1 struct {
+	Revision string `json:"revision"`
+}
+
 // DataRequestV1 models the request message for Data API POST operations.
 type DataRequestV1 struct {
 	Input *interface{} `json:"input"`
@@ -124,30 +144,11 @@ type DataRequestV1 struct {
 
 // DataResponseV1 models the response message for Data API read operations.
 type DataResponseV1 struct {
-	DecisionID  string       `json:"decision_id,omitempty"`
-	Explanation TraceV1      `json:"explanation,omitempty"`
-	Metrics     MetricsV1    `json:"metrics,omitempty"`
-	Result      *interface{} `json:"result,omitempty"`
-}
-
-// DiagnosticsResponseV1 models the response message for diagnostics reads.
-type DiagnosticsResponseV1 struct {
-	Result []DiagnosticsResponseElementV1 `json:"result"`
-}
-
-// DiagnosticsResponseElementV1 models an element in the response message for the
-// Diagnostics API.
-type DiagnosticsResponseElementV1 struct {
-	Revision    string       `json:"revision,omitempty"`
-	DecisionID  string       `json:"decision_id,omitempty"`
-	RemoteAddr  string       `json:"remote_addr"`
-	Query       string       `json:"query"`
-	Timestamp   string       `json:"timestamp"`
-	Input       interface{}  `json:"input,omitempty"`
-	Result      *interface{} `json:"result,omitempty"`
-	Error       *ErrorV1     `json:"error,omitempty"`
-	Explanation TraceV1      `json:"explanation,omitempty"`
-	Metrics     MetricsV1    `json:"metrics,omitempty"`
+	DecisionID  string        `json:"decision_id,omitempty"`
+	Provenance  *ProvenanceV1 `json:"provenance,omitempty"`
+	Explanation TraceV1       `json:"explanation,omitempty"`
+	Metrics     MetricsV1     `json:"metrics,omitempty"`
+	Result      *interface{}  `json:"result,omitempty"`
 }
 
 // MetricsV1 models a collection of performance metrics.
@@ -179,8 +180,10 @@ type ExplainModeV1 string
 
 // Explanation mode enumeration.
 const (
-	ExplainOffV1  ExplainModeV1 = "off"
-	ExplainFullV1 ExplainModeV1 = "full"
+	ExplainOffV1   ExplainModeV1 = "off"
+	ExplainFullV1  ExplainModeV1 = "full"
+	ExplainNotesV1 ExplainModeV1 = "notes"
+	ExplainFailsV1 ExplainModeV1 = "fails"
 )
 
 // TraceV1 models the trace result returned for queries that include the
@@ -376,6 +379,11 @@ type PartialEvaluationResultV1 struct {
 	Support []*ast.Module `json:"support,omitempty"`
 }
 
+// QueryRequestV1 models the request message for Query API operations.
+type QueryRequestV1 struct {
+	Query string `json:"query"`
+}
+
 const (
 	// ParamQueryV1 defines the name of the HTTP URL parameter that specifies
 	// values for the request query.
@@ -408,9 +416,18 @@ const (
 	// query evaluation.
 	ParamPartialV1 = "partial"
 
+	// ParamProvenanceV1 defines the name of the HTTP URL parameter that indicates
+	// the client wants build and version information in addition to the result.
+	ParamProvenanceV1 = "provenance"
+
 	// ParamWatchV1 defines the name of the HTTP URL parameter that indicates
 	// the client wants to set a watch on the current query or data reference.
 	ParamWatchV1 = "watch"
+
+	// ParamBundleActivationV1 defines the name of the HTTP URL parameter that
+	// indicates the client wants to include bundle activation in the results
+	// of the health API.
+	ParamBundleActivationV1 = "bundle"
 )
 
 // BadRequestErr represents an error condition raised if the caller passes

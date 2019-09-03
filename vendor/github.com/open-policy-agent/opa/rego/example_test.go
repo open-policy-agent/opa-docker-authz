@@ -9,11 +9,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/rego"
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/storage/inmem"
+	"github.com/open-policy-agent/opa/topdown"
 	"github.com/open-policy-agent/opa/util"
 )
 
@@ -191,23 +193,10 @@ func ExampleRego_Eval_compiler() {
 		}
 	`
 
-	// Parse the module. The first argument is used as an identifier in error messages.
-	parsed, err := ast.ParseModule("example.rego", module)
-	if err != nil {
-		// Handle error.
-	}
-
-	// Create a new compiler and compile the module. The keys are used as
-	// identifiers in error messages.
-	compiler := ast.NewCompiler()
-	compiler.Compile(map[string]*ast.Module{
-		"example.rego": parsed,
+	// Compile the module. The keys are used as identifiers in error messages.
+	compiler, err := ast.CompileModules(map[string]string{
+		"example.rego": module,
 	})
-
-	if compiler.Failed() {
-		// Handle error. Compilation errors are stored on the compiler.
-		panic(compiler.Errors)
-	}
 
 	// Create a new query that uses the compiled policy from above.
 	rego := rego.New(
@@ -349,16 +338,14 @@ func ExampleRego_Eval_transactions() {
 	// Run evaluation AFTER the transaction commits.
 	rs, err = outside.Eval(ctx)
 	if err != nil {
-		// Handle error.
+		fmt.Println("error (after txn):", err)
 	}
-
-	fmt.Println("value (after txn):", rs[0].Expressions[0].Value)
 
 	// Output:
 	//
 	// value (inside txn): pepperoni
 	// value (outside txn): cheese
-	// value (after txn): pepperoni
+	// error (after txn): storage_invalid_txn_error: stale transaction
 }
 
 func ExampleRego_Eval_errors() {
@@ -568,4 +555,151 @@ func ExampleRego_Partial() {
 	//
 	// Query #1: "GET" = input.method; input.path = ["reviews", _]; input.is_admin
 	// Query #2: "GET" = input.method; input.path = ["reviews", user3]; user3 = input.user
+}
+
+func ExampleRego_Eval_tracer() {
+
+	ctx := context.Background()
+
+	buf := topdown.NewBufferTracer()
+
+	// Create very simple query that binds a single variable, and enables tracing.
+	rego := rego.New(
+		rego.Query("x = 1"),
+		rego.Tracer(buf),
+	)
+
+	// Run evaluation.
+	rego.Eval(ctx)
+
+	// Inspect results.
+	topdown.PrettyTrace(os.Stdout, *buf)
+
+	// Output:
+	//
+	// Enter x = 1
+	// | Eval x = 1
+	// | Exit x = 1
+	// Redo x = 1
+	// | Redo x = 1
+}
+
+func ExampleRego_PrepareForEval() {
+	ctx := context.Background()
+
+	// Create a simple query
+	r := rego.New(
+		rego.Query("input.x == 1"),
+	)
+
+	// Prepare for evaluation
+	pq, err := r.PrepareForEval(ctx)
+
+	if err != nil {
+		// Handle error.
+	}
+
+	// Raw input data that will be used in the first evaluation
+	input := map[string]interface{}{"x": 2}
+
+	// Run the evaluation
+	rs, err := pq.Eval(ctx, rego.EvalInput(input))
+
+	if err != nil {
+		// Handle error.
+	}
+
+	// Inspect results.
+	fmt.Println("initial result:", rs[0].Expressions[0])
+
+	// Update input
+	input["x"] = 1
+
+	// Run the evaluation with new input
+	rs, err = pq.Eval(ctx, rego.EvalInput(input))
+
+	if err != nil {
+		// Handle error.
+	}
+
+	// Inspect results.
+	fmt.Println("updated result:", rs[0].Expressions[0])
+
+	// Output:
+	//
+	// initial result: false
+	// updated result: true
+}
+
+func ExampleRego_PrepareForPartial() {
+
+	ctx := context.Background()
+
+	// Define a simple policy for example purposes.
+	module := `package test
+
+	allow {
+		input.method = read_methods[_]
+		input.path = ["reviews", user]
+		input.user = user
+	}
+
+	allow {
+		input.method = read_methods[_]
+		input.path = ["reviews", _]
+		input.is_admin
+	}
+
+	read_methods = ["GET"]
+	`
+
+	r := rego.New(
+		rego.Query("data.test.allow == true"),
+		rego.Module("example.rego", module),
+	)
+
+	pq, err := r.PrepareForPartial(ctx)
+	if err != nil {
+		// Handle error.
+	}
+
+	pqs, err := pq.Partial(ctx)
+	if err != nil {
+		// Handle error.
+	}
+
+	// Inspect result
+	fmt.Println("First evaluation")
+	for i := range pqs.Queries {
+		fmt.Printf("Query #%d: %v\n", i+1, pqs.Queries[i])
+	}
+
+	// Evaluate with specified input
+	exampleInput := map[string]string{
+		"method": "GET",
+	}
+
+	// Evaluate again with different input and unknowns
+	pqs, err = pq.Partial(ctx,
+		rego.EvalInput(exampleInput),
+		rego.EvalUnknowns([]string{"input.user", "input.is_admin", "input.path"}),
+	)
+	if err != nil {
+		// Handle error.
+	}
+
+	// Inspect result
+	fmt.Println("Second evaluation")
+	for i := range pqs.Queries {
+		fmt.Printf("Query #%d: %v\n", i+1, pqs.Queries[i])
+	}
+
+	// Output:
+	//
+	// First evaluation
+	// Query #1: "GET" = input.method; input.path = ["reviews", _]; input.is_admin
+	// Query #2: "GET" = input.method; input.path = ["reviews", user3]; user3 = input.user
+	// Second evaluation
+	// Query #1: input.path = ["reviews", _]; input.is_admin
+	// Query #2: input.path = ["reviews", user3]; user3 = input.user
 }

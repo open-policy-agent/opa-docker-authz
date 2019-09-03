@@ -36,8 +36,8 @@ func TestCheckInference(t *testing.T) {
 			nil,
 			types.NewObject(
 				[]*types.StaticProperty{
-					{"a", types.S},
-					{"b", types.S},
+					{Key: "a", Value: types.S},
+					{Key: "b", Value: types.S},
 				}, nil,
 			),
 		),
@@ -96,7 +96,7 @@ func TestCheckInference(t *testing.T) {
 			Var("x"): types.A,
 		}},
 		{"object-numeric-key", `x = {1: 2}; y = 1; x[y]`, map[Var]types.Type{
-			Var("x"): types.NewObject([]*types.StaticProperty{{json.Number("1"), types.N}}, nil),
+			Var("x"): types.NewObject([]*types.StaticProperty{{Key: json.Number("1"), Value: types.N}}, nil),
 			Var("y"): types.N,
 		}},
 		{"sets", `x = {1, 2}; y = {{"foo", 1}, x}`, map[Var]types.Type{
@@ -336,7 +336,7 @@ func TestCheckInferenceRules(t *testing.T) {
 		{"complete-doc", ruleset1, `data.a.complete`, types.NewArray(
 			[]types.Type{types.NewObject(
 				[]*types.StaticProperty{{
-					"foo", types.N,
+					Key: "foo", Value: types.N,
 				}},
 				nil,
 			)},
@@ -350,7 +350,7 @@ func TestCheckInferenceRules(t *testing.T) {
 		{"partial-set-doc", ruleset1, `data.a.partialset`, types.NewSet(
 			types.NewObject(
 				[]*types.StaticProperty{{
-					"foo", types.S,
+					Key: "foo", Value: types.S,
 				}},
 				nil,
 			),
@@ -360,7 +360,7 @@ func TestCheckInferenceRules(t *testing.T) {
 			nil,
 			types.NewDynamicProperty(types.S, types.NewObject(
 				[]*types.StaticProperty{{
-					"foo", types.S,
+					Key: "foo", Value: types.S,
 				}},
 				nil,
 			)),
@@ -411,8 +411,8 @@ func TestCheckInferenceRules(t *testing.T) {
 
 		{"prefix", ruleset1, `data.prefix.a.b`, types.NewObject(
 			[]*types.StaticProperty{{
-				"c", types.NewObject(
-					[]*types.StaticProperty{{"d", types.B}},
+				Key: "c", Value: types.NewObject(
+					[]*types.StaticProperty{{Key: "d", Value: types.B}},
 					types.NewDynamicProperty(types.S, types.A),
 				),
 			}},
@@ -596,15 +596,15 @@ func TestCheckBuiltinErrors(t *testing.T) {
 			types.Args(
 				types.NewAny(types.NewObject(
 					[]*types.StaticProperty{
-						{"a", types.S},
-						{"b", types.S},
+						{Key: "a", Value: types.S},
+						{Key: "b", Value: types.S},
 					}, nil),
 				),
 			),
 			types.NewObject(
 				[]*types.StaticProperty{
-					{"b", types.S},
-					{"c", types.S},
+					{Key: "b", Value: types.S},
+					{Key: "c", Value: types.S},
 				}, nil,
 			),
 		),
@@ -623,7 +623,6 @@ func TestCheckBuiltinErrors(t *testing.T) {
 		{"objects-bad-input", `sum({"a": 1, "b": 2}, x)`},
 		{"sets-any", `sum({1,2,"3",4}, x)`},
 		{"virtual-ref", `plus(data.test.p, data.deabeef, 0)`},
-		{"function-ref", `data.test.f(1, data.test.f)`},
 	}
 
 	env := newTestEnv([]string{
@@ -837,7 +836,7 @@ func TestCheckRefErrInvalid(t *testing.T) {
 	}
 }
 
-func TestUserFunctionsTypeInference(t *testing.T) {
+func TestFunctionsTypeInference(t *testing.T) {
 	functions := []string{
 		`foo([a, b]) = y { split(a, b, y) }`,
 		`bar(x) = y { count(x, y) }`,
@@ -901,6 +900,18 @@ func TestUserFunctionsTypeInference(t *testing.T) {
 			`f(x) = y { {"k": x} = y }`,
 			false,
 		},
+		{
+			`p { [data.base.foo] }`,
+			true,
+		},
+		{
+			`p { x = data.base.foo }`,
+			true,
+		},
+		{
+			`p { data.base.foo(data.base.bar) }`,
+			true,
+		},
 	}
 
 	for n, test := range tests {
@@ -914,6 +925,33 @@ func TestUserFunctionsTypeInference(t *testing.T) {
 				t.Errorf("Expected success but got error: %v", c.Errors)
 			}
 		})
+	}
+}
+
+func TestFunctionTypeInferenceUnappliedWithObjectVarKey(t *testing.T) {
+
+	// Run type inference on a function that constructs an object with a key
+	// from args in the head.
+	module := MustParseModule(`
+		package test
+
+		f(x) = y { y = {x: 1} }
+	`)
+
+	env, err := newTypeChecker().CheckTypes(newTypeChecker().checkLanguageBuiltins(), []util.T{
+		module.Rules[0],
+	})
+
+	if len(err) > 0 {
+		t.Fatal(err)
+	}
+
+	// Check inferrred type for reference to function.
+	tpe := env.Get(MustParseRef("data.test.f"))
+	exp := types.NewFunction([]types.Type{types.A}, types.NewObject(nil, types.NewDynamicProperty(types.A, types.N)))
+
+	if types.Compare(tpe, exp) != 0 {
+		t.Fatalf("Expected %v but got %v", exp, tpe)
 	}
 }
 

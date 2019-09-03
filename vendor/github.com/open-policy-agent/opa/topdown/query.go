@@ -26,12 +26,14 @@ type Query struct {
 	store            storage.Store
 	txn              storage.Transaction
 	input            *ast.Term
-	tracer           Tracer
+	tracers          []Tracer
 	unknowns         []*ast.Term
 	partialNamespace string
 	metrics          metrics.Metrics
 	instr            *Instrumentation
+	disableInlining  []ast.Ref
 	genvarprefix     string
+	runtime          *ast.Term
 }
 
 // NewQuery returns a new Query object that can be run.
@@ -75,9 +77,9 @@ func (q *Query) WithInput(input *ast.Term) *Query {
 	return q
 }
 
-// WithTracer sets the query tracer to use during evaluation. This is optional.
+// WithTracer adds a query tracer to use during evaluation. This is optional.
 func (q *Query) WithTracer(tracer Tracer) *Query {
-	q.tracer = tracer
+	q.tracers = append(q.tracers, tracer)
 	return q
 }
 
@@ -110,6 +112,22 @@ func (q *Query) WithPartialNamespace(ns string) *Query {
 	return q
 }
 
+// WithDisableInlining adds a set of paths to the query that should be excluded from
+// inlining. Inlining during partial evaluation can be expensive in some cases
+// (e.g., when a cross-product is computed.) Disabling inlining avoids expensive
+// computation at the cost of generating support rules.
+func (q *Query) WithDisableInlining(paths []ast.Ref) *Query {
+	q.disableInlining = paths
+	return q
+}
+
+// WithRuntime sets the runtime data to execute the query with. The runtime data
+// can be returned by the `opa.runtime` built-in function.
+func (q *Query) WithRuntime(runtime *ast.Term) *Query {
+	q.runtime = runtime
+	return q
+}
+
 // PartialRun executes partial evaluation on the query with respect to unknown
 // values. Partial evaluation attempts to evaluate as much of the query as
 // possible without requiring values for the unknowns set on the query. The
@@ -124,26 +142,29 @@ func (q *Query) PartialRun(ctx context.Context) (partials []ast.Body, support []
 	f := &queryIDFactory{}
 	b := newBindings(0, q.instr)
 	e := &eval{
-		ctx:           ctx,
-		cancel:        q.cancel,
-		query:         q.query,
-		queryIDFact:   f,
-		queryID:       f.Next(),
-		bindings:      b,
-		compiler:      q.compiler,
-		store:         q.store,
-		baseCache:     newBaseCache(),
-		txn:           q.txn,
-		input:         q.input,
-		tracer:        q.tracer,
-		instr:         q.instr,
-		builtinCache:  builtins.Cache{},
-		virtualCache:  newVirtualCache(),
-		saveSet:       newSaveSet(q.unknowns, b),
-		saveStack:     newSaveStack(),
-		saveSupport:   newSaveSupport(),
-		saveNamespace: ast.StringTerm(q.partialNamespace),
-		genvarprefix:  q.genvarprefix,
+		ctx:             ctx,
+		cancel:          q.cancel,
+		query:           q.query,
+		queryIDFact:     f,
+		queryID:         f.Next(),
+		bindings:        b,
+		compiler:        q.compiler,
+		store:           q.store,
+		baseCache:       newBaseCache(),
+		targetStack:     newRefStack(),
+		txn:             q.txn,
+		input:           q.input,
+		tracers:         q.tracers,
+		instr:           q.instr,
+		builtinCache:    builtins.Cache{},
+		virtualCache:    newVirtualCache(),
+		saveSet:         newSaveSet(q.unknowns, b, q.instr),
+		saveStack:       newSaveStack(),
+		saveSupport:     newSaveSupport(),
+		saveNamespace:   ast.StringTerm(q.partialNamespace),
+		disableInlining: q.disableInlining,
+		genvarprefix:    q.genvarprefix,
+		runtime:         q.runtime,
 	}
 	q.startTimer(metrics.RegoPartialEval)
 	defer q.stopTimer(metrics.RegoPartialEval)
@@ -160,11 +181,14 @@ func (q *Query) PartialRun(ctx context.Context) (partials []ast.Body, support []
 	p := copypropagation.New(livevars)
 
 	err = e.Run(func(e *eval) error {
+
 		// Build output from saved expressions.
 		body := ast.NewBody()
+
 		for _, elem := range e.saveStack.Stack[len(e.saveStack.Stack)-1] {
 			body.Append(elem.Plug(e.bindings))
 		}
+
 		// Include bindings as exprs so that when caller evals the result, they
 		// can obtain values for the vars in their query.
 		bindingExprs := []*ast.Expr{}
@@ -172,18 +196,23 @@ func (q *Query) PartialRun(ctx context.Context) (partials []ast.Body, support []
 			bindingExprs = append(bindingExprs, ast.Equality.Expr(a, b))
 			return nil
 		})
+
 		// Sort binding expressions so that results are deterministic.
 		sort.Slice(bindingExprs, func(i, j int) bool {
 			return bindingExprs[i].Compare(bindingExprs[j]) < 0
 		})
+
 		for i := range bindingExprs {
 			body.Append(bindingExprs[i])
 		}
-		body = p.Apply(body)
-		partials = append(partials, body)
+
+		partials = append(partials, applyCopyPropagation(p, e.instr, body))
 		return nil
 	})
-	return partials, e.saveSupport.List(), err
+
+	support = e.saveSupport.List()
+
+	return partials, support, err
 }
 
 // Run is a wrapper around Iter that accumulates query results and returns them
@@ -210,13 +239,15 @@ func (q *Query) Iter(ctx context.Context, iter func(QueryResult) error) error {
 		compiler:     q.compiler,
 		store:        q.store,
 		baseCache:    newBaseCache(),
+		targetStack:  newRefStack(),
 		txn:          q.txn,
 		input:        q.input,
-		tracer:       q.tracer,
+		tracers:      q.tracers,
 		instr:        q.instr,
 		builtinCache: builtins.Cache{},
 		virtualCache: newVirtualCache(),
 		genvarprefix: q.genvarprefix,
+		runtime:      q.runtime,
 	}
 	q.startTimer(metrics.RegoQueryEval)
 	defer q.stopTimer(metrics.RegoQueryEval)
