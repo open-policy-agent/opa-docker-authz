@@ -9,38 +9,71 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
+	"github.com/open-policy-agent/opa/internal/version"
 	"io"
 	"net/http"
-	"net/url"
+	"reflect"
 	"strings"
 
-	"github.com/open-policy-agent/opa/util"
 	"github.com/sirupsen/logrus"
+
+	"github.com/open-policy-agent/opa/util"
 )
+
+// An HTTPAuthPlugin represents a mechanism to construct and configure HTTP authentication for a REST service
+type HTTPAuthPlugin interface {
+	// implementations can assume NewClient will be called before Prepare
+	NewClient(c Config) (*http.Client, error)
+	Prepare(req *http.Request) error
+}
 
 // Config represents configuration for a REST client.
 type Config struct {
-	Name        string            `json:"name"`
-	URL         string            `json:"url"`
-	Headers     map[string]string `json:"headers"`
-	Credentials struct {
-		Bearer *struct {
-			Scheme string `json:"scheme,omitempty"`
-			Token  string `json:"token"`
-		} `json:"bearer,omitempty"`
+	Name           string            `json:"name"`
+	URL            string            `json:"url"`
+	Headers        map[string]string `json:"headers"`
+	AllowInsureTLS bool              `json:"allow_insecure_tls,omitempty"`
+	Credentials    struct {
+		Bearer    *bearerAuthPlugin     `json:"bearer,omitempty"`
+		ClientTLS *clientTLSAuthPlugin  `json:"client_tls,omitempty"`
+		S3Signing *awsSigningAuthPlugin `json:"s3_signing,omitempty"`
 	} `json:"credentials"`
 }
 
-func (c *Config) validateAndInjectDefaults() error {
-	c.URL = strings.TrimRight(c.URL, "/")
-	_, err := url.Parse(c.URL)
-	if c.Credentials.Bearer != nil {
-		if c.Credentials.Bearer.Scheme == "" {
-			c.Credentials.Bearer.Scheme = "Bearer"
+func (c *Config) authPlugin() (HTTPAuthPlugin, error) {
+	// reflection avoids need for this code to change as auth plugins are added
+	s := reflect.ValueOf(c.Credentials)
+	var candidate HTTPAuthPlugin
+	for i := 0; i < s.NumField(); i++ {
+		if s.Field(i).IsNil() {
+			continue
 		}
+		if candidate != nil {
+			return nil, errors.New("a maximum one credential method must be specified")
+		}
+		candidate = s.Field(i).Interface().(HTTPAuthPlugin)
 	}
-	return err
+	if candidate == nil {
+		return &defaultAuthPlugin{}, nil
+	}
+	return candidate, nil
+}
+
+func (c *Config) authHTTPClient() (*http.Client, error) {
+	plugin, err := c.authPlugin()
+	if err != nil {
+		return nil, err
+	}
+	return plugin.NewClient(*c)
+}
+
+func (c *Config) authPrepare(req *http.Request) error {
+	plugin, err := c.authPlugin()
+	if err != nil {
+		return err
+	}
+	return plugin.Prepare(req)
 }
 
 // Client implements an HTTP/REST client for communicating with remote
@@ -53,15 +86,38 @@ type Client struct {
 	headers map[string]string
 }
 
+// Name returns an option that overrides the service name on the client.
+func Name(s string) func(*Client) {
+	return func(c *Client) {
+		c.config.Name = s
+	}
+}
+
 // New returns a new Client for config.
-func New(config []byte) (Client, error) {
+func New(config []byte, opts ...func(*Client)) (Client, error) {
 	var parsedConfig Config
 
 	if err := util.Unmarshal(config, &parsedConfig); err != nil {
 		return Client{}, err
 	}
 
-	return Client{config: parsedConfig}, parsedConfig.validateAndInjectDefaults()
+	parsedConfig.URL = strings.TrimRight(parsedConfig.URL, "/")
+
+	httpClient, err := parsedConfig.authHTTPClient()
+	if err != nil {
+		return Client{}, err
+	}
+
+	client := Client{
+		config: parsedConfig,
+		Client: *httpClient,
+	}
+
+	for _, f := range opts {
+		f(&client)
+	}
+
+	return client, nil
 }
 
 // Service returns the name of the service this Client is configured for.
@@ -122,11 +178,8 @@ func (c Client) Do(ctx context.Context, method, path string) (*http.Response, er
 		return nil, err
 	}
 
-	headers := map[string]string{}
-
-	// Set authorization header for credentials.
-	if c.config.Credentials.Bearer != nil {
-		req.Header.Add("Authorization", fmt.Sprintf("%v %v", c.config.Credentials.Bearer.Scheme, c.config.Credentials.Bearer.Token))
+	headers := map[string]string{
+		"User-Agent": version.UserAgent,
 	}
 
 	// Copy custom headers from config.
@@ -144,6 +197,11 @@ func (c Client) Do(ctx context.Context, method, path string) (*http.Response, er
 	}
 
 	req = req.WithContext(ctx)
+
+	err = c.config.authPrepare(req)
+	if err != nil {
+		return nil, err
+	}
 
 	logrus.WithFields(logrus.Fields{
 		"method":  method,

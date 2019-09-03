@@ -1,6 +1,6 @@
 .PHONY: all build
 
-VERSION := 0.4
+VERSION := 0.5
 OPA_VERSION := $(shell ./get-opa-version-from-glide.sh)
 GO_VERSION := 1.10
 REPO := openpolicyagent/opa-docker-authz

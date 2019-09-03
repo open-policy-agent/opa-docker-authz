@@ -211,10 +211,7 @@ func (tc *typeChecker) checkExpr(env *TypeEnv, expr *Expr) *Error {
 func (tc *typeChecker) checkExprBuiltin(env *TypeEnv, expr *Expr) *Error {
 
 	args := expr.Operands()
-	pre := make([]types.Type, len(args))
-	for i := range args {
-		pre[i] = env.Get(args[i])
-	}
+	pre := getArgTypes(env, args)
 
 	name := expr.Operator()
 	tpe := env.Get(name)
@@ -256,6 +253,15 @@ func (tc *typeChecker) checkExprBuiltin(env *TypeEnv, expr *Expr) *Error {
 }
 
 func (tc *typeChecker) checkExprEq(env *TypeEnv, expr *Expr) *Error {
+
+	pre := getArgTypes(env, expr.Operands())
+	exp := Equality.Decl.Args()
+
+	if len(pre) < len(exp) {
+		return newArgError(expr.Location, expr.Operator(), "too few arguments", pre, exp)
+	} else if len(exp) < len(pre) {
+		return newArgError(expr.Location, expr.Operator(), "too many arguments", pre, exp)
+	}
 
 	a, b := expr.Operand(0), expr.Operand(1)
 	typeA, typeB := env.Get(a), env.Get(b)
@@ -367,7 +373,8 @@ func unify1(env *TypeEnv, term *Term, tpe types.Type, union bool) bool {
 			return unify1Object(env, v, tpe, union)
 		case types.Any:
 			if types.Compare(tpe, types.A) == 0 {
-				v.Foreach(func(_, value *Term) {
+				v.Foreach(func(key, value *Term) {
+					unify1(env, key, types.A, true)
 					unify1(env, value, types.A, true)
 				})
 				return true
@@ -466,9 +473,8 @@ func (tc *typeChecker) err(err *Error) {
 }
 
 type refChecker struct {
-	env       *TypeEnv
-	errs      Errors
-	checkTerm bool
+	env  *TypeEnv
+	errs Errors
 }
 
 func newRefChecker(env *TypeEnv) *refChecker {
@@ -490,17 +496,13 @@ func (rc *refChecker) Visit(x interface{}) Visitor {
 			}
 			return nil
 		case *Term:
-			rc.checkTerm = true
 			Walk(rc, terms)
-			rc.checkTerm = false
 			return nil
 		}
 	case Ref:
-		if rc.checkTerm {
-			if err := rc.checkApply(rc.env, x); err != nil {
-				rc.errs = append(rc.errs, err)
-				return nil
-			}
+		if err := rc.checkApply(rc.env, x); err != nil {
+			rc.errs = append(rc.errs, err)
+			return nil
 		}
 		if err := rc.checkRef(rc.env, rc.env.tree, x, 0); err != nil {
 			rc.errs = append(rc.errs, err)
@@ -942,4 +944,12 @@ func sortValueSlice(sl []Value) {
 	sort.Slice(sl, func(i, j int) bool {
 		return sl[i].Compare(sl[j]) < 0
 	})
+}
+
+func getArgTypes(env *TypeEnv, args []*Term) []types.Type {
+	pre := make([]types.Type, len(args))
+	for i := range args {
+		pre[i] = env.Get(args[i])
+	}
+	return pre
 }

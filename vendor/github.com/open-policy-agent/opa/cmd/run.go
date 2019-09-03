@@ -7,33 +7,35 @@ package cmd
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path"
+
+	"github.com/spf13/cobra"
 
 	"github.com/open-policy-agent/opa/runtime"
 	"github.com/open-policy-agent/opa/server"
 	"github.com/open-policy-agent/opa/util"
-	"github.com/spf13/cobra"
 )
 
 const (
-	defaultAddr                        = ":8181"        // default listening address for server
-	defaultHistoryFile                 = ".opa_history" // default filename for shell history
-	defaultServerDiagnosticsBufferSize = 10             // default number of items to keep in diagnostics buffer for server
+	defaultAddr        = ":8181"        // default listening address for server
+	defaultHistoryFile = ".opa_history" // default filename for shell history
 )
 
 func init() {
 
 	var serverMode bool
-	var tlsCertFile string
-	var tlsPrivateKeyFile string
+	var tlsCertFile, tlsPrivateKeyFile, tlsCACertFile string
 	var ignore []string
 
-	authentication := util.NewEnumFlag("off", []string{"token", "off"})
+	authentication := util.NewEnumFlag("off", []string{"token", "tls", "off"})
 
 	authenticationSchemes := map[string]server.AuthenticationScheme{
 		"token": server.AuthenticationToken,
+		"tls":   server.AuthenticationTLS,
 		"off":   server.AuthenticationOff,
 	}
 
@@ -44,16 +46,14 @@ func init() {
 		"off":   server.AuthorizationOff,
 	}
 
-	var serverDiagnosticsBufferSize int
-
 	logLevel := util.NewEnumFlag("info", []string{"debug", "info", "error"})
-	logFormat := util.NewEnumFlag("text", []string{"text", "json"})
+	logFormat := util.NewEnumFlag("json", []string{"text", "json", "json-pretty"})
 
 	params := runtime.NewParams()
 
 	runCommand := &cobra.Command{
 		Use:   "run",
-		Short: "Start OPA in interative or server mode",
+		Short: "Start OPA in interactive or server mode",
 		Long: `Start an instance of the Open Policy Agent (OPA).
 
 To run the interactive shell:
@@ -95,6 +95,15 @@ the data document with the following syntax:
 				os.Exit(1)
 			}
 
+			if tlsCACertFile != "" {
+				pool, err := loadCertPool(tlsCACertFile)
+				if err != nil {
+					fmt.Println("error:", err)
+					os.Exit(1)
+				}
+				params.CertPool = pool
+			}
+
 			params.Authentication = authenticationSchemes[authentication.String()]
 			params.Authorization = authorizationScheme[authorization.String()]
 			params.Certificate = cert
@@ -102,7 +111,6 @@ the data document with the following syntax:
 				Level:  logLevel.String(),
 				Format: logFormat.String(),
 			}
-			params.DiagnosticsBuffer = server.NewBoundedBuffer(serverDiagnosticsBufferSize)
 			params.Paths = args
 			params.Filter = loaderFilter{
 				Ignore: ignore,
@@ -129,16 +137,21 @@ the data document with the following syntax:
 	runCommand.Flags().StringVarP(&params.HistoryPath, "history", "H", historyPath(), "set path of history file")
 	params.Addrs = runCommand.Flags().StringSliceP("addr", "a", []string{defaultAddr}, "set listening address of the server (e.g., [ip]:<port> for TCP, unix://<path> for UNIX domain socket)")
 	runCommand.Flags().StringVarP(&params.InsecureAddr, "insecure-addr", "", "", "set insecure listening address of the server")
+	runCommand.Flags().MarkDeprecated("insecure-addr", "use --addr instead")
 	runCommand.Flags().StringVarP(&params.OutputFormat, "format", "f", "pretty", "set shell output format, i.e, pretty, json")
 	runCommand.Flags().BoolVarP(&params.Watch, "watch", "w", false, "watch command line files for changes")
 	setMaxErrors(runCommand.Flags(), &params.ErrorLimit)
-	runCommand.Flags().IntVarP(&serverDiagnosticsBufferSize, "server-diagnostics-buffer-size", "", defaultServerDiagnosticsBufferSize, "set the size of the server's diagnostics buffer")
+	runCommand.Flags().BoolVarP(&params.PprofEnabled, "pprof", "", false, "enables pprof endpoints")
 	runCommand.Flags().StringVarP(&tlsCertFile, "tls-cert-file", "", "", "set path of TLS certificate file")
 	runCommand.Flags().StringVarP(&tlsPrivateKeyFile, "tls-private-key-file", "", "", "set path of TLS private key file")
+	runCommand.Flags().StringVarP(&tlsCACertFile, "tls-ca-cert-file", "", "", "set path of TLS CA cert file")
 	runCommand.Flags().VarP(authentication, "authentication", "", "set authentication scheme")
 	runCommand.Flags().VarP(authorization, "authorization", "", "set authorization scheme")
 	runCommand.Flags().VarP(logLevel, "log-level", "l", "set log level")
 	runCommand.Flags().VarP(logFormat, "log-format", "", "set log format")
+	runCommand.Flags().IntVar(&params.GracefulShutdownPeriod, "shutdown-grace-period", 10, "set the time (in seconds) that the server will wait to gracefully shut down")
+	runCommand.Flags().StringArrayVar(&params.ConfigOverrides, "set", []string{}, "override config values on the command line (use commas to specify multiple values)")
+	runCommand.Flags().StringArrayVar(&params.ConfigOverrideFiles, "set-file", []string{}, "override config values with files on the command line (use commas to specify multiple values)")
 	setIgnore(runCommand.Flags(), &ignore)
 
 	usageTemplate := `Usage:
@@ -174,4 +187,16 @@ func loadCertificate(tlsCertFile, tlsPrivateKeyFile string) (*tls.Certificate, e
 	}
 
 	return nil, nil
+}
+
+func loadCertPool(tlsCACertFile string) (*x509.CertPool, error) {
+	caCertPEM, err := ioutil.ReadFile(tlsCACertFile)
+	if err != nil {
+		return nil, fmt.Errorf("read CA cert file: %v", err)
+	}
+	pool := x509.NewCertPool()
+	if ok := pool.AppendCertsFromPEM(caCertPEM); !ok {
+		return nil, fmt.Errorf("failed to parse CA cert %q", tlsCACertFile)
+	}
+	return pool, nil
 }

@@ -9,52 +9,45 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
-	"encoding/json"
+	"crypto/x509"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
-	fsnotify "gopkg.in/fsnotify.v1"
-
 	"github.com/open-policy-agent/opa/ast"
+	"github.com/open-policy-agent/opa/internal/runtime"
+	storedversion "github.com/open-policy-agent/opa/internal/version"
 	"github.com/open-policy-agent/opa/loader"
 	"github.com/open-policy-agent/opa/plugins"
-	"github.com/open-policy-agent/opa/plugins/bundle"
+	"github.com/open-policy-agent/opa/plugins/discovery"
 	"github.com/open-policy-agent/opa/plugins/logs"
-	"github.com/open-policy-agent/opa/plugins/status"
 	"github.com/open-policy-agent/opa/repl"
 	"github.com/open-policy-agent/opa/server"
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/storage/inmem"
-	"github.com/open-policy-agent/opa/util"
 	"github.com/open-policy-agent/opa/version"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	fsnotify "gopkg.in/fsnotify.v1"
 )
 
 var (
-	registeredPlugins    []pluginFactory
+	registeredPlugins    map[string]plugins.Factory
 	registeredPluginsMux sync.Mutex
 )
 
-// RegisterPlugin registers a plugin with the runtime package. When a Runtime
-// is created, the factory functions will be called.
-func RegisterPlugin(name string, factory func(m *plugins.Manager, config []byte) (plugins.Plugin, error)) {
+// RegisterPlugin registers a plugin factory with the runtime
+// package. When the runtime is created, the factories are used to parse
+// plugin configuration and instantiate plugins. If no configuration is
+// provided, plugins are not instantiated. This function is idempotent.
+func RegisterPlugin(name string, factory plugins.Factory) {
 	registeredPluginsMux.Lock()
 	defer registeredPluginsMux.Unlock()
-
-	registeredPlugins = append(registeredPlugins, pluginFactory{
-		name:    name,
-		factory: factory,
-	})
-}
-
-type pluginFactory struct {
-	name    string
-	factory func(m *plugins.Manager, config []byte) (plugins.Plugin, error)
+	registeredPlugins[name] = factory
 }
 
 // Params stores the configuration for an OPA instance.
@@ -80,6 +73,9 @@ type Params struct {
 	// Certificate is the certificate to use in server-mode. If the certificate
 	// is nil, the server will NOT use TLS.
 	Certificate *tls.Certificate
+
+	// CertPool holds the CA certs trusted by the OPA server.
+	CertPool *x509.CertPool
 
 	// HistoryPath is the filename to store the interactive shell user
 	// input history.
@@ -107,11 +103,15 @@ type Params struct {
 	// exiting early.
 	ErrorLimit int
 
+	// PprofEnabled flag controls whether pprof endpoints are enabled
+	PprofEnabled bool
+
 	// DecisionIDFactory generates decision IDs to include in API responses
 	// sent by the server (in response to Data API queries.)
 	DecisionIDFactory func() string
 
 	// DiagnosticsBuffer is used by the server to record policy decisions.
+	// DEPRECATED. Use decision logging instead.
 	DiagnosticsBuffer server.Buffer
 
 	// Logging configures the logging behaviour.
@@ -120,9 +120,22 @@ type Params struct {
 	// ConfigFile refers to the OPA configuration to load on startup.
 	ConfigFile string
 
+	// ConfigOverrides are overrides for the OPA configuration that are applied
+	// over top the config file They are in a list of key=value syntax that
+	// conform to the syntax defined in the `strval` package
+	ConfigOverrides []string
+
+	// ConfigOverrideFiles Similar to `ConfigOverrides` execept they are in the
+	// form of `key=path/to/file`where the file contains the value to be used.
+	ConfigOverrideFiles []string
+
 	// Output is the output stream used when run as an interactive shell. This
 	// is mostly for test purposes.
 	Output io.Writer
+
+	// GracefulShutdownPeriod is the time (in seconds) to wait for the http
+	// server to shutdown gracefully.
+	GracefulShutdownPeriod int
 }
 
 // LoggingConfig stores the configuration for OPA's logging behaviour.
@@ -144,7 +157,11 @@ type Runtime struct {
 	Store   storage.Store
 	Manager *plugins.Manager
 
-	decisionLogger func(context.Context, *server.Info)
+	// TODO(tsandall): remove this field since it's available on the manager
+	// and doesn't have to duplicated here or on the server.
+	info *ast.Term // runtime information provided to evaluation engine
+
+	server *server.Server
 }
 
 // NewRuntime returns a new Runtime object initialized with params.
@@ -175,6 +192,11 @@ func NewRuntime(ctx context.Context, params Params) (*Runtime, error) {
 		return nil, errors.Wrapf(err, "storage error")
 	}
 
+	if err := storedversion.Write(ctx, store, txn); err != nil {
+		store.Abort(ctx, txn)
+		return nil, errors.Wrapf(err, "storage error")
+	}
+
 	if err := compileAndStoreInputs(ctx, store, txn, loaded.Modules, params.ErrorLimit); err != nil {
 		store.Abort(ctx, txn)
 		return nil, errors.Wrapf(err, "compile error")
@@ -184,74 +206,100 @@ func NewRuntime(ctx context.Context, params Params) (*Runtime, error) {
 		return nil, errors.Wrapf(err, "storage error")
 	}
 
-	m, plugins, err := initPlugins(params.ID, store, params.ConfigFile)
+	bs, err := loadConfig(params)
+	if err != nil {
+		return nil, errors.Wrapf(err, "config error")
+	}
+
+	info, err := runtime.Term(runtime.Params{Config: bs})
 	if err != nil {
 		return nil, err
 	}
 
-	var decisionLogger func(context.Context, *server.Info)
-
-	if p, ok := plugins["decision_logs"]; ok {
-		decisionLogger = p.(*logs.Plugin).Log
-
-		if params.DecisionIDFactory == nil {
-			params.DecisionIDFactory = generateDecisionID
-		}
+	manager, err := plugins.New(bs, params.ID, store, plugins.Info(info))
+	if err != nil {
+		return nil, errors.Wrapf(err, "config error")
 	}
 
+	disco, err := discovery.New(manager, discovery.Factories(registeredPlugins))
+	if err != nil {
+		return nil, errors.Wrapf(err, "config error")
+	}
+
+	manager.Register("discovery", disco)
+
 	rt := &Runtime{
-		Store:          store,
-		Manager:        m,
-		Params:         params,
-		decisionLogger: decisionLogger,
+		Store:   store,
+		Params:  params,
+		Manager: manager,
+		info:    info,
 	}
 
 	return rt, nil
 }
 
-// StartServer starts the runtime in server mode. This function will block the calling goroutine.
+// StartServer starts the runtime in server mode. This function will block the
+// calling goroutine and will exit the program on error.
 func (rt *Runtime) StartServer(ctx context.Context) {
+	err := rt.Serve(ctx)
+	if err != nil {
+		os.Exit(1)
+	}
+}
 
+// Serve will start a new REST API server and listen for requests. This
+// will block until either: an error occurs, the context is canceled, or
+// a SIGTERM or SIGKILL signal is sent.
+func (rt *Runtime) Serve(ctx context.Context) error {
 	setupLogging(rt.Params.Logging)
 
 	logrus.WithFields(logrus.Fields{
 		"addrs":         *rt.Params.Addrs,
 		"insecure_addr": rt.Params.InsecureAddr,
-	}).Infof("First line of log stream.")
+	}).Info("Initializing server.")
 
 	if err := rt.Manager.Start(ctx); err != nil {
-		logrus.WithField("err", err).Fatalf("Unable to initialize plugins.")
+		logrus.WithField("err", err).Error("Failed to start plugins.")
+		return err
 	}
 
-	s, err := server.New().
+	defer rt.Manager.Stop(ctx)
+
+	var err error
+	rt.server, err = server.New().
 		WithStore(rt.Store).
 		WithManager(rt.Manager).
 		WithCompilerErrorLimit(rt.Params.ErrorLimit).
+		WithPprofEnabled(rt.Params.PprofEnabled).
 		WithAddresses(*rt.Params.Addrs).
 		WithInsecureAddress(rt.Params.InsecureAddr).
 		WithCertificate(rt.Params.Certificate).
+		WithCertPool(rt.Params.CertPool).
 		WithAuthentication(rt.Params.Authentication).
 		WithAuthorization(rt.Params.Authorization).
-		WithDiagnosticsBuffer(rt.Params.DiagnosticsBuffer).
-		WithDecisionIDFactory(rt.Params.DecisionIDFactory).
-		WithDecisionLogger(rt.decisionLogger).
+		WithDecisionIDFactory(rt.decisionIDFactory).
+		WithDecisionLoggerWithErr(rt.decisionLogger).
+		WithRuntime(rt.info).
 		Init(ctx)
 
 	if err != nil {
-		logrus.WithField("err", err).Fatalf("Unable to initialize server.")
+		logrus.WithField("err", err).Error("Unable to initialize server.")
+		return err
 	}
 
 	if rt.Params.Watch {
 		if err := rt.startWatcher(ctx, rt.Params.Paths, onReloadLogger); err != nil {
-			logrus.WithField("err", err).Fatalf("Unable to open watch.")
+			logrus.WithField("err", err).Error("Unable to open watch.")
+			return err
 		}
 	}
 
-	s.Handler = NewLoggingHandler(s.Handler)
+	rt.server.Handler = NewLoggingHandler(rt.server.Handler)
 
-	loops, err := s.Listeners()
+	loops, err := rt.server.Listeners()
 	if err != nil {
-		logrus.WithField("err", err).Fatalf("Unable to create listeners.")
+		logrus.WithField("err", err).Error("Unable to create listeners.")
+		return err
 	}
 
 	errc := make(chan error)
@@ -260,12 +308,30 @@ func (rt *Runtime) StartServer(ctx context.Context) {
 			errc <- serverLoop()
 		}(loop)
 	}
+
+	signalc := make(chan os.Signal)
+	signal.Notify(signalc, syscall.SIGINT, syscall.SIGTERM)
+
 	for {
 		select {
+		case <-ctx.Done():
+			return rt.gracefulServerShutdown(rt.server)
+		case <-signalc:
+			return rt.gracefulServerShutdown(rt.server)
 		case err := <-errc:
 			logrus.WithField("err", err).Fatal("Listener failed.")
 		}
 	}
+}
+
+// Addrs returns a list of addresses that the runtime is listening on (when
+// in server mode). Returns an empty list if it hasn't started listening.
+func (rt *Runtime) Addrs() []string {
+	if rt.server == nil {
+		return nil
+	}
+
+	return rt.server.Addrs()
 }
 
 // StartREPL starts the runtime in REPL mode. This function will block the calling goroutine.
@@ -276,8 +342,10 @@ func (rt *Runtime) StartREPL(ctx context.Context) {
 		os.Exit(1)
 	}
 
+	defer rt.Manager.Stop(ctx)
+
 	banner := rt.getBanner()
-	repl := repl.New(rt.Store, rt.Params.HistoryPath, rt.Params.Output, rt.Params.OutputFormat, rt.Params.ErrorLimit, banner)
+	repl := repl.New(rt.Store, rt.Params.HistoryPath, rt.Params.Output, rt.Params.OutputFormat, rt.Params.ErrorLimit, banner).WithRuntime(rt.info)
 
 	if rt.Params.Watch {
 		if err := rt.startWatcher(ctx, rt.Params.Paths, onReloadPrinter(rt.Params.Output)); err != nil {
@@ -287,6 +355,30 @@ func (rt *Runtime) StartREPL(ctx context.Context) {
 	}
 
 	repl.Loop(ctx)
+}
+
+func (rt *Runtime) decisionIDFactory() string {
+	if rt.Params.DecisionIDFactory != nil {
+		return rt.Params.DecisionIDFactory()
+	}
+	if logs.Lookup(rt.Manager) != nil {
+		return generateDecisionID()
+	}
+	return ""
+}
+
+func (rt *Runtime) decisionLogger(ctx context.Context, event *server.Info) error {
+
+	if rt.Params.DiagnosticsBuffer != nil {
+		rt.Params.DiagnosticsBuffer.Push(event)
+	}
+
+	plugin := logs.Lookup(rt.Manager)
+	if plugin == nil {
+		return nil
+	}
+
+	return plugin.Log(ctx, event)
 }
 
 func (rt *Runtime) startWatcher(ctx context.Context, paths []string, onReload func(time.Duration, error)) error {
@@ -374,6 +466,19 @@ func (rt *Runtime) getBanner() string {
 	return buf.String()
 }
 
+func (rt *Runtime) gracefulServerShutdown(s *server.Server) error {
+	logrus.Info("Shutting down...")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(rt.Params.GracefulShutdownPeriod)*time.Second)
+	defer cancel()
+	err := s.Shutdown(ctx)
+	if err != nil {
+		logrus.WithField("err", err).Error("Failed to shutdown server gracefully.")
+		return err
+	}
+	logrus.Info("Server shutdown.")
+	return nil
+}
+
 func compileAndStoreInputs(ctx context.Context, store storage.Store, txn storage.Transaction, modules map[string]*loader.RegoFile, errorLimit int) error {
 
 	policies := make(map[string]*ast.Module, len(modules))
@@ -382,7 +487,7 @@ func compileAndStoreInputs(ctx context.Context, store storage.Store, txn storage
 		policies[id] = parsed.Parsed
 	}
 
-	c := ast.NewCompiler().SetErrorLimit(errorLimit)
+	c := ast.NewCompiler().SetErrorLimit(errorLimit).WithPathConflictsCheck(storage.NonEmpty(ctx, store, txn))
 
 	if c.Compile(policies); c.Failed() {
 		return c.Errors
@@ -454,12 +559,14 @@ func onReloadPrinter(output io.Writer) func(time.Duration, error) {
 
 func setupLogging(config LoggingConfig) {
 	switch config.Format {
+	case "text":
+		logrus.SetFormatter(&prettyFormatter{})
+	case "json-pretty":
+		logrus.SetFormatter(&logrus.JSONFormatter{PrettyPrint: true})
 	case "json":
-		logrus.SetFormatter(&logrus.JSONFormatter{})
+		fallthrough
 	default:
-		logrus.SetFormatter(&logrus.TextFormatter{
-			FullTimestamp: true,
-		})
+		logrus.SetFormatter(&logrus.JSONFormatter{})
 	}
 
 	lvl := logrus.InfoLevel
@@ -473,162 +580,6 @@ func setupLogging(config LoggingConfig) {
 	}
 
 	logrus.SetLevel(lvl)
-}
-
-// TODO(tsandall): revisit how plugins are wired up to the manager and how
-// everything is started and stopped. We could introduce a package-scoped
-// plugin registry that allows for (dynamic) init-time plugin registration.
-
-func initPlugins(id string, store storage.Store, configFile string) (*plugins.Manager, map[string]plugins.Plugin, error) {
-
-	var bs []byte
-	var err error
-
-	if configFile != "" {
-		bs, err = ioutil.ReadFile(configFile)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-
-	m, err := plugins.New(bs, id, store)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	plugins := map[string]plugins.Plugin{}
-
-	bundlePlugin, err := initBundlePlugin(m, bs)
-	if err != nil {
-		return nil, nil, err
-	} else if bundlePlugin != nil {
-		plugins["bundle"] = bundlePlugin
-	}
-
-	if bundlePlugin != nil {
-		statusPlugin, err := initStatusPlugin(m, bs, bundlePlugin)
-		if err != nil {
-			return nil, nil, err
-		} else if statusPlugin != nil {
-			plugins["status"] = statusPlugin
-		}
-	}
-
-	decisionLogsPlugin, err := initDecisionLogsPlugin(m, bs)
-	if err != nil {
-		return nil, nil, err
-	} else if decisionLogsPlugin != nil {
-		plugins["decision_logs"] = decisionLogsPlugin
-	}
-
-	err = initRegisteredPlugins(m, bs)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return m, plugins, nil
-}
-
-func initBundlePlugin(m *plugins.Manager, bs []byte) (*bundle.Plugin, error) {
-
-	var config struct {
-		Bundle json.RawMessage `json:"bundle"`
-	}
-
-	if err := util.Unmarshal(bs, &config); err != nil {
-		return nil, err
-	}
-
-	if config.Bundle == nil {
-		return nil, nil
-	}
-
-	p, err := bundle.New(config.Bundle, m)
-	if err != nil {
-		return nil, err
-	}
-
-	m.Register(p)
-
-	return p, nil
-}
-
-func initDecisionLogsPlugin(m *plugins.Manager, bs []byte) (*logs.Plugin, error) {
-
-	var config struct {
-		DecisionLogs json.RawMessage `json:"decision_logs"`
-	}
-
-	if err := util.Unmarshal(bs, &config); err != nil {
-		return nil, err
-	}
-
-	if config.DecisionLogs == nil {
-		return nil, nil
-	}
-
-	p, err := logs.New(config.DecisionLogs, m)
-	if err != nil {
-		return nil, err
-	}
-
-	m.Register(p)
-
-	return p, nil
-}
-
-func initRegisteredPlugins(m *plugins.Manager, bs []byte) error {
-
-	var config struct {
-		Plugins map[string]json.RawMessage `json:"plugins"`
-	}
-
-	if err := util.Unmarshal(bs, &config); err != nil {
-		return err
-	}
-
-	for _, reg := range registeredPlugins {
-		pc, ok := config.Plugins[reg.name]
-		if !ok {
-			continue
-		}
-		plugin, err := reg.factory(m, pc)
-		if err != nil {
-			return err
-		}
-		m.Register(plugin)
-	}
-
-	return nil
-
-}
-
-func initStatusPlugin(m *plugins.Manager, bs []byte, bundlePlugin *bundle.Plugin) (*status.Plugin, error) {
-
-	var config struct {
-		Status json.RawMessage `json:"status"`
-	}
-
-	if err := util.Unmarshal(bs, &config); err != nil {
-		return nil, err
-	}
-
-	if config.Status == nil {
-		return nil, nil
-	}
-
-	p, err := status.New(config.Status, m)
-	if err != nil {
-		return nil, err
-	}
-
-	m.Register(p)
-
-	bundlePlugin.Register(bundlePluginListener("status-plugin"), func(s bundle.Status) {
-		p.Update(s)
-	})
-
-	return p, nil
 }
 
 func generateInstanceID() (string, error) {
@@ -654,4 +605,6 @@ func uuid4() (string, error) {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", bs[0:4], bs[4:6], bs[6:8], bs[8:10], bs[10:]), nil
 }
 
-type bundlePluginListener string
+func init() {
+	registeredPlugins = make(map[string]plugins.Factory)
+}

@@ -299,6 +299,28 @@ func makeLiteralExpr(loc *Location, lhs, rest interface{}) (interface{}, error) 
 	return expr, nil
 }
 
+func makeSomeDeclLiteral(loc *Location, sl interface{}) (interface{}, error) {
+	symbols := sl.([]*Term)
+	return NewExpr(&SomeDecl{Location: loc, Symbols: symbols}).SetLocation(loc), nil
+}
+
+func makeSomeDeclSymbols(head interface{}, rest interface{}) (interface{}, error) {
+
+	var symbols []*Term
+
+	symbols = append(symbols, head.(*Term))
+
+	if sl1, ok := rest.([]interface{}); ok {
+		for i := range sl1 {
+			if sl2, ok := sl1[i].([]interface{}); ok {
+				symbols = append(symbols, sl2[3].(*Term))
+			}
+		}
+	}
+
+	return symbols, nil
+}
+
 func makeWithKeywordList(head, tail interface{}) (interface{}, error) {
 	var withs []*With
 
@@ -509,6 +531,19 @@ func makeNumber(loc *Location, text interface{}) (interface{}, error) {
 		// possible.
 		panic("illegal value")
 	}
+
+	// Put limit on size of exponent to prevent non-linear cost of String()
+	// function on big.Float from causing denial of service: https://github.com/golang/go/issues/11068
+	//
+	// n == sign * mantissa * 2^exp
+	// 0.5 <= mantissa < 1.0
+	//
+	// The limit is arbitrary.
+	exp := f.MantExp(nil)
+	if exp > 1e5 || exp < -1e5 {
+		return nil, fmt.Errorf("number too big")
+	}
+
 	return NumberTerm(json.Number(f.String())).SetLocation(loc), nil
 }
 
@@ -551,9 +586,12 @@ func makeComments(c *current, text interface{}) (interface{}, error) {
 
 	comment := NewComment(buf.Bytes())
 	comment.Location = currentLocation(c)
-	comments := c.globalStore[commentsKey].([]*Comment)
-	comments = append(comments, comment)
-	c.globalStore[commentsKey] = comments
-
+	comments := c.globalStore[commentsKey].(map[commentKey]*Comment)
+	key := commentKey{
+		File: comment.Location.File,
+		Row:  comment.Location.Row,
+		Col:  comment.Location.Col,
+	}
+	comments[key] = comment
 	return comment, nil
 }

@@ -12,6 +12,7 @@ package ast
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"unicode"
 
@@ -456,7 +457,30 @@ func ParseStatement(input string) (Statement, error) {
 // CommentsOption returns a parser option to initialize the comments store within
 // the parser.
 func CommentsOption() Option {
-	return GlobalStore(commentsKey, []*Comment{})
+	return GlobalStore(commentsKey, map[commentKey]*Comment{})
+}
+
+type commentKey struct {
+	File string
+	Row  int
+	Col  int
+}
+
+func (a commentKey) Compare(other commentKey) int {
+	if a.File < other.File {
+		return -1
+	} else if a.File > other.File {
+		return 1
+	} else if a.Row < other.Row {
+		return -1
+	} else if a.Row > other.Row {
+		return 1
+	} else if a.Col < other.Col {
+		return -1
+	} else if a.Col > other.Col {
+		return 1
+	}
+	return 0
 }
 
 // ParseStatements returns a slice of parsed statements.
@@ -474,7 +498,17 @@ func ParseStatements(filename, input string) ([]Statement, []*Comment, error) {
 	var sl []interface{}
 	if p, ok := parsed.(program); ok {
 		sl = p.buf
-		comments = p.comments.([]*Comment)
+		commentMap := p.comments.(map[commentKey]*Comment)
+		commentKeys := []commentKey{}
+		for k := range commentMap {
+			commentKeys = append(commentKeys, k)
+		}
+		sort.Slice(commentKeys, func(i, j int) bool {
+			return commentKeys[i].Compare(commentKeys[j]) < 0
+		})
+		for _, k := range commentKeys {
+			comments = append(comments, commentMap[k])
+		}
 	} else {
 		sl = parsed.([]interface{})
 	}
@@ -702,18 +736,58 @@ type parserErrorDetail struct {
 }
 
 func newParserErrorDetail(bs []byte, pos position) *parserErrorDetail {
-	lines := strings.Split(string(bs), "\n")
-	line := lines[pos.line-1]
-	idx := pos.col - 1
-	for (idx >= len(line) || unicode.IsSpace(rune(line[idx]))) && idx > 0 {
-		idx--
+
+	offset := pos.offset
+
+	// Find first non-space character at or before offset position.
+	if offset >= len(bs) {
+		offset = len(bs) - 1
+	} else if offset < 0 {
+		offset = 0
 	}
+
+	for offset > 0 && unicode.IsSpace(rune(bs[offset])) {
+		offset--
+	}
+
+	// Find beginning of line containing offset.
+	begin := offset
+
+	for begin > 0 && !isNewLineChar(bs[begin]) {
+		begin--
+	}
+
+	if isNewLineChar(bs[begin]) {
+		begin++
+	}
+
+	// Find end of line containing offset.
+	end := offset
+
+	for end < len(bs) && !isNewLineChar(bs[end]) {
+		end++
+	}
+
+	if begin > end {
+		begin = end
+	}
+
+	// Extract line and compute index of offset byte in line.
+	line := bs[begin:end]
+	index := offset - begin
+
 	return &parserErrorDetail{
-		line: lines[pos.line-1],
-		idx:  idx,
+		line: string(line),
+		idx:  index,
 	}
 }
 
 func (d parserErrorDetail) Lines() []string {
-	return []string{d.line, strings.Repeat(" ", d.idx) + "^"}
+	line := strings.TrimLeft(d.line, "\t") // remove leading tabs
+	tabCount := len(d.line) - len(line)
+	return []string{line, strings.Repeat(" ", d.idx-tabCount) + "^"}
+}
+
+func isNewLineChar(b byte) bool {
+	return b == '\r' || b == '\n'
 }

@@ -2,12 +2,15 @@
 # Use of this source code is governed by an Apache2
 # license that can be found in the LICENSE file.
 
-VERSION := 0.9.1
+VERSION := 0.13.5
 
 GO := go
-GOVERSION := 1.10
+GOVERSION := 1.12.8
 GOARCH := $(shell go env GOARCH)
 GOOS := $(shell go env GOOS)
+
+DOCKER_INSTALLED := $(shell hash docker 2>/dev/null && echo 1 || echo 0)
+DOCKER := docker
 
 BIN := opa_$(GOOS)_$(GOARCH)
 
@@ -18,7 +21,7 @@ BUILD_COMMIT := $(shell ./build/get-build-commit.sh)
 BUILD_TIMESTAMP := $(shell ./build/get-build-timestamp.sh)
 BUILD_HOSTNAME := $(shell ./build/get-build-hostname.sh)
 
-RELEASE_BUILDER_VERSION := 1.0
+RELEASE_BUILD_IMAGE := golang:$(GOVERSION)
 
 LDFLAGS := "-X github.com/open-policy-agent/opa/version.Version=$(VERSION) \
 	-X github.com/open-policy-agent/opa/version.Vcs=$(BUILD_COMMIT) \
@@ -45,12 +48,24 @@ version:
 deps:
 	@./build/install-deps.sh
 
+.PHONY: wasm-build
+wasm-build:
+ifeq ($(DOCKER_INSTALLED), 1)
+	@$(MAKE) -C wasm build
+	cp wasm/_obj/opa.wasm internal/compiler/wasm/opa/opa.wasm
+else
+	@echo "Docker not installed. Skipping OPA-WASM library build."
+endif
+
 .PHONY: generate
-generate:
+generate: wasm-build
 	$(GO) generate
 
 .PHONY: build
-build: generate
+build: go-build
+
+.PHONY: go-build
+go-build: generate
 	$(GO) build -o $(BIN) -ldflags $(LDFLAGS)
 
 .PHONY: image
@@ -62,31 +77,87 @@ image:
 image-quick:
 	sed -e 's/GOARCH/$(GOARCH)/g' Dockerfile.in > .Dockerfile_$(GOARCH)
 	sed -e 's/GOARCH/$(GOARCH)/g' Dockerfile_debug.in > .Dockerfile_debug_$(GOARCH)
+	sed -e 's/GOARCH/$(GOARCH)/g' Dockerfile_rootless.in > .Dockerfile_rootless_$(GOARCH)
 	docker build -t $(IMAGE):$(VERSION)	-f .Dockerfile_$(GOARCH) .
 	docker build -t $(IMAGE):$(VERSION)-debug -f .Dockerfile_debug_$(GOARCH) .
+	docker build -t $(IMAGE):$(VERSION)-rootless -f .Dockerfile_rootless_$(GOARCH) .
 
 .PHONY: push
 push:
 	docker push $(IMAGE):$(VERSION)
 	docker push $(IMAGE):$(VERSION)-debug
+	docker push $(IMAGE):$(VERSION)-rootless
 
 .PHONY: tag-latest
 tag-latest:
 	docker tag $(IMAGE):$(VERSION) $(IMAGE):latest
 	docker tag $(IMAGE):$(VERSION)-debug $(IMAGE):latest-debug
+	docker tag $(IMAGE):$(VERSION)-rootless $(IMAGE):latest-rootless
 
 .PHONY: push-latest
 push-latest:
 	docker push $(IMAGE):latest
 	docker push $(IMAGE):latest-debug
+	docker push $(IMAGE):latest-rootless
+
+.PHONY: push-binary-edge
+push-binary-edge:
+	aws s3 cp opa_linux_amd64 s3://opa-releases/edge/opa_linux_amd64
+
+.PHONY: tag-edge
+tag-edge:
+	docker tag $(IMAGE):$(VERSION) $(IMAGE):edge
+	docker tag $(IMAGE):$(VERSION)-debug $(IMAGE):edge-debug
+	docker tag $(IMAGE):$(VERSION)-rootless $(IMAGE):edge-rootless
+
+.PHONY: push-edge
+push-edge:
+	docker push $(IMAGE):edge
+	docker push $(IMAGE):edge-debug
+	docker push $(IMAGE):edge-rootless
+
+.PHONY: docker-login
+docker-login:
+	@docker login -u ${DOCKER_USER} -p ${DOCKER_PASSWORD}
+
+.PHONY: push-image
+push-image: docker-login image-quick push
+
+.PHONY: deploy-travis
+deploy-travis: push-image tag-edge push-edge push-binary-edge
+
+.PHONY: release-travis
+release-travis: push-image tag-latest push-latest
+
+.PHONY: release-bugfix-travis
+release-bugfix-travis: deploy-travis
 
 .PHONY: install
 install: generate
 	$(GO) install -ldflags $(LDFLAGS)
 
 .PHONY: test
-test: generate
+test: opa-wasm-test go-test wasm-test
+
+.PHONY: opa-wasm-test
+opa-wasm-test:
+ifeq ($(DOCKER_INSTALLED), 1)
+	@$(MAKE)  -C wasm test
+else
+	@echo "Docker not installed. Skipping OPA-WASM library test."
+endif
+
+.PHONY: go-test
+go-test: generate
 	$(GO) test ./...
+
+.PHONY: wasm-test
+wasm-test: generate
+ifeq ($(DOCKER_INSTALLED), 1)
+	@./build/run-wasm-tests.sh
+else
+	@echo "Docker not installed. Skipping WASM-based test execution."
+endif
 
 .PHONY: perf
 perf: generate
@@ -111,20 +182,21 @@ check-lint:
 fmt:
 	$(GO) fmt ./...
 
+.PHONY: wasm-clean
+wasm-clean:
+	@$(MAKE) -C wasm clean
+
 .PHONY: clean
-clean:
+clean: wasm-clean
 	rm -f .Dockerfile_*
 	rm -f opa_*_*
-	rm -fr site.tar.gz docs/_site docs/node_modules docs/book/_book docs/book/node_modules
+	rm -fr _test
 
-.PHONY: docs
-docs:
-	docker run -it --rm \
-		-v $(PWD):/go/src/github.com/open-policy-agent/opa \
-		-w /go/src/github.com/open-policy-agent/opa \
-		-p 4000:4000 \
-		$(REPOSITORY)/release-builder:$(RELEASE_BUILDER_VERSION) \
-		./build/build-docs.sh --output-dir=/go/src/github.com/open-policy-agent/opa --serve=4000
+# The docs-% pattern target will shim to the
+# makefile in ./docs
+.PHONY: docs-%
+docs-%:
+	$(MAKE) -C docs $*
 
 ######################################################
 #
@@ -132,22 +204,12 @@ docs:
 #
 ######################################################
 
-.PHONY: release-builder
-release-builder:
-	sed -e s/GOVERSION/$(GOVERSION)/g Dockerfile_release-builder.in > .Dockerfile_release-builder
-	docker build -f .Dockerfile_release-builder -t $(REPOSITORY)/release-builder:$(RELEASE_BUILDER_VERSION) -t $(REPOSITORY)/release-builder:latest .
-
-.PHONY: push-release-builder
-push-release-builder:
-	docker push $(REPOSITORY)/release-builder:latest
-	docker push $(REPOSITORY)/release-builder:$(RELEASE_BUILDER_VERSION)
-
 .PHONY: release
 release:
 	docker run -it --rm \
 		-v $(PWD)/_release/$(VERSION):/_release/$(VERSION) \
 		-v $(PWD):/_src \
-		$(REPOSITORY)/release-builder:$(RELEASE_BUILDER_VERSION) \
+		$(RELEASE_BUILD_IMAGE) \
 		/_src/build/build-release.sh --version=$(VERSION) --output-dir=/_release/$(VERSION) --source-url=/_src
 
 .PHONY: release-local
@@ -155,12 +217,13 @@ release-local:
 	docker run -it --rm \
 		-v $(PWD)/_release/$(VERSION):/_release/$(VERSION) \
 		-v $(PWD):/_src \
-		$(REPOSITORY)/release-builder:$(RELEASE_BUILDER_VERSION) \
+		$(RELEASE_BUILD_IMAGE) \
 		/_src/build/build-release.sh --output-dir=/_release/$(VERSION) --source-url=/_src
 
 .PHONY: release-patch
 release-patch:
 	@docker run -it --rm \
+		-e LAST_VERSION=$(LAST_VERSION) \
 		-v $(PWD):/_src \
 		python:2.7 \
 		/_src/build/gen-release-patch.sh --version=$(VERSION) --source-url=/_src

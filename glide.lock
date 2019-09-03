@@ -1,14 +1,12 @@
-hash: a3e20fb1f9177b74c95e4665a7d5881594f956149fb149e4ab5fe2b5a75a7d73
-updated: 2018-09-04T15:06:13.378934-07:00
+hash: ce907ddfb0db0bcf7984898645b3e58de02ec36760df59cb3e2ee31c0ae4a709
+updated: 2019-09-03T00:17:28.363607587-04:00
 imports:
 - name: github.com/coreos/go-systemd
-  version: eee3db372b31153ca0b90702e165948699803fd0
+  version: fd7a80b32e1fc73e890fde45604ed5009dc817a3
   subpackages:
   - activation
-- name: github.com/dchest/siphash
-  version: 34f201214d993633bb24f418ba11736ab8b55aa7
 - name: github.com/docker/go-connections
-  version: 97c2040d34dfae1d1b1275fa3a78dbdd2f41cf7e
+  version: fd1b1942c4d55f7f210a8387e612dc6ffee78ff6
   subpackages:
   - sockets
 - name: github.com/docker/go-plugins-helpers
@@ -19,14 +17,40 @@ imports:
 - name: github.com/fsnotify/fsnotify
   version: 4da3e2cfbabc9f751898f250b49f2439785783a1
 - name: github.com/ghodss/yaml
-  version: c7ce16629ff4cd059ed96ed06419dd3856fd3577
+  version: 25d852aebe32c875e9c044af3eef9c7dc6bc777f
+- name: github.com/gobwas/glob
+  version: 5ccd90ef52e1e632236f7326478d4faa74f99438
+  subpackages:
+  - compiler
+  - match
+  - syntax
+  - syntax/ast
+  - syntax/lexer
+  - util/runes
+  - util/strings
 - name: github.com/Microsoft/go-winio
-  version: 97e4973ce50b2ff5f09635a57e2b88a037aae829
+  version: 6c72808b55902eae4c5943626030429ff20f3b63
+  subpackages:
+  - pkg/guid
+- name: github.com/OneOfOne/xxhash
+  version: c1e3185f167680b62832a0a11938a04b1ab265fc
 - name: github.com/open-policy-agent/opa
-  version: d5ba22b70a13a5afce4d2ea7103f2ac2d300bc48
+  version: 054402f366885ddd90f9c6d89737ac039424b73b
   subpackages:
   - ast
   - bundle
+  - internal/compiler/wasm
+  - internal/compiler/wasm/opa
+  - internal/ir
+  - internal/leb128
+  - internal/planner
+  - internal/version
+  - internal/wasm/constant
+  - internal/wasm/encoding
+  - internal/wasm/instruction
+  - internal/wasm/module
+  - internal/wasm/opcode
+  - internal/wasm/types
   - loader
   - metrics
   - rego
@@ -35,23 +59,25 @@ imports:
   - topdown
   - topdown/builtins
   - topdown/copypropagation
+  - topdown/internal/jwx/buffer
+  - topdown/internal/jwx/jwa
+  - topdown/internal/jwx/jwk
+  - topdown/internal/jwx/jws
+  - topdown/internal/jwx/jws/sign
+  - topdown/internal/jwx/jws/verify
   - types
   - util
+  - version
 - name: github.com/pkg/errors
-  version: 816c9085562cd7ee03e7f8188a1cfd942858cded
+  version: 27936f6d90f9c8e1145f11ed52ffffbfdb9e0af7
 - name: github.com/rcrowley/go-metrics
-  version: e2704e165165ec55d062f5919b4b29494e9fa790
+  version: cac0b30c2563378d434b5af411844adff8e32960
 - name: github.com/yashtewari/glob-intersection
-  version: 7af743e8ec8480fee1932a737a406f7ec817f910
-- name: golang.org/x/net
-  version: a680a1efc54dd51c040b3b5ce4939ea3cf2ea0d1
-  subpackages:
-  - internal/socks
-  - proxy
+  version: 5c77d914dd0ba7bedca923f97232d37137e038f3
 - name: golang.org/x/sys
-  version: ac767d655b305d4e9612f5f6e33120b9176c4ad4
+  version: 9109b7679e13aa34a54834cfb4949cac4b96e576
   subpackages:
   - windows
 - name: gopkg.in/yaml.v2
-  version: 5420a8b6744d3b0345ab293f6fcba19c978f1183
+  version: 51d6538a90f86fe93ac480b35f37b2be17fef232
 testImports: []

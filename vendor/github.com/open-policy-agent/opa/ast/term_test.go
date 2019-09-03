@@ -178,6 +178,7 @@ func TestFind(t *testing.T) {
 		expected interface{}
 	}{
 		{RefTerm(StringTerm("foo"), IntNumberTerm(1), StringTerm("bar")), MustParseTerm(`{2, 3, 4}`)},
+		{RefTerm(StringTerm("foo"), IntNumberTerm(1), StringTerm("bar"), IntNumberTerm(4)), MustParseTerm(`4`)},
 		{RefTerm(StringTerm("foo"), IntNumberTerm(2)), fmt.Errorf("not found")},
 		{RefTerm(StringTerm("baz"), StringTerm("qux"), IntNumberTerm(0)), MustParseTerm(`"hello"`)},
 	}
@@ -418,6 +419,49 @@ func TestRefConcat(t *testing.T) {
 	}
 }
 
+func TestRefPtr(t *testing.T) {
+	cases := []string{
+		"",
+		"a",
+		"a/b",
+		"/a/b",
+		"/a/b/",
+		"a%2Fb",
+	}
+
+	for _, tc := range cases {
+		ref, err := PtrRef(DefaultRootDocument.Copy(), tc)
+		if err != nil {
+			t.Fatal("Unexpected error:", err)
+		}
+
+		ptr, err := ref.Ptr()
+		if err != nil {
+			t.Fatal("Unexpected error:", err)
+		}
+
+		roundtrip, err := PtrRef(DefaultRootDocument.Copy(), ptr)
+		if err != nil {
+			t.Fatal("Unexpected error:", err)
+		}
+
+		if !ref.Equal(roundtrip) {
+			t.Fatalf("Expected roundtrip of %q to be equal but got %v and %v", tc, ref, roundtrip)
+		}
+	}
+
+	if _, err := PtrRef(DefaultRootDocument.Copy(), "2%"); err == nil {
+		t.Fatalf("Expected error from %q", "2%")
+	}
+
+	ref := Ref{VarTerm("x"), IntNumberTerm(1)}
+
+	if _, err := ref.Ptr(); err == nil {
+		t.Fatal("Expected error from x[1]")
+	}
+
+}
+
 func TestSetEqual(t *testing.T) {
 	tests := []struct {
 		a        string
@@ -514,6 +558,25 @@ func TestSetOperations(t *testing.T) {
 	}
 }
 
+func TestSetCopy(t *testing.T) {
+	orig := MustParseTerm("{1,2,3}")
+	cpy := orig.Copy()
+	Walk(NewGenericVisitor(func(x interface{}) bool {
+		if Compare(IntNumberTerm(2), x) == 0 {
+			x.(*Term).Value = String("modified")
+		}
+		return false
+	}), orig)
+	expOrig := MustParseTerm(`{1, "modified", 3}`)
+	expCpy := MustParseTerm(`{1,2,3}`)
+	if !expOrig.Equal(orig) {
+		t.Errorf("Expected %v but got %v", expOrig, orig)
+	}
+	if !expCpy.Equal(cpy) {
+		t.Errorf("Expected %v but got %v", expCpy, cpy)
+	}
+}
+
 func TestArrayOperations(t *testing.T) {
 
 	arr := MustParseTerm(`[1,2,3,4]`).Value.(Array)
@@ -603,6 +666,86 @@ func TestValueToInterface(t *testing.T) {
 
 	if err == nil {
 		t.Fatalf("Expected error from JSON(%v)", term)
+	}
+}
+
+func TestLocationCompare(t *testing.T) {
+
+	tests := []struct {
+		a   string
+		b   string
+		exp int
+	}{
+		{
+			a:   "",
+			b:   "",
+			exp: 0,
+		},
+		{
+			a:   "",
+			b:   `{"file": "a", "row": 1, "col": 1}`,
+			exp: 1,
+		},
+		{
+			a:   `{"file": "a", "row": 1, "col": 1}`,
+			b:   "",
+			exp: -1,
+		},
+		{
+			a:   `{"file": "a", "row": 1, "col": 1}`,
+			b:   `{"file": "a", "row": 1, "col": 1}`,
+			exp: 0,
+		},
+		{
+			a:   `{"file": "a", "row": 1, "col": 1}`,
+			b:   `{"file": "b", "row": 1, "col": 1}`,
+			exp: -1,
+		},
+		{
+			a:   `{"file": "b", "row": 1, "col": 1}`,
+			b:   `{"file": "a", "row": 1, "col": 1}`,
+			exp: 1,
+		},
+		{
+			a:   `{"file": "a", "row": 1, "col": 1}`,
+			b:   `{"file": "a", "row": 2, "col": 1}`,
+			exp: -1,
+		},
+		{
+			a:   `{"file": "a", "row": 2, "col": 1}`,
+			b:   `{"file": "a", "row": 1, "col": 1}`,
+			exp: 1,
+		},
+		{
+			a:   `{"file": "a", "row": 1, "col": 1}`,
+			b:   `{"file": "a", "row": 1, "col": 2}`,
+			exp: -1,
+		},
+		{
+			a:   `{"file": "a", "row": 1, "col": 2}`,
+			b:   `{"file": "a", "row": 1, "col": 1}`,
+			exp: 1,
+		},
+	}
+
+	unmarshal := func(s string) *Location {
+		if s != "" {
+			var loc Location
+			if err := util.Unmarshal([]byte(s), &loc); err != nil {
+				t.Fatal(err)
+			}
+			return &loc
+		}
+		return nil
+	}
+
+	for _, tc := range tests {
+		locA := unmarshal(tc.a)
+		locB := unmarshal(tc.b)
+		result := locA.Compare(locB)
+		if tc.exp != result {
+			t.Fatalf("Expected %v but got %v for %v.Compare(%v)", tc.exp, result, locA, locB)
+		}
 	}
 }
 

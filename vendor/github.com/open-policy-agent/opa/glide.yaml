@@ -11,14 +11,19 @@ import:
 - package: github.com/pkg/errors
 - package: github.com/gorilla/mux
 - package: github.com/gorilla/context
+- package: github.com/OneOfOne/xxhash
 - package: github.com/olekukonko/tablewriter
-- package: github.com/dchest/siphash
 - package: gopkg.in/fsnotify.v1
+- package: github.com/gobwas/glob
+  version: v0.2.3
 - package: github.com/ghodss/yaml
 - package: github.com/sirupsen/logrus
-  version: v1.0.3
+  version: v1.4.1
 - package: github.com/prometheus/client_golang
   subpackages:
   - prometheus
 - package: github.com/yashtewari/glob-intersection
 - package: github.com/rcrowley/go-metrics
+- package: golang.org/x/lint
+  subpackages:
+  - golint

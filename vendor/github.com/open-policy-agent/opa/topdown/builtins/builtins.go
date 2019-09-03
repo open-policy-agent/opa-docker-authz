@@ -157,15 +157,63 @@ func FloatToNumber(f *big.Float) ast.Number {
 }
 
 // NumberToInt converts n to a big int.
-func NumberToInt(n ast.Number) *big.Int {
+// If n cannot be converted to an big int, an error is returned.
+func NumberToInt(n ast.Number) (*big.Int, error) {
 	r, ok := new(big.Int).SetString(string(n), 10)
 	if !ok {
-		panic("illegal value")
+		return nil, fmt.Errorf("illegal value")
 	}
-	return r
+	return r, nil
 }
 
 // IntToNumber converts i to a number.
 func IntToNumber(i *big.Int) ast.Number {
 	return ast.Number(i.String())
+}
+
+// StringSliceOperand converts x to a []string. If the cast fails, a descriptive error is
+// returned.
+func StringSliceOperand(x ast.Value, pos int) ([]string, error) {
+	a, err := ArrayOperand(x, pos)
+	if err != nil {
+		return nil, err
+	}
+
+	var f = make([]string, len(a))
+	for k, b := range a {
+		c, ok := b.Value.(ast.String)
+		if !ok {
+			return nil, NewOperandElementErr(pos, x, b.Value, "[]string")
+		}
+
+		f[k] = string(c)
+	}
+
+	return f, nil
+}
+
+// RuneSliceOperand converts x to a []rune. If the cast fails, a descriptive error is
+// returned.
+func RuneSliceOperand(x ast.Value, pos int) ([]rune, error) {
+	a, err := ArrayOperand(x, pos)
+	if err != nil {
+		return nil, err
+	}
+
+	var f = make([]rune, len(a))
+	for k, b := range a {
+		c, ok := b.Value.(ast.String)
+		if !ok {
+			return nil, NewOperandElementErr(pos, x, b.Value, "string")
+		}
+
+		d := []rune(string(c))
+		if len(d) != 1 {
+			return nil, NewOperandElementErr(pos, x, b.Value, "rune")
+		}
+
+		f[k] = d[0]
+	}
+
+	return f, nil
 }

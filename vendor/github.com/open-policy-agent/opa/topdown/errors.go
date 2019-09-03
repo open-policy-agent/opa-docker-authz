@@ -35,6 +35,14 @@ const (
 	// TypeErr indicates evaluation stopped because an expression was applied to
 	// a value of an inappropriate type.
 	TypeErr string = "eval_type_error"
+
+	// BuiltinErr indicates a built-in function received a semantically invalid
+	// input or encountered some kind of runtime error, e.g., connection
+	// timeout, connection refused, etc.
+	BuiltinErr string = "eval_builtin_error"
+
+	// WithMergeErr indicates that the real and replacement data could not be merged.
+	WithMergeErr string = "eval_with_merge_error"
 )
 
 // IsError returns true if the err is an Error.
@@ -99,5 +107,13 @@ func unsupportedBuiltinErr(loc *ast.Location) error {
 		Code:     InternalErr,
 		Location: loc,
 		Message:  "unsupported built-in",
+	}
+}
+
+func mergeConflictErr(loc *ast.Location) error {
+	return &Error{
+		Code:     WithMergeErr,
+		Location: loc,
+		Message:  "real and replacement data could not be merged",
 	}
 }
