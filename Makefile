@@ -1,17 +1,14 @@
 .PHONY: all build
 
 VERSION := 0.6
-OPA_VERSION := $(shell ./get-opa-version-from-glide.sh)
 GO_VERSION := 1.14.1
 REPO := openpolicyagent/opa-docker-authz
-DOCKER_VERSION := $(shell docker version --format '{{.Server.Version}}')
 
 all: build
 
 build:
 	@docker container run --rm \
 		-e VERSION=$(VERSION) \
-		-e OPA_VERSION=$(OPA_VERSION) \
 		-v $(PWD):/go/src/github.com/open-policy-agent/opa-docker-authz \
 		-w /go/src/github.com/open-policy-agent/opa-docker-authz \
 		golang:$(GO_VERSION) \
@@ -24,7 +21,6 @@ image: build
 
 plugin: build
 	@docker container run --rm \
-		-e DOCKER_VERSION=$(DOCKER_VERSION) \
 		-e REPO=$(REPO) \
 		-e VERSION=$(VERSION) \
 		-v /var/run/docker.sock:/var/run/docker.sock \
