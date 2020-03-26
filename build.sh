@@ -2,6 +2,9 @@
 
 set -e
 
+
+OPA_VERSION=$(go list -m -f '{{.Version}}' github.com/open-policy-agent/opa)
+
 echo "Building opa-docker-authz version: $VERSION (OPA version: $OPA_VERSION)"
 
 echo -e "\nBuilding opa-docker-authz ..."

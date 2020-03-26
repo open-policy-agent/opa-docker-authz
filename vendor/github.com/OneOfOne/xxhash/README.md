@@ -63,7 +63,7 @@ Fnv64Short-8                  74.7ns ± 8%
 	fmt.Println("File checksum:", h.Sum64())
 ```
 
-[<kbd>playground</kbd>](https://play.golang.org/p/wHKBwfu6CPV)
+[<kbd>playground</kbd>](http://play.golang.org/p/rhRN3RdQyd)
 
 ## TODO
 

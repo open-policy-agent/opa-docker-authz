@@ -6,6 +6,8 @@ static_url="https://download.docker.com/linux/static"
 
 echo -e "\nPreparing to build plugin ..."
 
+DOCKER_VERSION=$(docker version --format '{{.Server.Version}}')
+
 # Determine the channel (stable, edge nightly) required for the Docker client
 if [[ "$DOCKER_VERSION" =~ ^0\.0\.0-[0-9]{14}-[0-9a-f]{7}$ ]]; then
     channel=nightly
