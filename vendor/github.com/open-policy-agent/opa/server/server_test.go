@@ -24,6 +24,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pkg/errors"
+
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/bundle"
 	"github.com/open-policy-agent/opa/metrics"
@@ -36,7 +38,6 @@ import (
 	"github.com/open-policy-agent/opa/util"
 	"github.com/open-policy-agent/opa/util/test"
 	"github.com/open-policy-agent/opa/version"
-	"github.com/pkg/errors"
 )
 
 type tr struct {
@@ -66,39 +67,64 @@ func TestUnversionedGetHealthBundleNoBundleSet(t *testing.T) {
 
 	f := newFixture(t)
 
-	req := newReqUnversioned(http.MethodGet, "/health?bundle=true", "")
+	req := newReqUnversioned(http.MethodGet, "/health?bundles=true", "")
 	if err := f.executeRequest(req, 200, `{}`); err != nil {
 		t.Fatalf("Unexpected error while health check: %v", err)
 	}
 }
 
-func TestUnversionedGetHealthCheckBundleActivationSingle(t *testing.T) {
+func TestUnversionedGetHealthCheckOnlyBundlePlugin(t *testing.T) {
 
 	f := newFixture(t)
-	bundleName := "test-bundle"
 
 	// Initialize the server as if a bundle plugin was
 	// configured on the manager.
-	f.server.manager.Register(pluginBundle.Name, &pluginBundle.Plugin{})
-	f.server.bundleStatuses = map[string]*pluginBundle.Status{
-		bundleName: &pluginBundle.Status{Name: bundleName},
-	}
+	f.server.manager.UpdatePluginStatus("bundle", &plugins.Status{State: plugins.StateNotReady})
 
 	// The bundle hasn't been activated yet, expect the health check to fail
-	req := newReqUnversioned(http.MethodGet, "/health?bundle=true", "")
+	req := newReqUnversioned(http.MethodGet, "/health?bundles=true", "")
 	if err := f.executeRequest(req, 500, `{}`); err != nil {
 		t.Fatal(err)
 	}
 
 	// Set the bundle to be activated.
-	status := map[string]*pluginBundle.Status{
-		bundleName: &pluginBundle.Status{},
-	}
-	status[bundleName].SetActivateSuccess("")
-	f.server.updateBundleStatus(status)
+	f.server.manager.UpdatePluginStatus("bundle", &plugins.Status{State: plugins.StateOK})
 
 	// The heath check should now respond as healthy
-	req = newReqUnversioned(http.MethodGet, "/health?bundle=true", "")
+	req = newReqUnversioned(http.MethodGet, "/health?bundles=true", "")
+	if err := f.executeRequest(req, 200, `{}`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUnversionedGetHealthCheckDiscoveryWithBundle(t *testing.T) {
+
+	f := newFixture(t)
+
+	// Initialize the server as if a discovery bundle is configured
+	f.server.manager.UpdatePluginStatus("discovery", &plugins.Status{State: plugins.StateNotReady})
+
+	// The discovery bundle hasn't been activated yet, expect the health check to fail
+	req := newReqUnversioned(http.MethodGet, "/health?bundles=true", "")
+	if err := f.executeRequest(req, 500, `{}`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set the bundle to be not ready (plugin configured and created, but hasn't activated all bundles yet).
+	f.server.manager.UpdatePluginStatus("discovery", &plugins.Status{State: plugins.StateOK})
+	f.server.manager.UpdatePluginStatus("bundle", &plugins.Status{State: plugins.StateNotReady})
+
+	// The discovery bundle is OK, but the newly configured bundle hasn't been activated yet, expect the health check to fail
+	req = newReqUnversioned(http.MethodGet, "/health?bundles=true", "")
+	if err := f.executeRequest(req, 500, `{}`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set the bundle to be activated.
+	f.server.manager.UpdatePluginStatus("bundle", &plugins.Status{State: plugins.StateOK})
+
+	// The heath check should now respond as healthy
+	req = newReqUnversioned(http.MethodGet, "/health?bundles=true", "")
 	if err := f.executeRequest(req, 200, `{}`); err != nil {
 		t.Fatal(err)
 	}
@@ -112,6 +138,12 @@ func TestUnversionedGetHealthCheckBundleActivationSingleLegacy(t *testing.T) {
 
 	ctx := context.Background()
 
+	// The server doesn't know about any bundles, so return a healthy status
+	req := newReqUnversioned(http.MethodGet, "/health?bundle=true", "")
+	if err := f.executeRequest(req, 200, `{}`); err != nil {
+		t.Fatal(err)
+	}
+
 	err := storage.Txn(ctx, f.server.store, storage.WriteParams, func(txn storage.Transaction) error {
 		return bundle.LegacyWriteManifestToStore(ctx, f.server.store, txn, bundle.Manifest{
 			Revision: "a",
@@ -122,130 +154,305 @@ func TestUnversionedGetHealthCheckBundleActivationSingleLegacy(t *testing.T) {
 		t.Fatalf("Unexpected error: %s", err)
 	}
 
-	// The heath check should now respond as healthy
-	req := newReqUnversioned(http.MethodGet, "/health?bundle=true", "")
+	// The heath check still respond as healthy with a legacy bundle found in storage
+	req = newReqUnversioned(http.MethodGet, "/health?bundle=true", "")
 	if err := f.executeRequest(req, 200, `{}`); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestUnversionedGetHealthCheckBundleActivationMulti(t *testing.T) {
+func TestBundlesReady(t *testing.T) {
 
+	cases := []struct {
+		note   string
+		status map[string]*plugins.Status
+		ready  bool
+	}{
+		{
+			note:   "nil status",
+			status: nil,
+			ready:  true,
+		},
+		{
+			note:   "empty status",
+			status: map[string]*plugins.Status{},
+			ready:  true,
+		},
+		{
+			note: "discovery not ready - bundle missing",
+			status: map[string]*plugins.Status{
+				"discovery": {State: plugins.StateNotReady},
+			},
+			ready: false,
+		},
+		{
+			note: "discovery ok - bundle missing",
+			status: map[string]*plugins.Status{
+				"discovery": {State: plugins.StateOK},
+			},
+			ready: true, // bundles aren't enabled, only discovery plugin configured
+		},
+		{
+			note: "discovery missing - bundle not ready",
+			status: map[string]*plugins.Status{
+				"bundle": {State: plugins.StateNotReady},
+			},
+			ready: false,
+		},
+		{
+			note: "discovery missing - bundle ok",
+			status: map[string]*plugins.Status{
+				"bundle": {State: plugins.StateOK},
+			},
+			ready: true, // discovery isn't enabled, only bundle plugin configured
+		},
+		{
+			note: "discovery not ready - bundle not ready",
+			status: map[string]*plugins.Status{
+				"discovery": {State: plugins.StateNotReady},
+				"bundle":    {State: plugins.StateNotReady},
+			},
+			ready: false,
+		},
+		{
+			note: "discovery ok - bundle not ready",
+			status: map[string]*plugins.Status{
+				"discovery": {State: plugins.StateOK},
+				"bundle":    {State: plugins.StateNotReady},
+			},
+			ready: false,
+		},
+		{
+			note: "discovery not ready - bundle ok",
+			status: map[string]*plugins.Status{
+				"discovery": {State: plugins.StateNotReady},
+				"bundle":    {State: plugins.StateOK},
+			},
+			ready: false,
+		},
+		{
+			note: "discovery ok - bundle ok",
+			status: map[string]*plugins.Status{
+				"discovery": {State: plugins.StateOK},
+				"bundle":    {State: plugins.StateOK},
+			},
+			ready: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.note, func(t *testing.T) {
+			f := newFixture(t)
+
+			actual := f.server.bundlesReady(tc.status)
+			if actual != tc.ready {
+				t.Errorf("Expected %t got %t", tc.ready, actual)
+			}
+		})
+	}
+}
+
+func TestUnversionedGetHealthCheckDiscoveryWithPlugins(t *testing.T) {
+
+	// Use the same server through the cases, the status updates apply incrementally to it.
 	f := newFixture(t)
 
-	// Initialize the server as if a bundle plugin was
-	// configured on the manager.
-	bp := pluginBundle.New(&pluginBundle.Config{Bundles: map[string]*pluginBundle.Source{
-		"b1": {Service: "s1", Resource: "bundle.tar.gz"},
-		"b2": {Service: "s2", Resource: "bundle.tar.gz"},
-		"b3": {Service: "s3", Resource: "bundle.tar.gz"},
-	}}, f.server.manager)
-	f.server.manager.Register(pluginBundle.Name, bp)
-	f.server.bundleStatuses = map[string]*pluginBundle.Status{
-		"b1": {Name: "b1"},
-		"b2": {Name: "b2"},
-		"b3": {Name: "b3"},
+	cases := []struct {
+		note          string
+		statusUpdates map[string]*plugins.Status
+		exp           int
+	}{
+		{
+			note:          "no plugins configured",
+			statusUpdates: nil,
+			exp:           200,
+		},
+		{
+			note: "one plugin configured - not ready",
+			statusUpdates: map[string]*plugins.Status{
+				"p1": {State: plugins.StateNotReady},
+			},
+			exp: 500,
+		},
+		{
+			note: "one plugin configured - ready",
+			statusUpdates: map[string]*plugins.Status{
+				"p1": {State: plugins.StateOK},
+			},
+			exp: 200,
+		},
+		{
+			note: "one plugin configured - error state",
+			statusUpdates: map[string]*plugins.Status{
+				"p1": {State: plugins.StateErr},
+			},
+			exp: 500,
+		},
+		{
+			note: "one plugin configured - recovered from error",
+			statusUpdates: map[string]*plugins.Status{
+				"p1": {State: plugins.StateOK},
+			},
+			exp: 200,
+		},
+		{
+			note: "add second plugin - not ready",
+			statusUpdates: map[string]*plugins.Status{
+				"p1": {State: plugins.StateOK},
+				"p2": {State: plugins.StateNotReady},
+			},
+			exp: 500,
+		},
+		{
+			note: "add third plugin - not ready",
+			statusUpdates: map[string]*plugins.Status{
+				"p1": {State: plugins.StateOK},
+				"p2": {State: plugins.StateNotReady},
+				"p3": {State: plugins.StateNotReady},
+			},
+			exp: 500,
+		},
+		{
+			note: "mixed states - not ready",
+			statusUpdates: map[string]*plugins.Status{
+				"p1": {State: plugins.StateOK},
+				"p2": {State: plugins.StateErr},
+				"p3": {State: plugins.StateNotReady},
+			},
+			exp: 500,
+		},
+		{
+			note: "mixed states - still not ready",
+			statusUpdates: map[string]*plugins.Status{
+				"p1": {State: plugins.StateOK},
+				"p2": {State: plugins.StateErr},
+				"p3": {State: plugins.StateOK},
+			},
+			exp: 500,
+		},
+		{
+			note: "all plugins ready",
+			statusUpdates: map[string]*plugins.Status{
+				"p1": {State: plugins.StateOK},
+				"p2": {State: plugins.StateOK},
+				"p3": {State: plugins.StateOK},
+			},
+			exp: 200,
+		},
+		{
+			note: "one plugins fails",
+			statusUpdates: map[string]*plugins.Status{
+				"p1": {State: plugins.StateErr},
+				"p2": {State: plugins.StateOK},
+				"p3": {State: plugins.StateOK},
+			},
+			exp: 500,
+		},
+
+		{
+			note: "all plugins ready - recovery",
+			statusUpdates: map[string]*plugins.Status{
+				"p1": {State: plugins.StateOK},
+				"p2": {State: plugins.StateOK},
+				"p3": {State: plugins.StateOK},
+			},
+			exp: 200,
+		},
 	}
 
-	// No bundle has been activated yet, expect the health check to fail
-	req := newReqUnversioned(http.MethodGet, "/health?bundle=true", "")
-	if err := f.executeRequest(req, 500, `{}`); err != nil {
-		t.Fatal(err)
-	}
+	for _, tc := range cases {
+		t.Run(tc.note, func(t *testing.T) {
+			for name, status := range tc.statusUpdates {
+				f.server.manager.UpdatePluginStatus(name, status)
+			}
 
-	// Set one bundle to be activated
-	update := map[string]*pluginBundle.Status{
-		"b1": {Name: "b1"},
-		"b2": {Name: "b2"},
-		"b3": {Name: "b3"},
-	}
-	update["b2"].SetActivateSuccess("A")
-	f.server.updateBundleStatus(update)
-
-	// The heath check should still respond as unhealthy
-	req = newReqUnversioned(http.MethodGet, "/health?bundle=true", "")
-	if err := f.executeRequest(req, 500, `{}`); err != nil {
-		t.Fatal(err)
-	}
-
-	// Activate all the bundles
-	update["b1"].SetActivateSuccess("B")
-	update["b3"].SetActivateSuccess("C")
-	f.server.updateBundleStatus(update)
-
-	// The heath check should succeed now
-	req = newReqUnversioned(http.MethodGet, "/health?bundle=true", "")
-	if err := f.executeRequest(req, 200, `{}`); err != nil {
-		t.Fatal(err)
+			req := newReqUnversioned(http.MethodGet, "/health?plugins", "")
+			if err := f.executeRequest(req, tc.exp, `{}`); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
-func TestInitWithBundlePlugin(t *testing.T) {
-	store := inmem.New()
-	m, err := plugins.New([]byte{}, "test", store)
-	if err != nil {
-		t.Fatalf("Unexpected error creating plugin manager: %s", err.Error())
+func TestUnversionedGetHealthCheckBundleAndPlugins(t *testing.T) {
+
+	cases := []struct {
+		note     string
+		statuses map[string]*plugins.Status
+		exp      int
+	}{
+		{
+			note:     "no plugins configured",
+			statuses: nil,
+			exp:      200,
+		},
+		{
+			note: "only bundle plugin configured - not ready",
+			statuses: map[string]*plugins.Status{
+				"bundle": {State: plugins.StateNotReady},
+			},
+			exp: 500,
+		},
+		{
+			note: "only bundle plugin configured - ok",
+			statuses: map[string]*plugins.Status{
+				"bundle": {State: plugins.StateOK},
+			},
+			exp: 200,
+		},
+		{
+			note: "only custom plugin configured - not ready",
+			statuses: map[string]*plugins.Status{
+				"p1": {State: plugins.StateNotReady},
+			},
+			exp: 500,
+		},
+		{
+			note: "only custom plugin configured - ok",
+			statuses: map[string]*plugins.Status{
+				"p1": {State: plugins.StateOK},
+			},
+			exp: 200,
+		},
+		{
+			note: "both configured - bundle not ready",
+			statuses: map[string]*plugins.Status{
+				"bundle": {State: plugins.StateNotReady},
+				"p1":     {State: plugins.StateOK},
+			},
+			exp: 500,
+		},
+		{
+			note: "both configured - custom plugin not ready",
+			statuses: map[string]*plugins.Status{
+				"bundle": {State: plugins.StateOK},
+				"p1":     {State: plugins.StateNotReady},
+			},
+			exp: 500,
+		},
+		{
+			note: "both configured - both ready",
+			statuses: map[string]*plugins.Status{
+				"bundle": {State: plugins.StateOK},
+				"p1":     {State: plugins.StateOK},
+			},
+			exp: 200,
+		},
 	}
 
-	bundleName := "test-bundle"
-	bundleConf := &pluginBundle.Config{
-		Name:    bundleName,
-		Service: "s1",
-		Bundles: map[string]*pluginBundle.Source{"b1": {}},
-	}
+	for _, tc := range cases {
+		t.Run(tc.note, func(t *testing.T) {
+			f := newFixture(t)
 
-	m.Register(pluginBundle.Name, pluginBundle.New(bundleConf, m))
+			for name, status := range tc.statuses {
+				f.server.manager.UpdatePluginStatus(name, status)
+			}
 
-	server, err := New().
-		WithStore(store).
-		WithManager(m).
-		Init(context.Background())
-
-	if err != nil {
-		t.Fatalf("Unexpected error initializing server: %s", err.Error())
-	}
-
-	if !server.hasBundle() {
-		t.Error("server.hasBundle should be true")
-	}
-
-	isActivated := server.bundlesActivated()
-	if isActivated {
-		t.Error("bundle should not be initialized to activated status")
-	}
-}
-
-func TestInitWithBundlePluginMultiBundle(t *testing.T) {
-	store := inmem.New()
-	m, err := plugins.New([]byte{}, "test", store)
-	if err != nil {
-		t.Fatalf("Unexpected error creating plugin manager: %s", err.Error())
-	}
-
-	bundleConf := &pluginBundle.Config{Bundles: map[string]*pluginBundle.Source{
-		"b1": {},
-		"b2": {},
-		"b3": {},
-	}}
-
-	m.Register(pluginBundle.Name, pluginBundle.New(bundleConf, m))
-
-	server, err := New().
-		WithStore(store).
-		WithManager(m).
-		Init(context.Background())
-
-	if err != nil {
-		t.Fatalf("Unexpected error initializing server: %s", err.Error())
-	}
-
-	if !server.hasBundle() {
-		t.Error("server.hasBundle should be true")
-	}
-
-	isActivated := server.bundlesActivated()
-	if isActivated {
-		t.Error("bundle should not be initialized to activated")
+			req := newReqUnversioned(http.MethodGet, "/health?plugins&bundles", "")
+			if err := f.executeRequest(req, tc.exp, `{}`); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -403,6 +610,8 @@ func TestCompileV1(t *testing.T) {
 	}
 
 	default r = true
+
+	r { input.x = 1 }
 	`
 
 	expQuery := func(s string) string {
@@ -468,6 +677,7 @@ func TestCompileV1(t *testing.T) {
 					`data.partial.test.r = true`,
 					`package partial.test
 
+					r { input.x = 1 }
 					default r = true
 					`)},
 			},
@@ -1676,9 +1886,6 @@ func TestDataProvenanceSingleBundle(t *testing.T) {
 	// Initialize as if a bundle plugin is running
 	bp := pluginBundle.New(&pluginBundle.Config{Name: "b1"}, f.server.manager)
 	f.server.manager.Register(pluginBundle.Name, bp)
-	f.server.bundleStatuses = map[string]*pluginBundle.Status{
-		"b1": {Name: "b1"},
-	}
 
 	req := newReqV1(http.MethodPost, "/data?provenance", "")
 	f.reset()
@@ -1787,11 +1994,6 @@ func TestDataProvenanceMultiBundle(t *testing.T) {
 	}}, f.server.manager)
 	f.server.manager.Register(pluginBundle.Name, bp)
 
-	f.server.bundleStatuses = map[string]*pluginBundle.Status{
-		"b1": {Name: "b1"},
-		"b2": {Name: "b2"},
-	}
-
 	req := newReqV1(http.MethodPost, "/data?provenance", "")
 	f.reset()
 	f.server.Handler.ServeHTTP(f.recorder, req)
@@ -1870,12 +2072,56 @@ func TestDataProvenanceMultiBundle(t *testing.T) {
 	}
 }
 
-func TestDataMetrics(t *testing.T) {
-
+func TestDataMetricsEval(t *testing.T) {
 	f := newFixture(t)
 
-	req := newReqV1(http.MethodPost, "/data?metrics", "")
+	// Make a request to evaluate `data`
+	testDataMetrics(t, f, "/data?metrics", []string{
+		"counter_server_query_cache_hit",
+		"timer_rego_input_parse_ns",
+		"timer_rego_query_parse_ns",
+		"timer_rego_query_compile_ns",
+		"timer_rego_query_eval_ns",
+		"timer_server_handler_ns",
+	})
+
+	// Repeat previous request, expect to have hit the query cache
+	// so fewer timers should have been reported.
+	testDataMetrics(t, f, "/data?metrics", []string{
+		"counter_server_query_cache_hit",
+		"timer_rego_input_parse_ns",
+		"timer_rego_query_eval_ns",
+		"timer_server_handler_ns",
+	})
+
+	// Make a request to evaluate `data` and use partial evaluation,
+	// this should not hit the same query cache result as the previous
+	// request.
+	testDataMetrics(t, f, "/data?metrics&partial", []string{
+		"counter_server_query_cache_hit",
+		"timer_rego_input_parse_ns",
+		"timer_rego_module_compile_ns",
+		"timer_rego_query_parse_ns",
+		"timer_rego_query_compile_ns",
+		"timer_rego_query_eval_ns",
+		"timer_rego_partial_eval_ns",
+		"timer_server_handler_ns",
+	})
+
+	// Repeat previous partial eval request, this time it should
+	// be cached
+	testDataMetrics(t, f, "/data?metrics&partial", []string{
+		"counter_server_query_cache_hit",
+		"timer_rego_input_parse_ns",
+		"timer_rego_query_eval_ns",
+		"timer_server_handler_ns",
+	})
+}
+
+func testDataMetrics(t *testing.T, f *fixture, url string, expected []string) {
+	t.Helper()
 	f.reset()
+	req := newReqV1(http.MethodPost, url, "")
 	f.server.Handler.ServeHTTP(f.recorder, req)
 
 	var result types.DataResponseV1
@@ -1884,45 +2130,19 @@ func TestDataMetrics(t *testing.T) {
 		t.Fatalf("Unexpected JSON decode error: %v", err)
 	}
 
-	// Test some basic well-known metrics.
-	expected := []string{
-		"timer_rego_query_parse_ns",
-		"timer_rego_query_compile_ns",
-		"timer_rego_query_eval_ns",
-		"timer_server_handler_ns",
-	}
-
 	for _, key := range expected {
-		if result.Metrics[key] == nil {
-			t.Fatalf("Expected non-zero metric for %v but got: %v", key, result)
+		v, ok := result.Metrics[key]
+		if !ok {
+			t.Errorf("Missing expected metric: %s", key)
+		} else if v == nil {
+			t.Errorf("Expected non-nil value for metric: %s", key)
 		}
+
 	}
 
-	req = newReqV1(http.MethodPost, "/data?metrics&partial", "")
-
-	f.reset()
-	f.server.Handler.ServeHTTP(f.recorder, req)
-
-	result = types.DataResponseV1{}
-
-	if err := util.NewJSONDecoder(f.recorder.Body).Decode(&result); err != nil {
-		t.Fatalf("Unexpected JSON decode error: %v", err)
+	if len(expected) != len(result.Metrics) {
+		t.Errorf("Expected %d metrics, got %d\n\n\tValues: %+v", len(expected), len(result.Metrics), result.Metrics)
 	}
-
-	expected = []string{
-		"timer_rego_query_parse_ns",
-		"timer_rego_query_compile_ns",
-		"timer_rego_query_eval_ns",
-		"timer_rego_partial_eval_ns",
-		"timer_server_handler_ns",
-	}
-
-	for _, key := range expected {
-		if result.Metrics[key] == nil {
-			t.Fatalf("Expected non-zero metric for %v but got: %v", key, result)
-		}
-	}
-
 }
 
 func TestV1Pretty(t *testing.T) {
@@ -2561,47 +2781,6 @@ func TestQueryWatchMigrateInvalidate(t *testing.T) {
 	}
 }
 
-func TestMetricsEndpoint(t *testing.T) {
-
-	f := newFixture(t)
-
-	module := `package test
-
-	p = true`
-
-	err := f.v1TestRequests([]tr{
-		{"PUT", "/policies/test", module, http.StatusOK, "{}"},
-		{"POST", "/data/test/p", "", http.StatusOK, `{"result": true}`},
-	})
-
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	f.reset()
-
-	metricsRequest, err := http.NewRequest("GET", "/metrics", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	f.server.Handler.ServeHTTP(f.recorder, metricsRequest)
-
-	resp := f.recorder.Body.String()
-
-	expected := []string{
-		`http_request_duration_seconds_count{code="200",handler="v1/policies",method="put"} 1`,
-		`http_request_duration_seconds_count{code="200",handler="v1/data",method="post"} 1`,
-	}
-
-	for _, exp := range expected {
-		if !strings.Contains(resp, exp) {
-			t.Fatalf("Expected to find %q but got:\n\n%v", exp, resp)
-		}
-	}
-
-}
-
 type mockDecisionBuffer struct {
 	decisions []*Info
 }
@@ -2665,7 +2844,7 @@ func TestDecisionLogging(t *testing.T) {
 		nextID++
 		return fmt.Sprint(nextID)
 	}).WithDecisionLoggerWithErr(func(_ context.Context, info *Info) error {
-		if info.Path == "data.fail_closed.decision_logger_err" {
+		if info.Path == "fail_closed/decision_logger_err" {
 			return fmt.Errorf("some error")
 		}
 		decisions = append(decisions, info)
@@ -2793,17 +2972,17 @@ func TestDecisionLogging(t *testing.T) {
 		query   string
 		wantErr bool
 	}{
-		{path: "data"},
-		{path: "data"},
-		{path: "data.nonexistent", input: `{"foo": 1}`},
-		{path: "data"},
-		{path: "data.system.main"},
+		{path: ""},
+		{path: ""},
+		{path: "nonexistent", input: `{"foo": 1}`},
+		{path: ""},
+		{path: "system/main"},
 		{query: "data = x"},
 		{query: "data = x"},
-		{path: "data", wantErr: true},
-		{path: "data", wantErr: true},
-		{path: "data.system.main", wantErr: true},
-		{path: `data.test`, wantErr: true},
+		{path: "", wantErr: true},
+		{path: "", wantErr: true},
+		{path: "system/main", wantErr: true},
+		{path: `test`, wantErr: true},
 	}
 
 	if len(decisions) != len(exp) {
@@ -2831,6 +3010,22 @@ func TestDecisionLogging(t *testing.T) {
 		}
 	}
 
+}
+
+func TestDecisionLogErrorMessage(t *testing.T) {
+
+	f := newFixture(t)
+
+	f.server.WithDecisionLoggerWithErr(func(context.Context, *Info) error {
+		return fmt.Errorf("xxx")
+	})
+
+	if err := f.v1(http.MethodPost, "/data", "", 500, `{
+		"code": "internal_error",
+		"message": "decision_logs: xxx"
+	}`); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestWatchParams(t *testing.T) {
@@ -3051,7 +3246,10 @@ func TestBadQueryV1(t *testing.T) {
         "row": 1,
         "col": 1
       },
-      "details": {}
+      "details": {
+        "line": "^ -i",
+        "idx": 0
+      }
     }
   ]
 }`
@@ -3362,7 +3560,7 @@ type fixture struct {
 	t        *testing.T
 }
 
-func newFixture(t *testing.T) *fixture {
+func newFixture(t *testing.T, opts ...func(*Server)) *fixture {
 	ctx := context.Background()
 	store := inmem.New()
 	m, err := plugins.New([]byte{}, "test", store)
@@ -3374,11 +3572,14 @@ func newFixture(t *testing.T) *fixture {
 		panic(err)
 	}
 
-	server, err := New().
+	server := New().
 		WithAddresses([]string{":8182"}).
 		WithStore(store).
-		WithManager(m).
-		Init(ctx)
+		WithManager(m)
+	for _, opt := range opts {
+		opt(server)
+	}
+	server, err = server.Init(ctx)
 	if err != nil {
 		panic(err)
 	}
@@ -3423,7 +3624,7 @@ func (f *fixture) executeRequest(req *http.Request, code int, resp string) error
 	f.reset()
 	f.server.Handler.ServeHTTP(f.recorder, req)
 	if f.recorder.Code != code {
-		return fmt.Errorf("Expected code %v from %v %v but got: %v", code, req.Method, req.URL, f.recorder)
+		return fmt.Errorf("Expected code %v from %v %v but got: %+v", code, req.Method, req.URL, f.recorder)
 	}
 	if resp != "" {
 		var result interface{}

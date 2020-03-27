@@ -7,6 +7,7 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -18,9 +19,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/open-policy-agent/opa/runtime"
 	"github.com/open-policy-agent/opa/util"
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -265,4 +267,15 @@ func (t *TestRuntime) GetDataWithInput(path string, input interface{}) ([]byte, 
 	}
 
 	return body, nil
+}
+
+// GetDataWithInputTyped returns an unmarshalled response from GetDataWithInput.
+func (t *TestRuntime) GetDataWithInputTyped(path string, input interface{}, response interface{}) error {
+
+	bs, err := t.GetDataWithInput(path, input)
+	if err != nil {
+		return err
+	}
+
+	return json.Unmarshal(bs, response)
 }

@@ -90,7 +90,7 @@ type PatchV1 struct {
 	Value interface{} `json:"value"`
 }
 
-// PolicyListResponseV1 models the response mesasge for the Policy API list operation.
+// PolicyListResponseV1 models the response message for the Policy API list operation.
 type PolicyListResponseV1 struct {
 	Result []PolicyV1 `json:"result"`
 }
@@ -365,7 +365,7 @@ type CompileRequestV1 struct {
 	Unknowns *[]string    `json:"unknowns"`
 }
 
-// CompileResponseV1 models the response messaage for Compile API operations.
+// CompileResponseV1 models the response message for Compile API operations.
 type CompileResponseV1 struct {
 	Result      *interface{} `json:"result,omitempty"`
 	Explanation TraceV1      `json:"explanation,omitempty"`
@@ -427,7 +427,18 @@ const (
 	// ParamBundleActivationV1 defines the name of the HTTP URL parameter that
 	// indicates the client wants to include bundle activation in the results
 	// of the health API.
+	// Deprecated: Use ParamBundlesActivationV1 instead.
 	ParamBundleActivationV1 = "bundle"
+
+	// ParamBundlesActivationV1 defines the name of the HTTP URL parameter that
+	// indicates the client wants to include bundle activation in the results
+	// of the health API.
+	ParamBundlesActivationV1 = "bundles"
+
+	// ParamPluginsV1 defines the name of the HTTP URL parameter that
+	// indicates the client wants to include bundle status in the results
+	// of the health API.
+	ParamPluginsV1 = "plugins"
 )
 
 // BadRequestErr represents an error condition raised if the caller passes

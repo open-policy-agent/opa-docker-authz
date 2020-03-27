@@ -1,19 +1,22 @@
 {{ $docsHome   := .CurrentSection }}
 {{ $allDocs    := where site.RegularPages "Section" "docs" }}
 {{ $docs       := where $allDocs ".Params.kind" "eq" "documentation" }}
+{{ $kubernetes := where $allDocs ".Params.kind" "eq" "kubernetes" }}
 {{ $tutorials  := where $allDocs ".Params.kind" "eq" "tutorial" }}
-{{ $guides     := where $allDocs ".Params.kind" "eq" "guides" }}
+{{ $operations := where $allDocs ".Params.kind" "eq" "operations" }}
+{{ $misc := where $allDocs ".Params.kind" "eq" "misc" }}
 {{ $pageUrl    := .URL }}
 {{ $isDocsHome := eq .URL $docsHome.URL }}
 {{ $version    := index (split .File.Path "/") 1 }}
-{{ $latest     := index site.Data.releases 0 }}
+{{ $latest     := index site.Data.releases 1 }}
+
 <span class="docs-nav-title">
-  Documentation
+  Core Docs
 </span>
 
 {{ $docsHomeVersion := $version }}
 {{ if or (eq $version $latest) }}
-  {{ $docsHomeVersion = "latest" }}
+{{ $docsHomeVersion = "latest" }}
 {{ end }}
 <a class="docs-nav-item{{ if $isDocsHome }} is-active{{ end }}" href="/docs/{{ $docsHomeVersion }}">
   {{ $docsHome.Name }}
@@ -26,30 +29,20 @@
 {{ end }}
 
 {{ range $docs }}
-  {{ partial "docs/sidenav-link.html" (dict "ctx" . "pageUrl" $pageUrl "version" $version) }}
-{{ end }}
-
-<hr class="docs-nav-hr" />
-
-<span class="docs-nav-title">
-  Tutorials
-</span>
-
-{{ range $tutorials }}
 {{ partial "docs/sidenav-link.html" (dict "ctx" . "pageUrl" $pageUrl "version" $version) }}
 {{ end }}
 
-{{ with $guides }}
-<hr class="docs-nav-hr" />
+{{ partial "docs/sidenav-section.html" ( dict "ctx" . "sectionTitle" "Kubernetes" "section" $kubernetes "pageUrl" $pageUrl "version" $version ) }}
 
-<span class="docs-nav-title">
-  Guides
-</span>
+{{ partial "docs/sidenav-section.html" ( dict "ctx" . "sectionTitle" "Other Use Cases" "section" $tutorials "pageUrl" $pageUrl "version" $version ) }}
 
-{{ range . }}
-{{ partial "docs/sidenav-link.html" (dict "ctx" . "pageUrl" $pageUrl "version" $version) }}
-{{ end }}
-{{ end }}
+{{ partial "docs/sidenav-section.html" ( dict "ctx" . "sectionTitle" "Operations" "section" $operations "pageUrl" $pageUrl "version" $version ) }}
+
+{{ partial "docs/sidenav-section.html" ( dict "ctx" . "sectionTitle" "Miscellaneous" "section" $misc "pageUrl" $pageUrl "version" $version ) }}
+
+<a class="docs-nav-item" href="https://play.openpolicyagent.org/">
+  Rego Playground
+</a>
 
 <hr class="docs-nav-hr" />
 
@@ -60,5 +53,3 @@
 <a class="docs-nav-item" href="https://www.openpolicyagent.org/support.html">
   Enterprise and Commercial
 </a>
-
-

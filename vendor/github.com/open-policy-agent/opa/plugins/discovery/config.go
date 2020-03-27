@@ -16,9 +16,11 @@ import (
 // Config represents the configuration for the discovery feature.
 type Config struct {
 	download.Config         // bundle downloader configuration
-	Name            *string `json:"name"`     // name of the discovery bundle
-	Prefix          *string `json:"prefix"`   // path prefix for downloader
-	Decision        *string `json:"decision"` // the name of the query to run on the bundle to get the config
+	Name            *string `json:"name"`               // name of the discovery bundle
+	Prefix          *string `json:"prefix,omitempty"`   // Deprecated: use `Resource` instead.
+	Decision        *string `json:"decision"`           // the name of the query to run on the bundle to get the config
+	Service         string  `json:"service"`            // the name of the service used to download discovery bundle from
+	Resource        *string `json:"resource,omitempty"` // the resource path which will be downloaded from the service
 
 	service string
 	path    string
@@ -47,14 +49,23 @@ func (c *Config) validateAndInjectDefaults(services []string) error {
 		return fmt.Errorf("missing required discovery.name field")
 	}
 
-	if c.Prefix == nil {
-		s := defaultDiscoveryPathPrefix
-		c.Prefix = &s
+	if c.Resource != nil {
+		c.path = *c.Resource
+	} else {
+		if c.Prefix == nil {
+			s := defaultDiscoveryPathPrefix
+			c.Prefix = &s
+		}
+
+		c.path = fmt.Sprintf("%v/%v", strings.Trim(*c.Prefix, "/"), strings.Trim(*c.Name, "/"))
 	}
 
-	if len(services) != 1 {
-		return fmt.Errorf("discovery requires exactly one service")
+	service, err := c.getServiceFromList(c.Service, services)
+	if err != nil {
+		return fmt.Errorf("invalid configuration for decision service: %s", err.Error())
 	}
+
+	c.service = service
 
 	decision := c.Decision
 
@@ -62,14 +73,26 @@ func (c *Config) validateAndInjectDefaults(services []string) error {
 		decision = c.Name
 	}
 
-	c.service = services[0]
-	c.path = fmt.Sprintf("%v/%v", strings.Trim(*c.Prefix, "/"), strings.Trim(*c.Name, "/"))
 	c.query = fmt.Sprintf("%v.%v", ast.DefaultRootDocument, strings.Replace(strings.Trim(*decision, "/"), "/", ".", -1))
 
 	return c.Config.ValidateAndInjectDefaults()
 }
 
+func (c *Config) getServiceFromList(service string, services []string) (string, error) {
+	if service == "" {
+		if len(services) != 1 {
+			return "", fmt.Errorf("more than one service is defined")
+		}
+		return services[0], nil
+	}
+	for _, svc := range services {
+		if svc == service {
+			return service, nil
+		}
+	}
+	return service, fmt.Errorf("service name %q not found", service)
+}
+
 const (
-	defaultDiscoveryPathPrefix  = "bundles"
-	defaultDiscoveryQueryPrefix = "data"
+	defaultDiscoveryPathPrefix = "bundles"
 )

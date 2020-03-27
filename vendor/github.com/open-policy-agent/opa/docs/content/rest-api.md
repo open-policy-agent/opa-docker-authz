@@ -1,7 +1,7 @@
 ---
 title: REST API
 kind: documentation
-weight: 7
+weight: 80
 restrictedtoc: true
 ---
 
@@ -620,7 +620,7 @@ Create or update a policy module.
 
 If the policy module does not exist, it is created. If the policy module already exists, it is replaced.
 
-### Query Parameters
+#### Query Parameters
 
 - **pretty** - If parameter is `true`, response will formatted for humans.
 - **metrics** - Return compiler performance metrics in addition to result. See [Performance Metrics](#performance-metrics) for more detail.
@@ -640,7 +640,7 @@ PUT /v1/policies/example1 HTTP/1.1
 Content-Type: text/plain
 ```
 
-```ruby
+```live:put_example:module:read_only
 package opa.examples
 
 import data.servers
@@ -710,7 +710,7 @@ Content-Type: application/json
 
 ## Data API
 
-The Data API exposes endpoints for reading and writing documents in OPA. For an introduction to the different types of documents in OPA see [How Does OPA Work?](../how-does-opa-work).
+The Data API exposes endpoints for reading and writing documents in OPA. For an introduction to the different types of documents in OPA see [How Does OPA Work?](../#how-does-opa-work).
 
 ### Get a Document
 
@@ -1033,7 +1033,7 @@ Get a document that requires input.
 
 The path separator is used to access values inside object and array documents. If the path indexes into an array, the server will attempt to convert the array index to an integer. If the path element cannot be converted to an integer, the server will respond with 404.
 
-The request body contains an object that specifies a value for [The input Document](../how-does-opa-work#the-input-document).
+The request body contains an object that specifies a value for [The input Document](../#the-input-document).
 
 #### Request Headers
 
@@ -1076,7 +1076,7 @@ case, the response will not contain a `result` property.
 
 The examples below assume the following policy:
 
-```ruby
+```live:input_exmaple:module:read_only
 package opa.examples
 
 import input.example.flag
@@ -1154,7 +1154,7 @@ Use this API if you are enforcing policy decisions via webhooks that have pre-de
 request/response formats. Note, the API path prefix is `/v0` instead of `/v1`.
 
 The request message body defines the content of the [The input
-Document](../how-does-opa-work#the-input-document). The request message body
+Document](../#the-input-document). The request message body
 may be empty. The path separator is used to access values inside object and
 array documents.
 
@@ -1177,7 +1177,7 @@ If the requested document is missing or undefined, the server will return 404 an
 
 The examples below assume the following policy:
 
-```ruby
+```live:webhook_example:module:read_only
 package opa.examples
 
 import input.example.flag
@@ -1373,14 +1373,14 @@ produce a value for the `/data/system/main` document. You can configure OPA
 to use a different URL path to serve these queries. See the [Configuration Reference](../configuration)
 for more information.
 
-The request message body is mapped to the [Input Document](../how-does-opa-work#the-input-document).
+The request message body is mapped to the [Input Document](../#the-input-document).
 
 ```http
 PUT /v1/policies/example1 HTTP/1.1
 Content-Type: text/plain
 ```
 
-```ruby
+```live:system_example:module:read_only
 package system
 
 main = msg {
@@ -1517,7 +1517,7 @@ Compile API requests contain the following fields:
 
 The example below assumes that OPA has been given the following policy:
 
-```ruby
+```live:compile_example:module:read_only
 package example
 
 allow {
@@ -1609,7 +1609,7 @@ When you partially evaluate a query with the Compile API, OPA returns a new set 
 
 For example, if you extend to policy above to include a "break glass" condition, the decision may be to allow all requests regardless of clearance level.
 
-```ruby
+```live:compile_unconditional_example:module:read_only
 package example
 
 allow {
@@ -1688,7 +1688,7 @@ It is also possible for queries to _never_ be true. For example, the
 original policy could be extended to require that users be granted an
 exception:
 
-```ruby
+```live:compile_unconditional_false_example:module:read_only
 package example
 
 allow {
@@ -2045,16 +2045,19 @@ that the server is operational. Optionally it can account for bundle activation 
 (useful for "ready" checks at startup).
 
 #### Query Parameters
-`bundle` - Boolean parameter to account for bundle activation status in response.
+`bundles` - Boolean parameter to account for bundle activation status in response. This includes
+            any discovery bundles or bundles defined in the loaded discovery configuration.
+`plugins` - Boolean parameter to account for plugin status in response.
 
 #### Status Codes
-- **200** - OPA service is healthy. If `bundle=true` then all configured bundles have
-            been activated.
-- **500** - OPA service is not healthy. If `bundle=true` this can mean any of the configured
-            bundles have not yet been activated.
+- **200** - OPA service is healthy. If the `bundles` option is specified then all configured bundles have
+            been activated. If the `plugins` option is specified then all plugins are in an OK state.
+- **500** - OPA service is not healthy. If the `bundles` option is specified this can mean any of the configured
+            bundles have not yet been activated. If the `plugins` option is specified then at least one
+            plugin is in a non-OK state.
 
-> *Note*: The bundle activation check is only for initial startup. Subsequent downloads
-  will not affect the health check. The [Status](/docs/{{< current_version >}}/status)
+> *Note*: The bundle activation check is only for initial bundle activation. Subsequent downloads
+  will not affect the health check. The [Status](../management/#status)
   API should be used for more fine-grained bundle status monitoring.
 
 #### Example Request
@@ -2064,7 +2067,12 @@ GET /health HTTP/1.1
 
 #### Example Request (bundle activation)
 ```http
-GET /health?bundle=true HTTP/1.1
+GET /health?bundles HTTP/1.1
+```
+
+#### Example Request (plugin status)
+```http
+GET /health?plugins HTTP/1.1
 ```
 
 #### Healthy Response

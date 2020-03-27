@@ -21,6 +21,16 @@ func TestConfigValidation(t *testing.T) {
 			wantErr:  true,
 		},
 		{
+			input:    `{"name": "a/b/c", "service": "service1"}`,
+			services: []string{"service2"},
+			wantErr:  true,
+		},
+		{
+			input:    `{"name": "a/b/c", "service": "service1"}`,
+			services: []string{"service1", "service2"},
+			wantErr:  false,
+		},
+		{
 			input:    `{"name": "a/b/c"}`,
 			services: []string{"service1", "service2"},
 			wantErr:  true,
@@ -84,6 +94,38 @@ func TestConfigDecision(t *testing.T) {
 	}
 }
 
+func TestConfigService(t *testing.T) {
+	tests := []struct {
+		input    string
+		services []string
+		service  string
+	}{
+		{
+			input:    `{"name": "a/b/c"}`,
+			services: []string{"service1"},
+			service:  "service1",
+		},
+		{
+			input:    `{"name": "a/b/c", "service": "service1"}`,
+			services: []string{"service1", "service2"},
+			service:  "service1",
+		},
+	}
+
+	for i, test := range tests {
+		t.Run(fmt.Sprintf("TestConfigService_case_%d", i), func(t *testing.T) {
+			c, err := ParseConfig([]byte(test.input), test.services)
+			if err != nil {
+				t.Fatal("unexpected error while parsing config")
+			}
+
+			if c.service != test.service {
+				t.Fail()
+			}
+		})
+	}
+}
+
 func TestConfigPath(t *testing.T) {
 	tests := []struct {
 		input string
@@ -96,6 +138,14 @@ func TestConfigPath(t *testing.T) {
 		{
 			input: `{"name": "a/b/c"}`,
 			path:  "bundles/a/b/c",
+		},
+		{
+			input: `{"name": "a/b/c/", "resource": "x/y/z"}`,
+			path:  "x/y/z",
+		},
+		{
+			input: `{"name": "a/b/c", "prefix": "/bundles2", resource: "x/y/z"}`,
+			path:  "x/y/z",
 		},
 	}
 

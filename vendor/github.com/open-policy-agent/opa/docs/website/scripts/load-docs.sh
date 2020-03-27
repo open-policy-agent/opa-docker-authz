@@ -2,7 +2,7 @@
 
 set -xe
 
-ORIGINAL_COMMIT=$(git name-rev --name-only HEAD)
+ORIGINAL_COMMIT=$(git symbolic-ref -q --short HEAD || git name-rev --name-only HEAD)
 # If no name can be found "git name-rev" returns
 # "undefined", in which case we'll just use the
 # current commit ID.
@@ -32,8 +32,8 @@ for release in ${ALL_RELEASES}; do
 
     # ignore versions from before we used this static site generator
     if [[ (${CUR_MAJOR_VER} -lt 0) || \
-            (${CUR_MAJOR_VER} -le 0 && ${CUR_MINOR_VER} -lt 10) || \
-            (${CUR_MAJOR_VER} -le 0 && ${CUR_MINOR_VER} -le 10 && ${CUR_PATCH_VER} -le 5) ]]; then
+            (${CUR_MAJOR_VER} -le 0 && ${CUR_MINOR_VER} -lt 11) || \
+            (${CUR_MAJOR_VER} -le 0 && ${CUR_MINOR_VER} -le 10 && ${CUR_PATCH_VER} -le 7) ]]; then
         continue
     fi
 
@@ -87,6 +87,11 @@ rm -rf ${ROOT_DIR}/docs/website/generated/*
 echo "Removing data/releases.yaml file"
 rm -f ${RELEASES_YAML_FILE}
 
+mkdir -p $(dirname ${RELEASES_YAML_FILE})
+
+echo 'Adding "latest" version to releases.yaml'
+echo "- latest" > ${RELEASES_YAML_FILE}
+
 for release in "${RELEASES[@]}"; do
     version_docs_dir=${ROOT_DIR}/docs/website/generated/docs/${release}
 
@@ -104,23 +109,14 @@ for release in "${RELEASES[@]}"; do
     # if we were able to check out the version, otherwise skip it..
     if [[ "${errc}" == "0" ]]; then
         echo "Adding ${release} to releases.yaml"
-        mkdir -p $(dirname ${RELEASES_YAML_FILE})
         echo "- ${release}" >> ${RELEASES_YAML_FILE}
     else
         echo "WARNING: Failed to check out version ${version}!!"
     fi
 
     echo "Copying doc content from tag ${release}"
-    # TODO: Remove this check once we are no longer showing docs for v0.10.7 
-    # or older those releases have the docs content in a different location.
-    if [[ -d "${ROOT_DIR}/docs/content/code/" ]]; then
-        # new location
-        cp -r ${ROOT_DIR}/docs/content/* ${version_docs_dir}/
-    else
-        # old location
-        cp -r ${ROOT_DIR}/docs/content/docs/* ${version_docs_dir}/
-        cp -r ${ROOT_DIR}/docs/code ${version_docs_dir}/
-    fi
+    cp -r ${ROOT_DIR}/docs/content/* ${version_docs_dir}/
+
 done
 
 # Go back to the original tree state
@@ -133,3 +129,6 @@ echo "- edge" >> ${RELEASES_YAML_FILE}
 # Link instead of copy so we don't need to re-generate each time.
 # Use a relative link so it works in a container more easily.
 ln -s ../../../content ${ROOT_DIR}/docs/website/generated/docs/edge
+
+# Create a "latest" version from the latest semver found
+ln -s ${ROOT_DIR}/docs/website/generated/docs/${RELEASES[0]} ${ROOT_DIR}/docs/website/generated/docs/latest

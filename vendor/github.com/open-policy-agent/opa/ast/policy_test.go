@@ -38,6 +38,7 @@ f(x) = y { y = x }
 a = true { xs = {a: b | input.y[a] = "foo"; b = input.z["bar"]} }
 b = true { xs = {{"x": a[i].a} | a[i].n = "bob"; b[x]} }
 call_values { f(x) != g(x) }
+assigned := 1
 `)
 
 	bs, err := json.Marshal(mod)
@@ -56,6 +57,9 @@ call_values { f(x) != g(x) }
 		t.Fatalf("Expected roundtripped module to be equal to original:\nExpected:\n\n%v\n\nGot:\n\n%v\n", mod, roundtrip)
 	}
 
+	if mod.Rules[3].Path().String() != "data.a.b.c.t" {
+		t.Fatal("expected path data.a.b.c.t for 4th rule in module but got:", mod.Rules[3].Path())
+	}
 }
 
 func TestBodyEmptyJSON(t *testing.T) {
@@ -392,12 +396,17 @@ func TestRuleBodyEquals(t *testing.T) {
 	// Different expressions/different order
 	assertRulesNotEqual(t, ruleTrue1, ruleFalse1)
 	assertRulesNotEqual(t, ruleTrueFalse, ruleFalseTrue)
+
+	// Assigned versus not.
+	assigned := ruleTrue1.Copy()
+	assigned.Head.Assign = true
+	assertRulesNotEqual(t, ruleTrue1, assigned)
 }
 
 func TestRuleString(t *testing.T) {
 
 	rule1 := &Rule{
-		Head: NewHead(Var("p")),
+		Head: NewHead(Var("p"), nil, BooleanTerm(true)),
 		Body: NewBody(
 			Equality.Expr(StringTerm("foo"), StringTerm("bar")),
 		),
@@ -429,10 +438,14 @@ func TestRuleString(t *testing.T) {
 		Body: NewBody(Plus.Expr(VarTerm("x"), VarTerm("y"), VarTerm("z"))),
 	}
 
-	assertRuleString(t, rule1, `p { "foo" = "bar" }`)
+	rule5 := rule1.Copy()
+	rule5.Head.Assign = true
+
+	assertRuleString(t, rule1, `p = true { "foo" = "bar" }`)
 	assertRuleString(t, rule2, `p[x] = y { "foo" = x; not a.b[x]; "b" = y }`)
 	assertRuleString(t, rule3, `default p = true`)
 	assertRuleString(t, rule4, "f(x, y) = z { plus(x, y, z) }")
+	assertRuleString(t, rule5, `p := true { "foo" = "bar" }`)
 }
 
 func TestModuleString(t *testing.T) {
@@ -494,7 +507,7 @@ func TestSomeDeclString(t *testing.T) {
 	}
 
 	result := decl.String()
-	expected := "var a, b"
+	expected := "some a, b"
 
 	if result != expected {
 		t.Fatalf("Expected %v but got %v", expected, result)
@@ -502,18 +515,21 @@ func TestSomeDeclString(t *testing.T) {
 }
 
 func assertExprEqual(t *testing.T, a, b *Expr) {
+	t.Helper()
 	if !a.Equal(b) {
 		t.Errorf("Expressions are not equal (expected equal): a=%v b=%v", a, b)
 	}
 }
 
 func assertExprNotEqual(t *testing.T, a, b *Expr) {
+	t.Helper()
 	if a.Equal(b) {
 		t.Errorf("Expressions are equal (expected not equal): a=%v b=%v", a, b)
 	}
 }
 
 func assertExprString(t *testing.T, expr *Expr, expected string) {
+	t.Helper()
 	result := expr.String()
 	if result != expected {
 		t.Errorf("Expected %v but got %v", expected, result)
@@ -521,18 +537,21 @@ func assertExprString(t *testing.T, expr *Expr, expected string) {
 }
 
 func assertImportsEqual(t *testing.T, a, b *Import) {
+	t.Helper()
 	if !a.Equal(b) {
 		t.Errorf("Imports are not equal (expected equal): a=%v b=%v", a, b)
 	}
 }
 
 func assertImportsNotEqual(t *testing.T, a, b *Import) {
+	t.Helper()
 	if a.Equal(b) {
 		t.Errorf("Imports are equal (expected not equal): a=%v b=%v", a, b)
 	}
 }
 
 func assertImportToString(t *testing.T, imp *Import, expected string) {
+	t.Helper()
 	result := imp.String()
 	if result != expected {
 		t.Errorf("Expected %v but got %v", expected, result)
@@ -540,42 +559,49 @@ func assertImportToString(t *testing.T, imp *Import, expected string) {
 }
 
 func assertPackagesEqual(t *testing.T, a, b *Package) {
+	t.Helper()
 	if !a.Equal(b) {
 		t.Errorf("Packages are not equal (expected equal): a=%v b=%v", a, b)
 	}
 }
 
 func assertPackagesNotEqual(t *testing.T, a, b *Package) {
+	t.Helper()
 	if a.Equal(b) {
 		t.Errorf("Packages are not equal (expected not equal): a=%v b=%v", a, b)
 	}
 }
 
 func assertRulesEqual(t *testing.T, a, b *Rule) {
+	t.Helper()
 	if !a.Equal(b) {
 		t.Errorf("Rules are not equal (expected equal): a=%v b=%v", a, b)
 	}
 }
 
 func assertRulesNotEqual(t *testing.T, a, b *Rule) {
+	t.Helper()
 	if a.Equal(b) {
 		t.Errorf("Rules are equal (expected not equal): a=%v b=%v", a, b)
 	}
 }
 
 func assertHeadsEqual(t *testing.T, a, b *Head) {
+	t.Helper()
 	if !a.Equal(b) {
 		t.Errorf("Heads are not equal (expected equal): a=%v b=%v", a, b)
 	}
 }
 
 func assertHeadsNotEqual(t *testing.T, a, b *Head) {
+	t.Helper()
 	if a.Equal(b) {
 		t.Errorf("Heads are equal (expected not equal): a=%v b=%v", a, b)
 	}
 }
 
 func assertRuleString(t *testing.T, rule *Rule, expected string) {
+	t.Helper()
 	result := rule.String()
 	if result != expected {
 		t.Errorf("Expected %v but got %v", expected, result)

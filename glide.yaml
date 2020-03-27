@@ -7,4 +7,4 @@ import:
 - package: github.com/fsnotify/fsnotify
   version: 4da3e2cfbabc9f751898f250b49f2439785783a1
 - package: github.com/open-policy-agent/opa
-  version: v0.13.5
+  version: v0.18.0

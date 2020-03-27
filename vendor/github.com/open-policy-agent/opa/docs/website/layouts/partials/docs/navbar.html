@@ -7,11 +7,12 @@
 {{ $slack     := $social.slack }}
 {{ $docsHome  := .CurrentSection }}
 {{ $allDocs   := where site.RegularPages "Section" "docs" }}
-{{ $docs      := where $allDocs ".Params.kind" "eq" "documentation" }}
-{{ $tutorials := where $allDocs ".Params.kind" "eq" "tutorial" }}
-{{ $guides    := where $allDocs ".Params.kind" "eq" "guides" }}
+{{ $docs       := where $allDocs ".Params.kind" "eq" "core" }}
+{{ $kubernetes := where $allDocs ".Params.kind" "eq" "kubernetes" }}
+{{ $tutorials  := where $allDocs ".Params.kind" "eq" "tutorial" }}
+{{ $operations := where $allDocs ".Params.kind" "eq" "operations" }}
+{{ $misc := where $allDocs ".Params.kind" "eq" "misc" }}
 {{ $version   := index (split .File.Path "/") 1 }}
-{{ $latest    := index site.Data.releases 0 }}
 {{ $pageUrl   := .URL }}
 <nav class="navbar is-primary">
   <div class="navbar-brand is-hidden-tablet">
@@ -37,31 +38,33 @@
       </a>
 
       {{ range $docs }}
-        {{ partial "docs/navbar-link.html" (dict "ctx" . "pageUrl" $pageUrl "version" $version) }}
-      {{ end }}
-
-      <br />
-
-      <span class="navbar-item is-size-5 has-text-weight-light is-uppercase">
-        Tutorials
-      </span>
-
-      {{ range $tutorials }}
-        {{ partial "docs/navbar-link.html" (dict "ctx" . "pageUrl" $pageUrl "version" $version) }}
-      {{ end }}
-
-      <br />
-
-      <span class="navbar-item is-size-5 has-text-weight-light is-uppercase">
-        Guides
-      </span>
-
-      {{ range $guides }}
       {{ partial "docs/navbar-link.html" (dict "ctx" . "pageUrl" $pageUrl "version" $version) }}
       {{ end }}
+
+      {{ partial "docs/navbar-section.html" ( dict "ctx" . "sectionTitle" "Kubernetes" "section" $kubernetes "pageUrl" $pageUrl "version" $version ) }}
+
+      {{ partial "docs/navbar-section.html" ( dict "ctx" . "sectionTitle" "Other Use Cases" "section" $tutorials "pageUrl" $pageUrl "version" $version ) }}
+
+      {{ partial "docs/navbar-section.html" ( dict "ctx" . "sectionTitle" "Operations" "section" $operations "pageUrl" $pageUrl "version" $version ) }}
+
+      {{ partial "docs/navbar-section.html" ( dict "ctx" . "sectionTitle" "Miscellaneous" "section" $misc "pageUrl" $pageUrl "version" $version ) }}
+
     </div>
 
     <div class="navbar-end">
+      <!--
+      <div class="navbar-item">
+        <div class="field">
+          <p class="control is-expanded has-icons-right">
+            <input class="input" type="search" placeholder="Search...">
+            <span class="icon is-small is-right">
+              <icon />
+            </span>
+          </p>
+        </div>
+      </div>
+      -->
+
       <div class="navbar-item">
         <div class="buttons">
           <a class="button is-primary" href="{{ $github }}" target="_blank">
@@ -94,6 +97,15 @@
 
   <div class="navbar-menu">
     <div class="navbar-end">
+      <div class="navbar-item">
+        <p class="control has-icons-right">
+          <input class="input" type="search" id="search-bar" placeholder="Search...">
+          <span class="icon is-small is-right">
+            <icon />
+          </span>
+        </p>
+      </div>
+
       <a class="navbar-item" href="{{ $github }}" target="_blank">
         <span class="icon has-text-white-bis">
           <i class="fab fa-github"></i>

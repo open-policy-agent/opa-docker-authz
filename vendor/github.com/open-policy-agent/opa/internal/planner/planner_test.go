@@ -146,6 +146,55 @@ func TestPlannerHelloWorld(t *testing.T) {
 				q = 2 { false }
 			`},
 		},
+		{
+			note:    "comprehension",
+			queries: []string{`{x | input[_] = x}`},
+		},
+		{
+			note:    "closure",
+			queries: []string{`a = [1]; {x | a[_] = x}`},
+		},
+		{
+			note:    "iteration: packages and rules",
+			queries: []string{"data.test[x][y] = 3"},
+			modules: []string{
+				`
+					package test.a
+
+					p = 1
+					q = 2 { false }
+					r = 3
+				`,
+				`
+					package test.z
+
+					s = 3
+					t = 4
+				`,
+			},
+		},
+		{
+			note:    "variables in query",
+			queries: []string{"x = 1", "y = 2", "x = 1; y = 2"},
+		},
+		{
+			note: "with keyword",
+			queries: []string{
+				`input[i] = 1 with input as [1]; i > 1`,
+			},
+		},
+		{
+			note:    "with keyword data",
+			queries: []string{`data = x with data.foo as 1 with data.bar.r as 3`},
+			modules: []string{
+				`package foo
+
+				p = 1`,
+				`package bar
+
+				q = 2`,
+			},
+		},
 	}
 
 	for _, tc := range tests {

@@ -10,15 +10,19 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"strings"
 	"sync"
+	"time"
+
+	"github.com/sirupsen/logrus"
+
+	"github.com/open-policy-agent/opa/metrics"
 
 	"github.com/open-policy-agent/opa/ast"
+
 	"github.com/open-policy-agent/opa/bundle"
 	"github.com/open-policy-agent/opa/download"
 	"github.com/open-policy-agent/opa/plugins"
 	"github.com/open-policy-agent/opa/storage"
-	"github.com/sirupsen/logrus"
 )
 
 // Plugin implements bundle activation.
@@ -33,6 +37,7 @@ type Plugin struct {
 	mtx           sync.Mutex
 	cfgMtx        sync.Mutex
 	legacyConfig  bool
+	ready         bool
 }
 
 // New returns a new Plugin with the given config.
@@ -50,8 +55,10 @@ func New(parsedConfig *Config, manager *plugins.Manager) *Plugin {
 		status:      initialStatus,
 		downloaders: make(map[string]*download.Downloader),
 		etags:       make(map[string]string),
+		ready:       false,
 	}
-	p.initDownloaders()
+
+	manager.UpdatePluginStatus(Name, &plugins.Status{State: plugins.StateNotReady})
 	return p
 }
 
@@ -72,6 +79,7 @@ func Lookup(manager *plugins.Manager) *Plugin {
 func (p *Plugin) Start(ctx context.Context) error {
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
+	p.initDownloaders()
 	for name, dl := range p.downloaders {
 		p.logInfo(name, "Starting bundle downloader.")
 		dl.Start(ctx)
@@ -138,12 +146,16 @@ func (p *Plugin) Reconfigure(ctx context.Context, config interface{}) {
 	params := storage.WriteParams
 	params.Context = storage.NewContext()
 	err := storage.Txn(ctx, p.manager.Store, params, func(txn storage.Transaction) error {
-		for name := range deletedBundles {
-			_, err := p.deactivate(ctx, txn, name, nil)
-			if err != nil {
-				p.logError(name, "Failed to deactivate bundle: %s", err)
-				return err
-			}
+		opts := &bundle.DeactivateOpts{
+			Ctx:         ctx,
+			Store:       p.manager.Store,
+			Txn:         txn,
+			BundleNames: deletedBundles,
+		}
+		err := bundle.Deactivate(opts)
+		if err != nil {
+			p.logError(fmt.Sprint(deletedBundles), "Failed to deactivate bundles: %s", err)
+			return err
 		}
 		return nil
 	})
@@ -152,6 +164,8 @@ func (p *Plugin) Reconfigure(ctx context.Context, config interface{}) {
 		// continue in a potentially inconsistent state.
 		panic(errors.New("Unable deactivate bundle: " + err.Error()))
 	}
+
+	readyNow := p.ready
 
 	for name, source := range p.config.Bundles {
 		_, updated := updatedBundles[name]
@@ -166,8 +180,15 @@ func (p *Plugin) Reconfigure(ctx context.Context, config interface{}) {
 			}
 			p.downloaders[name] = p.newDownloader(name, source)
 			p.downloaders[name].Start(ctx)
+			readyNow = false
 		}
 	}
+
+	if !readyNow {
+		p.ready = false
+		p.manager.UpdatePluginStatus(Name, &plugins.Status{State: plugins.StateNotReady})
+	}
+
 }
 
 // Register a listener to receive status updates. The name must be comparable.
@@ -245,11 +266,27 @@ func (p *Plugin) oneShot(ctx context.Context, name string, u download.Update) {
 	}
 
 	for _, listener := range p.bulkListeners {
-		listener(p.status)
+		// Send a copy of the full status map to the bulk listeners.
+		// They shouldn't have access to the original underlying
+		// map, primarily for thread safety issues with modifications
+		// made to it.
+		statusCpy := map[string]*Status{}
+		for k, v := range p.status {
+			statusCpy[k] = v
+		}
+		listener(statusCpy)
 	}
 }
 
 func (p *Plugin) process(ctx context.Context, name string, u download.Update) {
+
+	if u.Metrics != nil {
+		p.status[name].Metrics = u.Metrics
+	} else {
+		p.status[name].Metrics = metrics.New()
+	}
+
+	p.status[name].SetRequest()
 
 	if u.Error != nil {
 		p.logError(name, "Bundle download failed: %v", u.Error)
@@ -257,8 +294,13 @@ func (p *Plugin) process(ctx context.Context, name string, u download.Update) {
 		return
 	}
 
+	p.status[name].LastSuccessfulRequest = p.status[name].LastRequest
+
 	if u.Bundle != nil {
-		p.status[name].SetDownloadSuccess()
+		p.status[name].LastSuccessfulDownload = p.status[name].LastSuccessfulRequest
+
+		p.status[name].Metrics.Timer(metrics.RegoLoadBundles).Start()
+		defer p.status[name].Metrics.Timer(metrics.RegoLoadBundles).Stop()
 
 		if err := p.activate(ctx, name, u.Bundle); err != nil {
 			p.logError(name, "Bundle activation failed: %v", err)
@@ -274,6 +316,23 @@ func (p *Plugin) process(ctx context.Context, name string, u download.Update) {
 			p.logInfo(name, "Bundle downloaded and activated successfully.")
 		}
 		p.etags[name] = u.ETag
+
+		// If the plugin wasn't ready yet then check if we are now after activating this bundle.
+		if !p.ready {
+			readyNow := true // optimistically
+			for _, status := range p.status {
+				if len(status.Errors) > 0 || (status.LastSuccessfulActivation == time.Time{}) {
+					readyNow = false // Not ready yet, check again on next bundle activation.
+					break
+				}
+			}
+
+			if readyNow {
+				p.ready = true
+				p.manager.UpdatePluginStatus(Name, &plugins.Status{State: plugins.StateOK})
+			}
+
+		}
 		return
 	}
 
@@ -290,196 +349,37 @@ func (p *Plugin) activate(ctx context.Context, name string, b *bundle.Bundle) er
 	params := storage.WriteParams
 	params.Context = storage.NewContext()
 
-	return storage.Txn(ctx, p.manager.Store, params, func(txn storage.Transaction) error {
+	err := storage.Txn(ctx, p.manager.Store, params, func(txn storage.Transaction) error {
 		p.logDebug(name, "Opened storage transaction (%v).", txn.ID())
 		defer p.logDebug(name, "Closing storage transaction (%v).", txn.ID())
 
-		// Erase data at new roots to prepare for writing the new data
-		newRoots := map[string]struct{}{}
+		// Compile the bundle modules with a new compiler and set it on the
+		// transaction params for use by onCommit hooks.
+		compiler := ast.NewCompiler().WithPathConflictsCheck(storage.NonEmpty(ctx, p.manager.Store, txn))
 
-		if b.Manifest.Roots != nil {
-			for _, root := range *b.Manifest.Roots {
-				newRoots[root] = struct{}{}
-			}
+		var activateErr error
+
+		opts := &bundle.ActivateOpts{
+			Ctx:      ctx,
+			Store:    p.manager.Store,
+			Txn:      txn,
+			Compiler: compiler,
+			Metrics:  p.status[name].Metrics,
+			Bundles:  map[string]*bundle.Bundle{name: b},
 		}
 
-		// Before changing anything make sure the roots don't collide with any
-		// other bundles that already are activated.
-		err := p.hasRootsOverlap(ctx, txn, name, newRoots)
-		if err != nil {
-			return err
-		}
-
-		// Erase data and policies at new + old roots, and remove the old
-		// manifest before activating a new bundle.
-		remaining, err := p.deactivate(ctx, txn, name, newRoots)
-		if err != nil {
-			return err
-		}
-
-		// Write data from new bundle into store. Only write under the
-		// roots contained in the manifest.
-		if err := p.writeData(ctx, txn, *b.Manifest.Roots, b.Data); err != nil {
-			return err
-		}
-
-		compiler, err := p.writeModules(ctx, txn, b.Modules, remaining)
-		if err != nil {
-			return err
-		}
-
-		// Always write manifests to the named location. If the plugin is in the older style config
-		// then also write to the old legacy unnamed location.
-		if err := bundle.WriteManifestToStore(ctx, p.manager.Store, txn, name, b.Manifest); err != nil {
-			return err
-		}
-		if !p.config.IsMultiBundle() {
-			if err := bundle.LegacyWriteManifestToStore(ctx, p.manager.Store, txn, b.Manifest); err != nil {
-				return err
-			}
+		if p.config.IsMultiBundle() {
+			activateErr = bundle.Activate(opts)
+		} else {
+			activateErr = bundle.ActivateLegacy(opts)
 		}
 
 		plugins.SetCompilerOnContext(params.Context, compiler)
 
-		return nil
+		return activateErr
 	})
-}
 
-// deactivate a bundle by name. This will clear all policies and data at its roots and remove its
-// manifest from storage. If additionalRoots are provided they will be deleted along with the
-// roots found in storage for the bundle.
-func (p *Plugin) deactivate(ctx context.Context, txn storage.Transaction, name string, additionalRoots map[string]struct{}) (map[string]*ast.Module, error) {
-	erase := additionalRoots
-	if erase == nil {
-		erase = map[string]struct{}{}
-	}
-
-	if roots, err := bundle.ReadBundleRootsFromStore(ctx, p.manager.Store, txn, name); err == nil {
-		for _, root := range roots {
-			erase[root] = struct{}{}
-		}
-	} else if !storage.IsNotFound(err) {
-		return nil, err
-	}
-
-	p.logDebug(name, "Erasing data and polices with roots at %+v", erase)
-
-	if err := p.eraseData(ctx, txn, erase); err != nil {
-		return nil, err
-	}
-
-	remaining, err := p.erasePolicies(ctx, txn, erase)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := bundle.EraseManifestFromStore(ctx, p.manager.Store, txn, name); err != nil && !storage.IsNotFound(err) {
-		return nil, err
-	}
-
-	if err := bundle.LegacyEraseManifestFromStore(ctx, p.manager.Store, txn); err != nil && !storage.IsNotFound(err) {
-		return nil, err
-	}
-
-	return remaining, nil
-}
-
-func (p *Plugin) eraseData(ctx context.Context, txn storage.Transaction, roots map[string]struct{}) error {
-	for root := range roots {
-		path, ok := storage.ParsePathEscaped("/" + root)
-		if !ok {
-			return fmt.Errorf("manifest root path invalid: %v", root)
-		}
-		if len(path) > 0 {
-			if err := p.manager.Store.Write(ctx, txn, storage.RemoveOp, path, nil); err != nil {
-				if !storage.IsNotFound(err) {
-					return err
-				}
-			}
-		}
-	}
-	return nil
-}
-
-func (p *Plugin) erasePolicies(ctx context.Context, txn storage.Transaction, roots map[string]struct{}) (map[string]*ast.Module, error) {
-
-	ids, err := p.manager.Store.ListPolicies(ctx, txn)
-	if err != nil {
-		return nil, err
-	}
-
-	remaining := map[string]*ast.Module{}
-
-	for _, id := range ids {
-		bs, err := p.manager.Store.GetPolicy(ctx, txn, id)
-		if err != nil {
-			return nil, err
-		}
-		module, err := ast.ParseModule(id, string(bs))
-		if err != nil {
-			return nil, err
-		}
-		path, err := module.Package.Path.Ptr()
-		if err != nil {
-			return nil, err
-		}
-		deleted := false
-		for root := range roots {
-			if strings.HasPrefix(path, root) {
-				if err := p.manager.Store.DeletePolicy(ctx, txn, id); err != nil {
-					return nil, err
-				}
-				deleted = true
-				break
-			}
-		}
-		if !deleted {
-			remaining[id] = module
-		}
-	}
-
-	return remaining, nil
-}
-
-func (p *Plugin) writeData(ctx context.Context, txn storage.Transaction, roots []string, data map[string]interface{}) error {
-	for _, root := range roots {
-		path, ok := storage.ParsePathEscaped("/" + root)
-		if !ok {
-			return fmt.Errorf("manifest root path invalid: %v", root)
-		}
-		if value, ok := lookup(path, data); ok {
-			if len(path) > 0 {
-				if err := storage.MakeDir(ctx, p.manager.Store, txn, path[:len(path)-1]); err != nil {
-					return err
-				}
-			}
-			if err := p.manager.Store.Write(ctx, txn, storage.AddOp, path, value); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func (p *Plugin) writeModules(ctx context.Context, txn storage.Transaction, files []bundle.ModuleFile, remaining map[string]*ast.Module) (*ast.Compiler, error) {
-	modules := map[string]*ast.Module{}
-	for name, module := range remaining {
-		modules[name] = module
-	}
-	for _, file := range files {
-		modules[file.Path] = file.Parsed
-	}
-	compiler := ast.NewCompiler().
-		WithPathConflictsCheck(storage.NonEmpty(ctx, p.manager.Store, txn))
-	if compiler.Compile(modules); compiler.Failed() {
-		return nil, compiler.Errors
-	}
-	for _, file := range files {
-		if err := p.manager.Store.UpsertPolicy(ctx, txn, file.Path, file.Raw); err != nil {
-			return nil, err
-		}
-	}
-	return compiler, nil
+	return err
 }
 
 func (p *Plugin) logError(bundleName string, fmt string, a ...interface{}) {
@@ -525,58 +425,4 @@ func (p *Plugin) configDelta(newConfig *Config) (map[string]*Source, map[string]
 	}
 
 	return newBundles, updatedBundles, deletedBundles
-}
-
-func (p *Plugin) hasRootsOverlap(ctx context.Context, txn storage.Transaction, bundleName string, bundleRoots map[string]struct{}) error {
-	collisions := map[string][]string{}
-	allBundles, err := bundle.ReadBundleNamesFromStore(ctx, p.manager.Store, txn)
-	if err != nil && !storage.IsNotFound(err) {
-		return err
-	}
-	for _, otherBundle := range allBundles {
-		if otherBundle == bundleName {
-			// ignore the bundle we are in the process of activating
-			continue
-		}
-		otherRoots, err := bundle.ReadBundleRootsFromStore(ctx, p.manager.Store, txn, otherBundle)
-		if err != nil && !storage.IsNotFound(err) {
-			return err
-		}
-		for _, existingRoot := range otherRoots {
-			for newRoot := range bundleRoots {
-				if strings.HasPrefix(newRoot, existingRoot) || strings.HasPrefix(existingRoot, newRoot) {
-					collisions[otherBundle] = append(collisions[otherBundle], newRoot)
-				}
-			}
-		}
-	}
-
-	if len(collisions) > 0 {
-		var bundleNames []string
-		for name := range collisions {
-			bundleNames = append(bundleNames, name)
-		}
-		p.logDebug(bundleName, fmt.Sprintf("bundle root collisions: %+v", collisions))
-		return fmt.Errorf("detected overlapping roots in bundle manifest with: %s", bundleNames)
-	}
-	return nil
-}
-
-func lookup(path storage.Path, data map[string]interface{}) (interface{}, bool) {
-	if len(path) == 0 {
-		return data, true
-	}
-	for i := 0; i < len(path)-1; i++ {
-		value, ok := data[path[i]]
-		if !ok {
-			return nil, false
-		}
-		obj, ok := value.(map[string]interface{})
-		if !ok {
-			return nil, false
-		}
-		data = obj
-	}
-	value, ok := data[path[len(path)-1]]
-	return value, ok
 }

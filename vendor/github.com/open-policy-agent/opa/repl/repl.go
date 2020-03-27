@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/peterh/liner"
+
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/format"
 	pr "github.com/open-policy-agent/opa/internal/presentation"
@@ -25,7 +27,6 @@ import (
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/topdown"
 	"github.com/open-policy-agent/opa/topdown/lineage"
-	"github.com/peterh/liner"
 )
 
 // REPL represents an instance of the interactive shell.
@@ -482,18 +483,27 @@ func (r *REPL) cmdTypes() error {
 	return nil
 }
 
+var errUnknownUsage = fmt.Errorf("usage: unknown <input/data reference> [<input/data reference> [...]] (hint: try 'input')")
+
 func (r *REPL) cmdUnknown(s []string) error {
+
 	if len(s) == 0 && len(r.unknowns) == 0 {
-		return fmt.Errorf("usage: unknown <unknown-1> [<unknown-2> [...]] (hint: try just 'input')")
+		return errUnknownUsage
 	}
-	r.unknowns = make([]*ast.Term, len(s))
-	for i := range r.unknowns {
+
+	unknowns := make([]*ast.Term, len(s))
+
+	for i := range unknowns {
+
 		ref, err := ast.ParseRef(s[i])
 		if err != nil {
-			return err
+			return errUnknownUsage
 		}
-		r.unknowns[i] = ast.NewTerm(ref)
+
+		unknowns[i] = ast.NewTerm(ref)
 	}
+
+	r.unknowns = unknowns
 	return nil
 }
 
@@ -610,10 +620,13 @@ func (r *REPL) compileBody(ctx context.Context, compiler *ast.Compiler, body ast
 	return body, qc.TypeEnv(), err
 }
 
-func (r *REPL) compileRule(ctx context.Context, rule *ast.Rule, unset bool) error {
+func (r *REPL) compileRule(ctx context.Context, rule *ast.Rule) error {
 
-	if unset {
-		_, err := r.unsetRule(ctx, rule.Head.Name)
+	var unset bool
+
+	if rule.Head.Assign {
+		var err error
+		unset, err = r.unsetRule(ctx, rule.Head.Name)
 		if err != nil {
 			return err
 		}
@@ -810,7 +823,7 @@ func (r *REPL) evalStatement(ctx context.Context, stmt interface{}) error {
 
 		return err
 	case *ast.Rule:
-		return r.compileRule(ctx, stmt, false)
+		return r.compileRule(ctx, stmt)
 	case *ast.Import:
 		return r.evalImport(ctx, stmt)
 	case *ast.Package:
@@ -851,7 +864,7 @@ func (r *REPL) evalBody(ctx context.Context, compiler *ast.Compiler, input ast.V
 	rs, err := eval.Eval(ctx)
 
 	output := pr.Output{
-		Error:   err,
+		Errors:  pr.NewOutputErrors(err),
 		Result:  rs,
 		Metrics: r.metrics,
 	}
@@ -907,7 +920,7 @@ func (r *REPL) evalPartial(ctx context.Context, compiler *ast.Compiler, input as
 	output := pr.Output{
 		Metrics: r.metrics,
 		Partial: pq,
-		Error:   err,
+		Errors:  pr.NewOutputErrors(err),
 	}
 
 	switch r.explain {
@@ -991,9 +1004,9 @@ func (r *REPL) interpretAsRule(ctx context.Context, compiler *ast.Compiler, body
 	}
 
 	if expr.IsAssignment() {
-		rule, err := ast.ParseCompleteDocRuleFromEqExpr(r.getCurrentOrDefaultModule(), expr.Operand(0), expr.Operand(1))
+		rule, err := ast.ParseCompleteDocRuleFromAssignmentExpr(r.getCurrentOrDefaultModule(), expr.Operand(0), expr.Operand(1))
 		if err == nil {
-			if err := r.compileRule(ctx, rule, expr.IsAssignment()); err != nil {
+			if err := r.compileRule(ctx, rule); err != nil {
 				return false, err
 			}
 		}
@@ -1010,7 +1023,7 @@ func (r *REPL) interpretAsRule(ctx context.Context, compiler *ast.Compiler, body
 
 	rule, err := ast.ParseCompleteDocRuleFromEqExpr(r.getCurrentOrDefaultModule(), expr.Operand(0), expr.Operand(1))
 	if err == nil {
-		if err := r.compileRule(ctx, rule, expr.IsAssignment()); err != nil {
+		if err := r.compileRule(ctx, rule); err != nil {
 			return false, err
 		}
 	}
@@ -1069,7 +1082,7 @@ func (r *REPL) printTypes(ctx context.Context, typeEnv *ast.TypeEnv, body ast.Bo
 		SkipRefHead: true,
 	})
 
-	ast.Walk(vis, body)
+	vis.Walk(body)
 
 	for v := range vis.Vars() {
 		fmt.Fprintf(r.output, "# %v: %v\n", v, typeEnv.Get(v))
@@ -1116,7 +1129,7 @@ var extra = [...]commandDesc{
 var builtin = [...]commandDesc{
 	{"show", []string{""}, "show active module definition"},
 	{"show debug", []string{""}, "show REPL settings"},
-	{"unset", []string{"<var>"}, "undefine rules in currently active module"},
+	{"unset", []string{"<var>"}, "unset rules in currently active module"},
 	{"json", []string{}, "set output format to JSON"},
 	{"pretty", []string{}, "set output format to pretty"},
 	{"pretty-limit", []string{}, "set pretty value output limit"},
@@ -1176,18 +1189,23 @@ func dumpStorage(ctx context.Context, store storage.Store, txn storage.Transacti
 
 func isGlobalInModule(compiler *ast.Compiler, module *ast.Module, term *ast.Term) bool {
 
-	v, ok := term.Value.(ast.Var)
-	if !ok {
+	var name ast.Var
+
+	if ast.RootDocumentRefs.Contains(term) {
+		name = term.Value.(ast.Ref)[0].Value.(ast.Var)
+	} else if v, ok := term.Value.(ast.Var); ok {
+		name = v
+	} else {
 		return false
 	}
 
 	for _, imp := range module.Imports {
-		if imp.Name().Compare(v) == 0 {
+		if imp.Name().Compare(name) == 0 {
 			return true
 		}
 	}
 
-	path := module.Package.Path.Copy().Append(ast.StringTerm(string(v)))
+	path := module.Package.Path.Copy().Append(ast.StringTerm(string(name)))
 	node := compiler.RuleTree
 
 	for _, elem := range path {

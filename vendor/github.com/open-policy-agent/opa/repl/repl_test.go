@@ -549,6 +549,26 @@ func TestUnknownJSON(t *testing.T) {
 	}
 }
 
+func TestUnknownInvalid(t *testing.T) {
+	ctx := context.Background()
+	store := inmem.New()
+	var buffer bytes.Buffer
+	repl := newRepl(store, &buffer)
+
+	err := repl.OneShot(ctx, "unknown x-1")
+	if err == nil || !strings.Contains(err.Error(), "usage: unknown <input/data reference>") {
+		t.Fatal("expected error from setting bad unknown but got:", err)
+	}
+
+	// Ensure that partial evaluation has not been enabled.
+	buffer.Reset()
+	repl.OneShot(ctx, "1+2")
+	result := strings.TrimSpace(buffer.String())
+	if result != "3" {
+		t.Fatal("want true but got:", result)
+	}
+}
+
 func TestUnset(t *testing.T) {
 	ctx := context.Background()
 	store := inmem.New()
@@ -887,6 +907,20 @@ func TestEvalConstantRule(t *testing.T) {
 	}
 }
 
+func TestEvalConstantRuleDefaultRootDoc(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore()
+	var buffer bytes.Buffer
+	repl := newRepl(store, &buffer)
+	repl.OneShot(ctx, "input = 1")
+	buffer.Reset()
+	repl.OneShot(ctx, "input = 2")
+	assertREPLText(t, buffer, "undefined\n")
+	buffer.Reset()
+	repl.OneShot(ctx, "input = 1")
+	assertREPLText(t, buffer, "true\n")
+}
+
 func TestEvalConstantRuleAssignment(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore()
@@ -904,6 +938,14 @@ func TestEvalConstantRuleAssignment(t *testing.T) {
 	repl.OneShot(ctx, "x := 2")
 	assertREPLText(t, buffer, redefined)
 	buffer.Reset()
+
+	repl.OneShot(ctx, "show")
+	assertREPLText(t, buffer, `package repl
+
+x := 2
+`)
+	buffer.Reset()
+
 	repl.OneShot(ctx, "x := 3")
 	assertREPLText(t, buffer, redefined)
 	buffer.Reset()
@@ -1945,28 +1987,28 @@ func TestEvalTrace(t *testing.T) {
 	repl.OneShot(ctx, "trace")
 	repl.OneShot(ctx, `data.a[i].b.c[j] = x; data.a[k].b.c[x] = 1`)
 	expected := strings.TrimSpace(`
-Enter data.a[i].b.c[j] = x; data.a[k].b.c[x] = 1
-| Eval data.a[i].b.c[j] = x
-| Eval data.a[k].b.c[x] = 1
-| Fail data.a[k].b.c[x] = 1
-| Redo data.a[i].b.c[j] = x
-| Eval data.a[k].b.c[x] = 1
-| Exit data.a[i].b.c[j] = x; data.a[k].b.c[x] = 1
-Redo data.a[i].b.c[j] = x; data.a[k].b.c[x] = 1
-| Redo data.a[k].b.c[x] = 1
-| Redo data.a[i].b.c[j] = x
-| Eval data.a[k].b.c[x] = 1
-| Fail data.a[k].b.c[x] = 1
-| Redo data.a[i].b.c[j] = x
-| Eval data.a[k].b.c[x] = 1
-| Fail data.a[k].b.c[x] = 1
-| Redo data.a[i].b.c[j] = x
-| Eval data.a[k].b.c[x] = 1
-| Fail data.a[k].b.c[x] = 1
-| Redo data.a[i].b.c[j] = x
-| Eval data.a[k].b.c[x] = 1
-| Fail data.a[k].b.c[x] = 1
-| Redo data.a[i].b.c[j] = x
+query:1             Enter data.a[i].b.c[j] = x; data.a[k].b.c[x] = 1
+query:1             | Eval data.a[i].b.c[j] = x
+query:1             | Eval data.a[k].b.c[x] = 1
+query:1             | Fail data.a[k].b.c[x] = 1
+query:1             | Redo data.a[i].b.c[j] = x
+query:1             | Eval data.a[k].b.c[x] = 1
+query:1             | Exit data.a[i].b.c[j] = x; data.a[k].b.c[x] = 1
+query:1             Redo data.a[i].b.c[j] = x; data.a[k].b.c[x] = 1
+query:1             | Redo data.a[k].b.c[x] = 1
+query:1             | Redo data.a[i].b.c[j] = x
+query:1             | Eval data.a[k].b.c[x] = 1
+query:1             | Fail data.a[k].b.c[x] = 1
+query:1             | Redo data.a[i].b.c[j] = x
+query:1             | Eval data.a[k].b.c[x] = 1
+query:1             | Fail data.a[k].b.c[x] = 1
+query:1             | Redo data.a[i].b.c[j] = x
+query:1             | Eval data.a[k].b.c[x] = 1
+query:1             | Fail data.a[k].b.c[x] = 1
+query:1             | Redo data.a[i].b.c[j] = x
+query:1             | Eval data.a[k].b.c[x] = 1
+query:1             | Fail data.a[k].b.c[x] = 1
+query:1             | Redo data.a[i].b.c[j] = x
 +---+---+---+---+
 | i | j | k | x |
 +---+---+---+---+
@@ -1988,12 +2030,12 @@ func TestEvalNotes(t *testing.T) {
 	repl.OneShot(ctx, "notes")
 	buffer.Reset()
 	repl.OneShot(ctx, "p")
-	expected := strings.TrimSpace(`Enter data.repl.p = _
-| Enter data.repl.p
-| | Note "x = 2"
-Redo data.repl.p = _
-| Redo data.repl.p
-| | Note "x = 3"
+	expected := strings.TrimSpace(`query:1             Enter data.repl.p = _
+query:1             | Enter data.repl.p
+note                | | Note "x = 2"
+query:1             Redo data.repl.p = _
+query:1             | Redo data.repl.p
+note                | | Note "x = 3"
 true`)
 	expected += "\n"
 	if expected != buffer.String() {
