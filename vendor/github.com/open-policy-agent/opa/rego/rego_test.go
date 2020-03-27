@@ -13,15 +13,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/open-policy-agent/opa/internal/storage/mock"
-
 	"github.com/open-policy-agent/opa/ast"
+	"github.com/open-policy-agent/opa/bundle"
+	"github.com/open-policy-agent/opa/internal/storage/mock"
 	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/storage/inmem"
 	"github.com/open-policy-agent/opa/topdown"
 	"github.com/open-policy-agent/opa/types"
 	"github.com/open-policy-agent/opa/util"
+	"github.com/open-policy-agent/opa/util/test"
 )
 
 func assertEval(t *testing.T, r *Rego, expected string) {
@@ -242,19 +243,91 @@ func TestRegoMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	exp := []string{
+	validateRegoMetrics(t, m, []string{
 		"timer_rego_query_parse_ns",
 		"timer_rego_query_eval_ns",
 		"timer_rego_query_compile_ns",
 		"timer_rego_module_parse_ns",
 		"timer_rego_module_compile_ns",
+	})
+}
+
+func TestPreparedRegoMetrics(t *testing.T) {
+	m := metrics.New()
+	r := New(Query("foo = 1"), Module("foo.rego", "package x"), Metrics(m))
+	ctx := context.Background()
+	pq, err := r.PrepareForEval(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
+
+	_, err = pq.Eval(ctx, EvalMetrics(m))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	validateRegoMetrics(t, m, []string{
+		"timer_rego_query_parse_ns",
+		"timer_rego_query_eval_ns",
+		"timer_rego_query_compile_ns",
+		"timer_rego_module_parse_ns",
+		"timer_rego_module_compile_ns",
+	})
+}
+
+func TestPreparedRegoMetricsPrepareOnly(t *testing.T) {
+	m := metrics.New()
+	r := New(Query("foo = 1"), Module("foo.rego", "package x"), Metrics(m))
+	ctx := context.Background()
+	pq, err := r.PrepareForEval(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = pq.Eval(ctx) // No EvalMetrics() passed in
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	validateRegoMetrics(t, m, []string{
+		"timer_rego_query_parse_ns",
+		"timer_rego_query_compile_ns",
+		"timer_rego_module_parse_ns",
+		"timer_rego_module_compile_ns",
+	})
+}
+
+func TestPreparedRegoMetricsEvalOnly(t *testing.T) {
+	m := metrics.New()
+	r := New(Query("foo = 1"), Module("foo.rego", "package x")) // No Metrics() passed in
+	ctx := context.Background()
+	pq, err := r.PrepareForEval(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = pq.Eval(ctx, EvalMetrics(m))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	validateRegoMetrics(t, m, []string{
+		"timer_rego_query_eval_ns",
+	})
+}
+
+func validateRegoMetrics(t *testing.T, m metrics.Metrics, expectedFields []string) {
+	t.Helper()
 
 	all := m.All()
 
-	for _, name := range exp {
-		if _, ok := all[name]; !ok {
+	for _, name := range expectedFields {
+		value, ok := all[name]
+		if !ok {
 			t.Errorf("expected to find %v but did not", name)
+		}
+		if value.(int64) == 0 {
+			t.Errorf("expected metric %v to have some non-zero value, but found 0", name)
 		}
 	}
 }
@@ -277,6 +350,45 @@ func TestRegoInstrumentExtraEvalCompilerStage(t *testing.T) {
 	for _, name := range exp {
 		if _, ok := all[name]; !ok {
 			t.Errorf("expected to find %v but did not", name)
+		}
+	}
+}
+
+func TestPreparedRegoInstrumentExtraEvalCompilerStage(t *testing.T) {
+	m := metrics.New()
+	r := New(Query("foo = 1"), Module("foo.rego", "package x"), Metrics(m), Instrument(true))
+	ctx := context.Background()
+	pq, err := r.PrepareForEval(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// No metrics flag is passed in, should not affect results for compiler stage
+	// but expect to turn off instrumentation for evaluation.
+	_, err = pq.Eval(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	exp := []string{
+		"timer_query_compile_stage_rewrite_to_capture_value_ns",
+	}
+
+	nExp := []string{
+		"timer_eval_op_plug_ns", // We should *not* see the eval timers
+	}
+
+	all := m.All()
+
+	for _, name := range exp {
+		if _, ok := all[name]; !ok {
+			t.Errorf("expected to find %v but did not", name)
+		}
+	}
+
+	for _, name := range nExp {
+		if _, ok := all[name]; ok {
+			t.Errorf("did not expect to find %v", name)
 		}
 	}
 }
@@ -321,6 +433,91 @@ func TestRegoInstrumentExtraPartialResultCompilerStage(t *testing.T) {
 	for _, name := range exp {
 		if _, ok := all[name]; !ok {
 			t.Errorf("Expected to find '%v' in metrics\n\nActual:\n %+v", name, all)
+		}
+	}
+}
+
+func TestPreparedRegoTracerNoPropagate(t *testing.T) {
+	tracer := topdown.NewBufferTracer()
+	mod := `
+	package test
+
+	p = {
+		input.x == 10
+	}
+	`
+	pq, err := New(
+		Query("data"),
+		Module("foo.rego", mod),
+		Tracer(tracer),
+		Input(map[string]interface{}{"x": 10})).PrepareForEval(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error %s", err)
+	}
+
+	_, err = pq.Eval(context.Background()) // no EvalTracer option
+	if err != nil {
+		t.Fatalf("unexpected error %s", err)
+	}
+
+	if len(*tracer) > 0 {
+		t.Fatal("expected 0 traces to be collected")
+	}
+}
+
+func TestRegoDisableIndexing(t *testing.T) {
+	tracer := topdown.NewBufferTracer()
+	mod := `
+	package test
+
+	p {
+		input.x = 1
+	}
+
+	p {
+		input.y = 1
+	}
+	`
+	pq, err := New(
+		Query("data"),
+		Module("foo.rego", mod),
+	).PrepareForEval(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error %s", err)
+	}
+
+	_, err = pq.Eval(
+		context.Background(),
+		EvalTracer(tracer),
+		EvalRuleIndexing(false),
+		EvalInput(map[string]interface{}{"x": 10}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error %s", err)
+	}
+
+	var evalNodes []string
+	for _, e := range *tracer {
+		if e.Op == topdown.EvalOp {
+			evalNodes = append(evalNodes, string(e.Node.Loc().Text))
+		}
+	}
+
+	expectedEvalNodes := []string{
+		"input.x = 1",
+		"input.y = 1",
+	}
+
+	for _, expected := range expectedEvalNodes {
+		found := false
+		for _, actual := range evalNodes {
+			if actual == expected {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("Missing expected eval node in trace: %q\nGot: %q\n", expected, evalNodes)
 		}
 	}
 }
@@ -757,6 +954,46 @@ func TestPartialResultWithInput(t *testing.T) {
 	assertEval(t, r2, "[[true]]")
 }
 
+func TestPreparedPartialResultWithTracer(t *testing.T) {
+	mod := `
+	package test
+	default p = false
+	p {
+		input.x = 1
+	}
+	`
+	r := New(
+		Query("data.test.p == true"),
+		Module("test.rego", mod),
+	)
+
+	tracer := topdown.NewBufferTracer()
+
+	ctx := context.Background()
+	pq, err := r.PrepareForPartial(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error from Rego.PrepareForPartial(): %s", err.Error())
+	}
+
+	pqs, err := pq.Partial(ctx, EvalTracer(tracer))
+	if err != nil {
+		t.Fatalf("unexpected error from PreparedEvalQuery.Partial(): %s", err.Error())
+	}
+
+	expectedQuery := "input.x = 1"
+	if len(pqs.Queries) != 1 {
+		t.Errorf("expected 1 query but found %d: %+v", len(pqs.Queries), pqs)
+	}
+	if pqs.Queries[0].String() != expectedQuery {
+		t.Errorf("unexpected query in result, expected='%s' found='%s'",
+			expectedQuery, pqs.Queries[0].String())
+	}
+
+	if len(*tracer) == 0 {
+		t.Errorf("Expected buffer tracer to contain > 0 traces")
+	}
+}
+
 func TestMissingLocation(t *testing.T) {
 
 	// Create a query programmatically and evaluate it. The Location information
@@ -773,6 +1010,35 @@ func TestMissingLocation(t *testing.T) {
 	if rs[0].Expressions[0].Location != nil {
 		t.Fatal("Expected location data to be unset.")
 	}
+}
+
+func TestBundlePassing(t *testing.T) {
+
+	opaBundle := bundle.Bundle{
+		Modules: []bundle.ModuleFile{
+			{
+				Path: "policy.rego",
+				Parsed: ast.MustParseModule(`package foo
+                         allow = true`),
+				Raw: []byte(`package foo
+                         allow = true`),
+			},
+		},
+		Manifest: bundle.Manifest{Revision: "test", Roots: &[]string{"/"}},
+	}
+
+	// Pass a bundle
+	r := New(
+		ParsedBundle("123", &opaBundle),
+		Query("x = data.foo.allow"),
+	)
+
+	res, err := r.Eval(context.Background())
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertResultSet(t, res, `[[true]]`)
 }
 
 func TestModulePassing(t *testing.T) {
@@ -905,4 +1171,280 @@ func TestUnsafeBuiltins(t *testing.T) {
 			log.Fatalf("Unexpected error or result. Result: %v. Error: %v", rs, err)
 		}
 	})
+}
+
+func TestPreparedQueryGetModules(t *testing.T) {
+	mods := map[string]string{
+		"a.rego": "package a\np = 1",
+		"b.rego": "package b\nq = 1",
+		"c.rego": "package c\nr = 1",
+	}
+
+	var regoArgs []func(r *Rego)
+
+	for name, mod := range mods {
+		regoArgs = append(regoArgs, Module(name, mod))
+	}
+
+	regoArgs = append(regoArgs, Query("data"))
+
+	ctx := context.Background()
+	pq, err := New(regoArgs...).PrepareForEval(ctx)
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	actualMods := pq.Modules()
+
+	if len(actualMods) != len(mods) {
+		t.Fatalf("Expected %d modules, got %d", len(mods), len(actualMods))
+	}
+
+	for name, actualMod := range actualMods {
+		expectedMod, found := mods[name]
+		if !found {
+			t.Fatalf("Unexpected module %s", name)
+		}
+		if actualMod.String() != ast.MustParseModule(expectedMod).String() {
+			t.Fatalf("Modules for %s do not match.\n\nExpected:\n%s\n\nActual:\n%s\n\n",
+				name, actualMod.String(), expectedMod)
+		}
+	}
+}
+
+func TestRegoEvalWithFile(t *testing.T) {
+	files := map[string]string{
+		"x/x.rego": "package x\np = 1",
+		"x/x.json": `{"y": "foo"}`,
+	}
+
+	test.WithTempFS(files, func(path string) {
+		ctx := context.Background()
+
+		pq, err := New(
+			Load([]string{path}, nil),
+			Query("data"),
+		).PrepareForEval(ctx)
+
+		if err != nil {
+			t.Fatalf("Unexpected error: %s", err)
+		}
+
+		rs, err := pq.Eval(ctx)
+		if err != nil {
+			t.Fatalf("Unexpected error: %s", err)
+		}
+
+		assertResultSet(t, rs, `[[{"x":{"p":1,"y":"foo"}}]]`)
+	})
+}
+
+func TestRegoEvalWithBundle(t *testing.T) {
+	files := map[string]string{
+		"x/x.rego":            "package x\np = data.x.b",
+		"x/data.json":         `{"b": "bar"}`,
+		"other/not-data.json": `{"ignored": "data"}`,
+	}
+
+	test.WithTempFS(files, func(path string) {
+		ctx := context.Background()
+
+		pq, err := New(
+			LoadBundle(path),
+			Query("data.x.p"),
+		).PrepareForEval(ctx)
+
+		if err != nil {
+			t.Fatalf("Unexpected error: %s", err)
+		}
+
+		rs, err := pq.Eval(ctx)
+		if err != nil {
+			t.Fatalf("Unexpected error: %s", err)
+		}
+
+		assertResultSet(t, rs, `[["bar"]]`)
+	})
+}
+
+func TestRegoEvalPoliciesinStore(t *testing.T) {
+	store := mock.New()
+	ctx := context.Background()
+	txn := storage.NewTransactionOrDie(ctx, store, storage.WriteParams)
+
+	err := store.UpsertPolicy(ctx, txn, "a.rego", []byte("package a\np=1"))
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+	err = store.Commit(ctx, txn)
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	pq, err := New(
+		Store(store),
+		Module("b.rego", "package b\np = data.a.p"),
+		Query("data.b.p"),
+	).PrepareForEval(ctx)
+
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	rs, err := pq.Eval(ctx)
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	assertResultSet(t, rs, `[[1]]`)
+}
+
+func TestRegoEvalModulesOnCompiler(t *testing.T) {
+	compiler := ast.NewCompiler()
+
+	compiler.Compile(map[string]*ast.Module{
+		"a.rego": ast.MustParseModule("package a\np = 1"),
+	})
+
+	if len(compiler.Errors) > 0 {
+		t.Fatalf("Unexpected compile errors: %s", compiler.Errors)
+	}
+
+	ctx := context.Background()
+
+	pq, err := New(
+		Compiler(compiler),
+		Query("data.a.p"),
+	).PrepareForEval(ctx)
+
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	rs, err := pq.Eval(ctx)
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	assertResultSet(t, rs, `[[1]]`)
+}
+
+func TestRegoLoadFilesWithProvidedStore(t *testing.T) {
+	ctx := context.Background()
+	store := mock.New()
+
+	files := map[string]string{
+		"x.rego": "package x\np = data.x.b",
+	}
+
+	test.WithTempFS(files, func(path string) {
+		pq, err := New(
+			Store(store),
+			Query("data"),
+			Load([]string{path}, nil),
+		).PrepareForEval(ctx)
+
+		if err == nil {
+			t.Fatal("Expected an error but err == nil")
+		}
+
+		if pq.r != nil {
+			t.Fatalf("Expected pq.r == nil, got: %+v", pq)
+		}
+	})
+}
+
+func TestRegoLoadBundleWithProvidedStore(t *testing.T) {
+	ctx := context.Background()
+	store := mock.New()
+
+	files := map[string]string{
+		"x/x.rego": "package x\np = data.x.b",
+	}
+
+	test.WithTempFS(files, func(path string) {
+		pq, err := New(
+			Store(store),
+			Query("data"),
+			LoadBundle(path),
+		).PrepareForEval(ctx)
+
+		if err == nil {
+			t.Fatal("Expected an error but err == nil")
+		}
+
+		if pq.r != nil {
+			t.Fatalf("Expected pq.r == nil, got: %+v", pq)
+		}
+	})
+}
+
+func TestRegoCustomBuiltinPartialPropagate(t *testing.T) {
+	mod := `package test
+	p {
+		x = trim_and_split(input.foo, "/")
+		x == ["foo", "bar", "baz"]
+	}
+	`
+
+	originalRego := New(
+		Module("test.rego", mod),
+		Query(`data.test.p`),
+		Function2(
+			&Function{
+				Name: "trim_and_split",
+				Decl: types.NewFunction(
+					types.Args(types.S, types.S), // two string inputs
+					types.NewArray(nil, types.S), // variable-length string array output
+				),
+			},
+			func(_ BuiltinContext, a, b *ast.Term) (*ast.Term, error) {
+
+				str, ok1 := a.Value.(ast.String)
+				delim, ok2 := b.Value.(ast.String)
+
+				// The function is undefined for non-string inputs. Built-in
+				// functions should only return errors in unrecoverable cases.
+				if !ok1 || !ok2 {
+					return nil, nil
+				}
+
+				result := strings.Split(strings.Trim(string(str), string(delim)), string(delim))
+
+				arr := make(ast.Array, len(result))
+				for i := range result {
+					arr[i] = ast.StringTerm(result[i])
+				}
+
+				return ast.NewTerm(arr), nil
+			},
+		),
+	)
+
+	pr, err := originalRego.PartialResult(context.Background())
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+
+	rs, err := pr.Rego(
+		Input(map[string]interface{}{"foo": "/foo/bar/baz/"}),
+	).Eval(context.Background())
+
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+	assertResultSet(t, rs, `[[true]]`)
+
+}
+
+func TestPrepareWithEmptyModule(t *testing.T) {
+	_, err := New(
+		Query("d"),
+		Module("example.rego", ""),
+	).PrepareForEval(context.Background())
+
+	expected := "1 error occurred: example.rego:0: rego_parse_error: empty module"
+	if err == nil || err.Error() != expected {
+		t.Fatalf("Expected error %s, got %s", expected, err)
+	}
 }

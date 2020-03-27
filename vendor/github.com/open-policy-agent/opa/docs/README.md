@@ -14,6 +14,9 @@ the website.
 directory. This content is versioned for each release and should have all images
 and code snippets alongside the markdown content files.
 
+[website/data/integrations.yaml](./website/data/integrations.yaml) - Source for the
+integrations index. See [Integration Index](#integration-index) below for more details.
+
 ## Website Components
 
 The website ([openpolicyagent.org](https://openpolicyagent.org)) and doc's hosted there
@@ -57,7 +60,10 @@ a plug-in for IDE's). The rendered output will be very similar to what Hugo will
 generate.
  
 > This excludes the Hugo shortcodes (places with `{{< SHORT_CODE >}}` in the markdown.
-  To see the output of these you'll need to involve Hugo
+  To see the output of these you'll need to involve Hugo. Additionally, to validate
+  and view live code blocks, a full site build is required (e.g. `make serve`,
+  details below). See the "Live Code Blocks" section for more information on
+  how to write them.
 
 #### Modifying the Hugo templates and/or website (HTML/CSS/JS)
 
@@ -66,9 +72,11 @@ immediately be the Hugo dev server. See
 [Run the site locally using Docker](#run-the-site-locally-using-docker)
 
 > This approach will *not* include the Netlify redirects so urls like
- `http://localhost:1313/docs/latest/` will not work. You must navigate directly to
- the version of docs you want to test. Typically this will be
- [http://localhost:1313/docs/edge/](http://localhost:1313/docs/edge/).
+  `http://localhost:1313/docs/latest/` will not work. You must navigate directly to
+  the version of docs you want to test. Typically this will be
+  [http://localhost:1313/docs/edge/](http://localhost:1313/docs/edge/).
+  It will also not include the processing required for live code blocks
+  to show up correctly.
 
 
 #### Modifying the netlify config/redirects
@@ -108,7 +116,9 @@ OFFLINE=1 make generate
 ### Run the site locally using Docker
 
 > Note: running with docker only uses the Hugo server and not Netlify locally.
-This means that redirects and other Netlify features the site relies on will not work.
+  This means that redirects and other Netlify features the site relies on will not work.
+  It will also not include the processing required for live code blocks
+  to show up correctly.
 
 If [Docker is running](https://docs.docker.com/get-started/):
 
@@ -126,6 +136,7 @@ on your system:
 
 - The [Hugo](#installing-hugo) static site generator
 - The [Netlify dev CLI](https://www.netlify.com/products/dev/)
+- [NodeJS](https://nodejs.org) (and NPM)
 
 The site will be running from the Hugo dev server and fronted through netlify running
 as a local reverse proxy. This more closely simulates the production environment but
@@ -168,14 +179,231 @@ re-deployed.
 
 ## Checking links
 
-To check the site's links, first install the [`htmlproofer`](https://github.com/gjtorikian/html-proofer) Ruby gem:
-
-```bash
-gem install htmlproofer
-```
+To check the site's links, first start the full site preview locally (see [Serving the full site](#serving-the-full-site) instructions))
 
 Then run:
 
 ```bash
-make linkcheck
+docker run --rm -it --net=host linkchecker/linkchecker $URL
 ```
+
+Note: You may need to adjust the `URL` (host and/or port) depending on the environment. For OSX
+and Windows the host might need to be `host.docker.internal` instead of `localhost`.
+
+> This link checker will work on best with Netlify previews! Just point it at the preview URL instead of the local server.
+  The "pretty url" feature seems to work best when deployed, running locally may result in erroneous links.
+
+## Live Code Blocks
+
+Live blocks enable readers to interact with and change Rego snippets from within the docs.
+They are written as standard markdown code blocks with a special syntax in the language label
+and are enabled used a postprocessing step during full site builds.
+
+> For them to render correctly you must build the site using `make serve` or Netlify.
+  If the live blocks build starts failing, try running `make live-blocks-clear-caches` from the `docs/` folder.
+  For the page to be able to live update code blocks, you may also want to
+  disable your browser's CORS checks when developing. For chrome you can use the command-line flags
+  `--disable-web-security --user-data-dir=/tmp/$RANDOM`; this will open a new window
+  that isn't tied to your existing user data.
+
+Here's what they look like:
+
+``````markdown
+In this module:
+
+```live:rule_body:module
+package example
+
+u {
+  "foo" == "foo"
+}
+```
+
+The rule `u` evaluates to true:
+
+```live:rule_body:output
+```
+``````
+
+### Groups
+
+Each live block group within a page has a unique name, for example `rule_body` above.
+Each group can be composed of up to 1 of each type of live block:
+
+- `module` - A complete or partial rego module.
+- `query` - Rego expressions for which to show output instead of the module.
+- `input` - JSON input with which to evaluate the module/ query.
+- `output` - A block to contain the output for the group, contents will be inserted automatically.
+
+Groups can also be structured hierarchically using slashes in their names. When evaluated, the module blocks will be concatenated and any other missing blocks will be inherited from ancestors.
+Here's what a more complex set of blocks could look like:
+
+``````markdown
+```live:eg:module:hidden
+package example
+```
+
+We can define a scalar rule:
+
+```live:eg/string:module
+string = "hello"
+```
+
+Which generates the document you'd expect:
+
+```live:eg/string:output
+```
+
+We can then define a rule that uses the value of `string`:
+
+```live:eg/string/rule:module
+r { input.value == string }
+```
+
+And query it with some input:
+
+```live:eg/string/rule:input
+{
+  "value": "world"
+}
+```
+```live:eg/string/rule:query:hidden
+r
+```
+
+with which it will be undefined:
+
+```live:eg/string/rule:output:expect_undefined
+```
+``````
+
+In that example, the output for `eg/string` is evaluated with only the module:
+
+```
+package example
+
+string = "hello"
+```
+
+Whereas the `eg/string/rule` output is evaluated with the module:
+
+```
+package example
+
+string = "hello"
+
+r { input.value == string }
+```
+
+as well the given query and input.
+
+If any of the blocks that impact the output are edited by a reader,
+the output will update accordingly
+
+### Tags
+
+You'll notice in the previous example that some blocks have an additional section after the type, these are tags.
+
+> To apply multiple tags to a block, separate them with commas. E.g. `live:group_name:block_type:tag1,tag2,tag2`
+
+Some tags can be applied to any block:
+
+- `hidden` - Hide the code block.
+- `read_only` - Prevent editing of the block.
+- `merge_down` - Visually merge this code block with the one below it (remove bottom margin).
+- `openable` - Add a button to the block that opens its group in the Rego Playground. This should typically
+  only be used on complete module blocks.
+- `line_numbers` - Show line numbers in the block. This should be used sparingly; the code will visually shift when they appear.
+
+Outputs can also be tagged as expecting various errors. If one is tagged as expecting errors that do not occur
+or errors occur that it is not tagged as expecting, the build will fail noisily.
+
+More specific errors appear before less specific ones in this list, try to use them.
+If you think a more specific tag could be added for your case, please create an issue.
+
+- `expect_undefined` - The query result is undefined. If all the rules in a module are undefined, the output is simply `{}`.
+- `expect_assigned_above` - A variable is already `:=` assigned.
+- `expect_referenced_above` - A variable is used before it is `:=` assigned.
+- `expect_compile_error`
+- `expect_rego_type_error` - A compile-time type error.
+- `expect_unsafe_var`
+- `expect_recursion`
+- `expect_rego_error` - Any parse/compile-time error.
+- `expect_conflict`
+- `expect_eval_type_error` - An evaluation-time type error.
+- `expect_builtin_error`
+- `expect_with_merge_error`
+- `expect_eval_error` - Any evaluation-time error.
+- `expect_error` - Any OPA error. This should generally not be used.
+
+> At this time, due to the way OPA loads modules on the CLI, expecting parse errors is not possible.
+
+Finally, outputs can also be tagged one or more times with `include(<group name>)`, which will include
+another group's module when evaluating (e.g. so that they can be imported).
+
+> If a query isn't specified for the output's group, when other modules are included the default becomes `data` instead of `data.<package name>`.
+
+# Integration Index
+
+The integration index makes it easy to find either a specific integration with OPA 
+or to browse the integrations with OPA within a particular category.  And it pulls 
+information about that integration (e.g. blogs, videos, tutorials, code) into a 
+single place while allowing integration authors to maintain the code wherever they like.  
+
+## Schema
+
+The schema of integrations.yaml has the following highlevel entries, each of which is self-explanatory.
+* integrations
+* organizations
+* software
+
+Each entry is an object where keys are unique identifiers for each subentry.  
+Organizations and Software are self-explanatory by inspection.  The schema for integrations is as follows.
+
+* title: string
+* description: string
+* software: array of strings
+* labels: collection of key/value pairs.
+* tutorials: array of links
+* code: array of links
+* inventors: array of either
+  * string (organization name)
+  * object with fields
+    * name: string
+    * organization: string
+* videos: array of either
+  * link
+  * object with fields
+    * title: string
+    * speakers: array of name/organization objects
+    * venue: string
+    * link: string
+* blogs: array of links
+
+The UI for this is currently hosted at [https://openpolicyagent.org/docs/latest/ecosystem/](https://openpolicyagent.org/docs/latest/ecosystem/)
+
+The future plan is to use the following labels to generate categories of integrations.
+
+* layer: which layer of the stack does this belong to
+* category: which kind of component within that layer is this
+* type: what kind of integration this is.  Either `enforcement` or `poweredbyopa`.  `enforcement` is the default 
+  if `type` is missing.  `poweredbyopa` is intended to be integrations built using OPA that are not tied to a 
+  particular layer of the stack.  This distinction is the most ambiguous and may change.
+
+As of now the labels are only displayed for each entry.
+
+## Logos
+For each entry in the [integrations.yaml](./website/data/integrations.yaml) integrations section the UI will use a
+PNG logo with the same name as the key from [./website/static/img/logos/integrations](./website/static/img/logos/integrations)
+
+For example:
+
+```yaml
+integrations:
+  my-cool-integration:
+    ...
+```
+
+Would need a file called `my-cool-integration.png` at `./website/static/img/logos/integrations/my-cool-integration.png`
+
+If it doesn't exist the OPA logo will be shown by default.

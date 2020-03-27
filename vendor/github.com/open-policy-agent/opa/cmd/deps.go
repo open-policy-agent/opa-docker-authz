@@ -11,17 +11,19 @@ import (
 	"github.com/open-policy-agent/opa/dependencies"
 	"github.com/open-policy-agent/opa/internal/presentation"
 
+	"github.com/pkg/errors"
+	"github.com/spf13/cobra"
+
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/loader"
 	"github.com/open-policy-agent/opa/util"
-	"github.com/pkg/errors"
-	"github.com/spf13/cobra"
 )
 
 type depsCommandParams struct {
-	dataPaths repeatedStringFlag
-	format    *util.EnumFlag
-	ignore    []string
+	dataPaths   repeatedStringFlag
+	format      *util.EnumFlag
+	ignore      []string
+	bundlePaths repeatedStringFlag
 }
 
 const (
@@ -56,7 +58,8 @@ func init() {
 
 	depsCommand.Flags().VarP(params.format, "format", "f", "set output format")
 	depsCommand.Flags().VarP(&params.dataPaths, "data", "d", "set data file(s) or directory path(s)")
-	setIgnore(depsCommand.Flags(), &params.ignore)
+	depsCommand.Flags().VarP(&params.bundlePaths, "bundle", "b", "set bundle file(s) or directory path(s)")
+	addIgnoreFlag(depsCommand.Flags(), &params.ignore)
 
 	RootCommand.AddCommand(depsCommand)
 }
@@ -68,18 +71,34 @@ func deps(args []string, params depsCommandParams) error {
 		return err
 	}
 
-	f := loaderFilter{
-		Ignore: params.ignore,
-	}
-
-	result, err := loader.Filtered(params.dataPaths.v, f.Apply)
-	if err != nil {
-		return err
-	}
-
 	modules := map[string]*ast.Module{}
-	for _, m := range result.Modules {
-		modules[m.Name] = m.Parsed
+
+	if len(params.dataPaths.v) > 0 {
+		f := loaderFilter{
+			Ignore: params.ignore,
+		}
+
+		result, err := loader.NewFileLoader().Filtered(params.dataPaths.v, f.Apply)
+		if err != nil {
+			return err
+		}
+
+		for _, m := range result.Modules {
+			modules[m.Name] = m.Parsed
+		}
+	}
+
+	if len(params.bundlePaths.v) > 0 {
+		for _, path := range params.bundlePaths.v {
+			b, err := loader.NewFileLoader().AsBundle(path)
+			if err != nil {
+				return err
+			}
+
+			for name, mod := range b.ParsedModules(path) {
+				modules[name] = mod
+			}
+		}
 	}
 
 	compiler := ast.NewCompiler()

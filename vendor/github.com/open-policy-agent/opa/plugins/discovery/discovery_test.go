@@ -120,7 +120,7 @@ func TestProcessBundle(t *testing.T) {
 		}
 	`)
 
-	_, ps, err := processBundle(ctx, manager, nil, initialBundle, "data.config")
+	_, ps, err := processBundle(ctx, manager, nil, initialBundle, "data.config", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestProcessBundle(t *testing.T) {
 		}
 	`)
 
-	_, ps, err = processBundle(ctx, manager, nil, updatedBundle, "data.config")
+	_, ps, err = processBundle(ctx, manager, nil, updatedBundle, "data.config", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestProcessBundle(t *testing.T) {
 		}
 	`)
 
-	_, _, err = processBundle(ctx, manager, nil, updatedBundle, "data.config")
+	_, _, err = processBundle(ctx, manager, nil, updatedBundle, "data.config", nil)
 	if err == nil {
 		t.Fatal("Expected error but got success")
 	}
@@ -372,12 +372,14 @@ func TestStatusUpdates(t *testing.T) {
 
 	for !ok && time.Since(t0) < time.Second {
 		updates = ts.Updates()
-		ok = len(updates) == 5 &&
-			updates[0].Discovery.ActiveRevision == "test-revision-1" && updates[0].Discovery.Code == "" &&
-			updates[1].Discovery.ActiveRevision == "test-revision-1" && updates[1].Discovery.Code == "bundle_error" &&
-			updates[2].Discovery.ActiveRevision == "test-revision-2" && updates[2].Discovery.Code == "" &&
-			updates[3].Discovery.ActiveRevision == "test-revision-2" && updates[3].Discovery.Code == "bundle_error" &&
-			updates[4].Discovery.ActiveRevision == "test-revision-2" && updates[4].Discovery.Code == ""
+		ok = len(updates) == 7 &&
+			updates[0].Plugins["discovery"].State == plugins.StateNotReady && updates[0].Plugins["status"].State == plugins.StateOK &&
+			updates[1].Plugins["discovery"].State == plugins.StateOK && updates[1].Plugins["status"].State == plugins.StateOK &&
+			updates[2].Plugins["discovery"].State == plugins.StateOK && updates[2].Discovery.ActiveRevision == "test-revision-1" && updates[2].Discovery.Code == "" &&
+			updates[3].Plugins["discovery"].State == plugins.StateOK && updates[3].Discovery.ActiveRevision == "test-revision-1" && updates[3].Discovery.Code == "bundle_error" &&
+			updates[4].Plugins["discovery"].State == plugins.StateOK && updates[4].Discovery.ActiveRevision == "test-revision-2" && updates[4].Discovery.Code == "" &&
+			updates[5].Plugins["discovery"].State == plugins.StateOK && updates[5].Discovery.ActiveRevision == "test-revision-2" && updates[5].Discovery.Code == "bundle_error" &&
+			updates[6].Plugins["discovery"].State == plugins.StateOK && updates[6].Discovery.ActiveRevision == "test-revision-2" && updates[6].Discovery.Code == ""
 	}
 
 	if !ok {
@@ -419,7 +421,7 @@ bundle:
   service: s2
 `
 	manager := getTestManager(t, conf)
-	_, err := getPluginSet(nil, manager, manager.Config)
+	_, err := getPluginSet(nil, manager, manager.Config, nil)
 	if err != nil {
 		t.Fatalf("Unexpected error: %s", err)
 	}
@@ -455,7 +457,7 @@ bundles:
     service: s1
 `
 	manager := getTestManager(t, conf)
-	_, err := getPluginSet(nil, manager, manager.Config)
+	_, err := getPluginSet(nil, manager, manager.Config, nil)
 	if err != nil {
 		t.Fatalf("Unexpected error: %s", err)
 	}

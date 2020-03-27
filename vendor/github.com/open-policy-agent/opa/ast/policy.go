@@ -168,6 +168,7 @@ type (
 		Args     Args      `json:"args,omitempty"`
 		Key      *Term     `json:"key,omitempty"`
 		Value    *Term     `json:"value,omitempty"`
+		Assign   bool      `json:"assign,omitempty"`
 	}
 
 	// Args represents zero or more arguments to a rule.
@@ -268,6 +269,26 @@ func (mod *Module) RuleSet(name Var) RuleSet {
 		}
 	}
 	return rs
+}
+
+// UnmarshalJSON parses bs and stores the result in mod. The rules in the module
+// will have their module pointer set to mod.
+func (mod *Module) UnmarshalJSON(bs []byte) error {
+
+	// Declare a new type and use a type conversion to avoid recursively calling
+	// Module#UnmarshalJSON.
+	type module Module
+
+	if err := util.UnmarshalJSON(bs, (*module)(mod)); err != nil {
+		return err
+	}
+
+	WalkRules(mod, func(rule *Rule) bool {
+		rule.Module = mod
+		return false
+	})
+
+	return nil
 }
 
 // NewComment returns a new Comment object.
@@ -590,6 +611,11 @@ func (head *Head) Compare(other *Head) int {
 	} else if other == nil {
 		return 1
 	}
+	if head.Assign && !other.Assign {
+		return -1
+	} else if !head.Assign && other.Assign {
+		return 1
+	}
 	if cmp := Compare(head.Args, other.Args); cmp != 0 {
 		return cmp
 	}
@@ -626,7 +652,11 @@ func (head *Head) String() string {
 		buf = append(buf, head.Name.String())
 	}
 	if head.Value != nil {
-		buf = append(buf, "=")
+		if head.Assign {
+			buf = append(buf, ":=")
+		} else {
+			buf = append(buf, "=")
+		}
 		buf = append(buf, head.Value.String())
 	}
 	return strings.Join(buf, " ")
@@ -637,13 +667,13 @@ func (head *Head) Vars() VarSet {
 	vis := &VarVisitor{vars: VarSet{}}
 	// TODO: improve test coverage for this.
 	if head.Args != nil {
-		Walk(vis, head.Args)
+		vis.Walk(head.Args)
 	}
 	if head.Key != nil {
-		Walk(vis, head.Key)
+		vis.Walk(head.Key)
 	}
 	if head.Value != nil {
-		Walk(vis, head.Value)
+		vis.Walk(head.Value)
 	}
 	return vis.vars
 }
@@ -696,7 +726,7 @@ func (a Args) SetLoc(loc *Location) {
 // Vars returns a set of vars that appear in a.
 func (a Args) Vars() VarSet {
 	vis := &VarVisitor{vars: VarSet{}}
-	Walk(vis, a)
+	vis.Walk(a)
 	return vis.vars
 }
 
@@ -826,7 +856,7 @@ func (body Body) String() string {
 // control which vars are included.
 func (body Body) Vars(params VarVisitorParams) VarSet {
 	vis := NewVarVisitor().WithParams(params)
-	Walk(vis, body)
+	vis.Walk(body)
 	return vis.Vars()
 }
 
@@ -984,8 +1014,9 @@ func (expr *Expr) IncludeWith(target *Term, value *Term) *Expr {
 
 // NoWith returns a copy of expr where the with modifier has been removed.
 func (expr *Expr) NoWith() *Expr {
-	expr.With = nil
-	return expr
+	cpy := *expr
+	cpy.With = nil
+	return &cpy
 }
 
 // IsEquality returns true if this is an equality expression.
@@ -1116,7 +1147,7 @@ func (expr *Expr) UnmarshalJSON(bs []byte) error {
 // control which vars are included.
 func (expr *Expr) Vars(params VarVisitorParams) VarSet {
 	vis := NewVarVisitor().WithParams(params)
-	Walk(vis, expr)
+	vis.Walk(expr)
 	return vis.Vars()
 }
 
@@ -1131,7 +1162,7 @@ func (d *SomeDecl) String() string {
 	for i := range buf {
 		buf[i] = d.Symbols[i].String()
 	}
-	return "var " + strings.Join(buf, ", ")
+	return "some " + strings.Join(buf, ", ")
 }
 
 // SetLoc sets the Location on d.

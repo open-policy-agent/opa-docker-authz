@@ -169,35 +169,65 @@ func builtinJWTVerifyES256(a ast.Value, b ast.Value) (ast.Value, error) {
 	})
 }
 
-// getKeyFromCert returns the public key found in a X.509 certificate.
-func getKeyFromCert(certificate string) (key interface{}, err error) {
-	block, rest := pem.Decode([]byte(certificate))
-	if block == nil || block.Type != "CERTIFICATE" || len(rest) > 0 {
-		return nil, fmt.Errorf("failed to decode PEM block containing certificate")
+// getKeyFromCertOrJWK returns the public key found in a X.509 certificate or JWK key(s).
+// A valid PEM block is never valid JSON (and vice versa), hence can try parsing both.
+func getKeyFromCertOrJWK(certificate string) ([]interface{}, error) {
+	if block, rest := pem.Decode([]byte(certificate)); block != nil {
+		if len(rest) > 0 {
+			return nil, fmt.Errorf("extra data after a PEM certificate block")
+		}
+
+		if block.Type == "CERTIFICATE" {
+			cert, err := x509.ParseCertificate(block.Bytes)
+			if err != nil {
+				return nil, errors.Wrap(err, "failed to parse a PEM certificate")
+			}
+
+			return []interface{}{cert.PublicKey}, nil
+		}
+
+		if block.Type == "PUBLIC KEY" {
+			key, err := x509.ParsePKIXPublicKey(block.Bytes)
+			if err != nil {
+				return nil, errors.Wrap(err, "failed to parse a PEM public key")
+			}
+
+			return []interface{}{key}, nil
+		}
+
+		return nil, fmt.Errorf("failed to extract a Key from the PEM certificate")
 	}
 
-	cert, err := x509.ParseCertificate(block.Bytes)
+	jwks, err := jwk.ParseString(certificate)
 	if err != nil {
-		return nil, errors.Wrap(err, "PEM parse error")
+		return nil, errors.Wrap(err, "failed to parse a JWK key (set)")
 	}
-	key = cert.PublicKey
-	return
+
+	var keys []interface{}
+	for _, k := range jwks.Keys {
+		key, err := k.Materialize()
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+
+	return keys, nil
 }
 
 // Implements JWT signature verification.
 func builtinJWTVerify(a ast.Value, b ast.Value, verify func(publicKey interface{}, digest []byte, signature []byte) error) (ast.Value, error) {
-	// Decode the JSON Web Token
 	token, err := decodeJWT(a)
 	if err != nil {
 		return nil, err
 	}
 
-	// Process PEM encoded certificate input
-	astCertificate, err := builtins.StringOperand(b, 2)
+	s, err := builtins.StringOperand(b, 2)
 	if err != nil {
 		return nil, err
 	}
-	key, err := getKeyFromCert(string(astCertificate))
+
+	keys, err := getKeyFromCertOrJWK(string(s))
 	if err != nil {
 		return nil, err
 	}
@@ -208,14 +238,18 @@ func builtinJWTVerify(a ast.Value, b ast.Value, verify func(publicKey interface{
 	}
 
 	// Validate the JWT signature
-	err = verify(key,
-		getInputSHA([]byte(token.header+"."+token.payload)),
-		[]byte(signature))
+	for _, key := range keys {
+		err = verify(key,
+			getInputSHA([]byte(token.header+"."+token.payload)),
+			[]byte(signature))
 
-	if err != nil {
-		return ast.Boolean(false), nil
+		if err == nil {
+			return ast.Boolean(true), nil
+		}
 	}
-	return ast.Boolean(true), nil
+
+	// None of the keys worked, return false
+	return ast.Boolean(false), nil
 }
 
 // Implements HS256 (secret) JWT signature verification
@@ -253,8 +287,8 @@ func builtinJWTVerifyHS256(a ast.Value, b ast.Value) (ast.Value, error) {
 
 // tokenConstraints holds decoded JWT verification constraints.
 type tokenConstraints struct {
-	// The single asymmetric key we will verify with.
-	key interface{}
+	// The set of asymmetric keys we can verify with.
+	keys []interface{}
 
 	// The single symmetric key we will verify with.
 	secret string
@@ -299,15 +333,13 @@ var tokenConstraintTypes = map[string]tokenConstraintHandler{
 
 // tokenConstraintCert handles the `cert` constraint.
 func tokenConstraintCert(value ast.Value, constraints *tokenConstraints) (err error) {
-	var cert ast.String
+	var s ast.String
 	var ok bool
-	if cert, ok = value.(ast.String); !ok {
-		err = fmt.Errorf("cert constraint: must be a string")
-		return
+	if s, ok = value.(ast.String); !ok {
+		return fmt.Errorf("cert constraint: must be a string")
 	}
-	if constraints.key, err = getKeyFromCert(string(cert)); err != nil {
-		return
-	}
+
+	constraints.keys, err = getKeyFromCertOrJWK(string(s))
 	return
 }
 
@@ -376,7 +408,7 @@ func parseTokenConstraints(a ast.Value) (constraints tokenConstraints, err error
 // validate validates the constraints argument.
 func (constraints *tokenConstraints) validate() (err error) {
 	keys := 0
-	if constraints.key != nil {
+	if constraints.keys != nil {
 		keys++
 	}
 	if constraints.secret != "" {
@@ -394,7 +426,7 @@ func (constraints *tokenConstraints) validate() (err error) {
 }
 
 // verify verifies a JWT using the constraints and the algorithm from the header
-func (constraints *tokenConstraints) verify(kid, alg, header, payload, signature string) (err error) {
+func (constraints *tokenConstraints) verify(kid, alg, header, payload, signature string) error {
 	// Construct the payload
 	plaintext := []byte(header)
 	plaintext = append(plaintext, []byte(".")...)
@@ -404,19 +436,28 @@ func (constraints *tokenConstraints) verify(kid, alg, header, payload, signature
 	var a tokenAlgorithm
 	a, ok = tokenAlgorithms[alg]
 	if !ok {
-		err = fmt.Errorf("unknown JWS algorithm: %s", alg)
-		return
+		return fmt.Errorf("unknown JWS algorithm: %s", alg)
 	}
-	// If we're configured with a single key then only trust that
-	if constraints.key != nil {
-		return a.verify(constraints.key, a.hash, plaintext, []byte(signature))
+	// If we're configured with asymmetric key(s) then only trust that
+	if constraints.keys != nil {
+		verified := false
+		for _, key := range constraints.keys {
+			err := a.verify(key, a.hash, plaintext, []byte(signature))
+			if err == nil {
+				verified = true
+				break
+			}
+		}
+		if !verified {
+			return errSignatureNotVerified
+		}
+		return nil
 	}
 	if constraints.secret != "" {
 		return a.verify([]byte(constraints.secret), a.hash, plaintext, []byte(signature))
 	}
 	// (*tokenConstraints)validate() should prevent this happening
-	err = errors.New("unexpectedly found no keys to trust")
-	return
+	return errors.New("unexpectedly found no keys to trust")
 }
 
 // validAudience checks the audience of the JWT.

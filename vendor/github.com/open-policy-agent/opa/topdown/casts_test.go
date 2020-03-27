@@ -5,9 +5,9 @@
 package topdown
 
 import (
-	"fmt"
-	"github.com/open-policy-agent/opa/ast"
 	"testing"
+
+	"github.com/open-policy-agent/opa/ast"
 )
 
 func TestToArray(t *testing.T) {
@@ -19,7 +19,7 @@ func TestToArray(t *testing.T) {
 		panic(err)
 	}
 
-	typeErr := fmt.Errorf("type")
+	typeErr := &Error{Code: TypeErr, Message: "operand 1 must be one of {array, set}"}
 
 	tests := []struct {
 		note     string
@@ -40,7 +40,7 @@ func TestToArray(t *testing.T) {
 
 func TestToSet(t *testing.T) {
 
-	typeErr := fmt.Errorf("type")
+	typeErr := &Error{Code: TypeErr, Message: "operand 1 must be one of {array, set}"}
 
 	tests := []struct {
 		note     string
@@ -60,7 +60,7 @@ func TestToSet(t *testing.T) {
 }
 
 func TestCasts(t *testing.T) {
-	typeErr := fmt.Errorf("type")
+	typeErr := &Error{Code: TypeErr}
 
 	tests := []struct {
 		note     string

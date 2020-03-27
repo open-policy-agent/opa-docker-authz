@@ -41,8 +41,9 @@ func (ss *saveSet) Pop() {
 func (ss *saveSet) Contains(t *ast.Term, b *bindings) bool {
 	if ss != nil {
 		ss.instr.startTimer(partialOpSaveSetContains)
-		defer ss.instr.stopTimer(partialOpSaveSetContains)
-		return ss.contains(t, b)
+		ret := ss.contains(t, b)
+		ss.instr.stopTimer(partialOpSaveSetContains)
+		return ret
 	}
 	return false
 }
@@ -62,8 +63,9 @@ func (ss *saveSet) contains(t *ast.Term, b *bindings) bool {
 func (ss *saveSet) ContainsRecursive(t *ast.Term, b *bindings) bool {
 	if ss != nil {
 		ss.instr.startTimer(partialOpSaveSetContainsRec)
-		defer ss.instr.stopTimer(partialOpSaveSetContainsRec)
-		return ss.containsrec(t, b)
+		ret := ss.containsrec(t, b)
+		ss.instr.stopTimer(partialOpSaveSetContainsRec)
+		return ret
 	}
 	return false
 }
@@ -313,4 +315,68 @@ func (s *saveSupport) Insert(path ast.Ref, rule *ast.Rule) {
 	}
 	rule.Module = module
 	module.Rules = append(module.Rules, rule)
+}
+
+// saveRequired returns true if the statement x will result in some expressions
+// being saved. This check allows the evaluator to evaluate statements
+// completely during partial evaluation as long as they do not depend on any
+// kind of unknown value or statements that would generate saves.
+func saveRequired(c *ast.Compiler, ss *saveSet, b *bindings, x interface{}, rec bool) bool {
+
+	var found bool
+
+	vis := ast.NewGenericVisitor(func(node interface{}) bool {
+		if found {
+			return found
+		}
+		switch node := node.(type) {
+		case *ast.Expr:
+			found = len(node.With) > 0 || ignoreExprDuringPartial(node)
+		case *ast.Term:
+			switch v := node.Value.(type) {
+			case ast.Var:
+				// Variables only need to be tested in the node from call site
+				// because once traversal recurses into a rule existing unknown
+				// variables are out-of-scope.
+				if !rec && ss.ContainsRecursive(node, b) {
+					found = true
+				}
+			case ast.Ref:
+				if ss.Contains(node, b) {
+					found = true
+				} else {
+					for _, rule := range c.GetRulesDynamic(v) {
+						if saveRequired(c, ss, b, rule, true) {
+							found = true
+							break
+						}
+					}
+				}
+			}
+		}
+		return found
+	})
+
+	vis.Walk(x)
+
+	return found
+}
+
+func ignoreExprDuringPartial(expr *ast.Expr) bool {
+	if !expr.IsCall() {
+		return false
+	}
+
+	bi, ok := ast.BuiltinMap[expr.Operator().String()]
+
+	return ok && ignoreDuringPartial(bi)
+}
+
+func ignoreDuringPartial(bi *ast.Builtin) bool {
+	for _, ignore := range ast.IgnoreDuringPartialEval {
+		if bi == ignore {
+			return true
+		}
+	}
+	return false
 }

@@ -23,6 +23,10 @@ This is a list of production adopters of OPA (in alphabetical order):
   Kubernetes clusters that host a mix of production and test
   workloads.
 
+* [Fugue](https://fugue.co) is a cloud security SaaS that uses OPA to
+  classify compliance violations and security risks in AWS and Azure
+  accounts and generate compliance reports and notifications.
+
 * [Intuit](https://www.intuit.com/company/) uses OPA as a validating
   and mutating admission controller to implement various security,
   multi-tenancy, and risk management policies across approximately 50
@@ -43,6 +47,16 @@ This is a list of production adopters of OPA (in alphabetical order):
   evaluate policies in a flexible and consistent manner. For a
   description of how Netflix has architected access control with OPA
   check out [this talk from KubeCon Austin 2017](https://www.youtube.com/watch?v=R6tUNpRpdnY).
+
+* [Plex Systems](https://www.plex.com) uses OPA to enforce policy throughout
+  their entire release process; from local development to continuous production
+  audits. The CI/CD pipelines at Plex leverage [conftest](https://github.com/instrumenta/conftest),
+  a policy enforcement tool that relies on OPA, to automatically reject changes that do not adhere 
+  to defined policies. Plex also uses
+  [Gatekeeper](https://github.com/open-policy-agent/gatekeeper), a Kubernetes policy controller, as
+  a means to enforce policies within their Kubernetes clusters. The general-purpose nature of OPA
+  has enabled Plex to have a consistent means of policy enforcement,
+  no matter the environment.
 
 * [SAP/InfraBox](https://github.com/SAP/Infrabox) integrates OPA to
   implement authorization over HTTP API resources. OPA policies
@@ -67,8 +81,9 @@ This is a list of production adopters of OPA (in alphabetical order):
   Kubernetes that offload policy decisions to OPA sidecars. VGS has
   implemented a synchronization protocol on top of the Bundle and
   Status APIs so that the system can determine when permission updates
-  have propagated. For more details on the VGS use case see [this blog
-  post](https://blog.verygoodsecurity.com/posts/building-a-fine-grained-permission-system-in-a-distributed-environment).
+  have propagated. For more details on the VGS use case see these blog posts:
+  [part 1](https://blog.verygoodsecurity.com/posts/building-a-fine-grained-permission-system-in-a-distributed-environment),
+  [part 2](https://blog.verygoodsecurity.com/posts/building-a-fine-grained-permissions-system-in-a-distributed-environment).
 
 In addition, there are several production adopters that prefer to
 remain anonymous.
@@ -92,6 +107,12 @@ pre-production (in alphabetical order):
   December 2018, ~850 ORY Keto instances were running in a mix of
   pre-production and production environments.
 
+* [Spacelift](https://spacelift.io) is a specialized CI/CD platform
+  for infrastructure-as-code. Spacelift is [using OPA](https://docs.spacelift.io/concepts/policy) to provide flexible,
+  fine-grained controls at various application decision points, including
+  automated code review, defining access levels or blocking execution of
+  unwanted code.
+
 Other adopters that have gone into production or various stages of
 testing include:
 
@@ -100,6 +121,7 @@ testing include:
 * [Pinterest](https://www.pinterest.com/)
 * [SolarWinds](https://www.solarwinds.com/) via [Lee Calcote](https://github.com/leecalcote)
 * [State Street Corporation](http://www.statestreet.com/)
+* [Yelp](https://www.yelp.com/)
 
 If you have adopted OPA and would like to be included in this list,
 feel free to submit a PR.

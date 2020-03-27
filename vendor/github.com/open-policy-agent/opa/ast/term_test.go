@@ -84,6 +84,40 @@ func TestInterfaceToValue(t *testing.T) {
 
 }
 
+func TestObjectInsertGetLen(t *testing.T) {
+	tests := []struct {
+		insert   [][2]string
+		expected map[string]string
+	}{
+		{[][2]string{{`null`, `value1`}, {`null`, `value2`}}, map[string]string{`null`: `value2`}},
+		{[][2]string{{`false`, `value`}, {`true`, `value1`}, {`true`, `value2`}}, map[string]string{`false`: `value`, `true`: `value2`}},
+		{[][2]string{{`0`, `value`}, {`1`, `value1`}, {`1`, `value2`}, {`1.5`, `value`}}, map[string]string{`0`: `value`, `1`: `value2`, `1.5`: `value`}},
+		{[][2]string{{`"string"`, `value1`}, {`"string"`, `value2`}}, map[string]string{`"string"`: `value2`}},
+		{[][2]string{{`["other"]`, `value1`}, {`["other"]`, `value2`}}, map[string]string{`["other"]`: `value2`}},
+	}
+
+	for _, tc := range tests {
+		o := NewObject()
+		for _, kv := range tc.insert {
+			o.Insert(MustParseTerm(kv[0]), MustParseTerm(kv[1]))
+
+			if v := o.Get(MustParseTerm(kv[0])); v == nil || !MustParseTerm(kv[1]).Equal(v) {
+				t.Errorf("Expected the object to contain %v", v)
+			}
+		}
+
+		if o.Len() != len(tc.expected) {
+			t.Errorf("Expected the object to have %v entries", len(tc.expected))
+		}
+
+		for k, v := range tc.expected {
+			if x := o.Get(MustParseTerm(k)); x == nil || !MustParseTerm(v).Equal(x) {
+				t.Errorf("Expected the object to contain %v", k)
+			}
+		}
+	}
+}
+
 func TestObjectSetOperations(t *testing.T) {
 
 	a := MustParseTerm(`{"a": "b", "c": "d"}`).Value.(Object)
@@ -110,6 +144,79 @@ func TestObjectSetOperations(t *testing.T) {
 
 	if !ok || r3.Compare(expected) != 0 {
 		t.Errorf("Expected c.Merge(d) to equal %v but got: %v", expected, r3)
+	}
+}
+
+func TestObjectFilter(t *testing.T) {
+	cases := []struct {
+		note     string
+		object   string
+		filter   string
+		expected string
+	}{
+		{
+			note:     "base",
+			object:   `{"a": {"b": {"c": 7, "d": 8}}, "e": 9}`,
+			filter:   `{"a": {"b": {"c": null}}}`,
+			expected: `{"a": {"b": {"c": 7}}}`,
+		},
+		{
+			note:     "multiple roots",
+			object:   `{"a": {"b": {"c": 7, "d": 8}}, "e": 9}`,
+			filter:   `{"a": {"b": {"c": null}}, "e": null}`,
+			expected: `{"a": {"b": {"c": 7}}, "e": 9}`,
+		},
+		{
+			note:     "shared roots",
+			object:   `{"a": {"b": {"c": 7, "d": 8}, "e": 9}}`,
+			filter:   `{"a": {"b": {"c": null}, "e": null}}`,
+			expected: `{"a": {"b": {"c": 7}, "e": 9}}`,
+		},
+		{
+			note:     "empty filter",
+			object:   `{"a": 7}`,
+			filter:   `{}`,
+			expected: `{}`,
+		},
+		{
+			note:     "empty object",
+			object:   `{}`,
+			filter:   `{"a": {"b": null}}`,
+			expected: `{}`,
+		},
+		{
+			note:     "arrays",
+			object:   `{"a": [{"b": 7, "c": 8}, {"d": 9}]}`,
+			filter:   `{"a": {"0": {"b": null}, "1": null}}`,
+			expected: `{"a": [{"b": 7}, {"d": 9}]}`,
+		},
+		{
+			note:     "object with number keys",
+			object:   `{"a": [{"1":["b", "c", "d"]}, {"x": "y"}]}`,
+			filter:   `{"a": {"0": {"1": {"2": null}}}}`,
+			expected: `{"a": [{"1": ["d"]}]}`,
+		},
+		{
+			note:     "sets",
+			object:   `{"a": {"b", "c", "d"}, "x": {"y"}}`,
+			filter:   `{"a": {"b": null, "d": null}, "x": null}`,
+			expected: `{"a": {"b", "d"}, "x": {"y"}}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.note, func(t *testing.T) {
+			obj := MustParseTerm(tc.object).Value.(Object)
+			filterObj := MustParseTerm(tc.filter).Value.(Object)
+			expected := MustParseTerm(tc.expected).Value.(Object)
+			actual, err := obj.Filter(filterObj)
+			if err != nil {
+				t.Errorf("unexpected error: %s", err)
+			}
+			if actual.Compare(expected) != 0 {
+				t.Errorf("Expected:\n\n\t%s\n\nGot:\n\n\t%s\n\n", expected, actual)
+			}
+		})
 	}
 }
 
@@ -313,6 +420,8 @@ func TestTermString(t *testing.T) {
 	assertToString(t, RefTerm(VarTerm("foo"), StringTerm("bar"), VarTerm("i"), IntNumberTerm(0), StringTerm("baz")).Value, "foo.bar[i][0].baz")
 	assertToString(t, RefTerm(VarTerm("foo"), BooleanTerm(false), NullTerm(), StringTerm("bar")).Value, "foo[false][null].bar")
 	assertToString(t, RefTerm(VarTerm("p"), StringTerm("not")).Value, `p["not"]`)
+	assertToString(t, RefTerm(CallTerm(VarTerm("f"), VarTerm("x")), IntNumberTerm(0)).Value, "f(x)[0]")
+	assertToString(t, RefTerm(ArrayTerm(StringTerm("a"), StringTerm("b")), IntNumberTerm(0)).Value, "[\"a\", \"b\"][0]")
 	assertToString(t, ArrayTerm().Value, "[]")
 	assertToString(t, ObjectTerm().Value, "{}")
 	assertToString(t, SetTerm().Value, "set()")
@@ -376,6 +485,10 @@ func TestRefDynamic(t *testing.T) {
 	}
 	if a[:a.Dynamic()].Dynamic() != -1 {
 		t.Fatalf("Expected dynamic offset to be -1 for foo.bar")
+	}
+
+	if MustParseRef("f(x)[0]").Dynamic() != 0 {
+		t.Fatalf("Expected dynamic offset to be f(x) for foo.bar[baz.qux].corge")
 	}
 }
 
@@ -522,6 +635,41 @@ func TestSetMap(t *testing.T) {
 
 }
 
+func TestSetAddContainsLen(t *testing.T) {
+	tests := []struct {
+		add      []string
+		expected []string
+	}{
+		{[]string{`null`, `null`}, []string{`null`}},
+		{[]string{`true`, `true`, `false`}, []string{`true`, `false`}},
+		{[]string{`0`, `1`, `1`, `1.5`}, []string{`0`, `1`, `1.5`}},
+		{[]string{`"string"`, `"string"`}, []string{`"string"`}},
+		{[]string{`["other"]`, `["other"]`}, []string{`["other"]`}},
+	}
+
+	for _, tc := range tests {
+		s := NewSet()
+		for _, v := range tc.add {
+			x := MustParseTerm(v)
+			s.Add(x)
+
+			if !s.Contains(x) {
+				t.Errorf("Expected the set to contain %v", v)
+			}
+		}
+
+		if s.Len() != len(tc.expected) {
+			t.Errorf("Expected the set to have %v entries", len(tc.expected))
+		}
+
+		for _, v := range tc.expected {
+			if !s.Contains(MustParseTerm(v)) {
+				t.Errorf("Expected the set to contain %v", v)
+			}
+		}
+	}
+}
+
 func TestSetOperations(t *testing.T) {
 
 	tests := []struct {
@@ -561,12 +709,13 @@ func TestSetOperations(t *testing.T) {
 func TestSetCopy(t *testing.T) {
 	orig := MustParseTerm("{1,2,3}")
 	cpy := orig.Copy()
-	Walk(NewGenericVisitor(func(x interface{}) bool {
+	vis := NewGenericVisitor(func(x interface{}) bool {
 		if Compare(IntNumberTerm(2), x) == 0 {
 			x.(*Term).Value = String("modified")
 		}
 		return false
-	}), orig)
+	})
+	vis.Walk(orig)
 	expOrig := MustParseTerm(`{1, "modified", 3}`)
 	expCpy := MustParseTerm(`{1,2,3}`)
 	if !expOrig.Equal(orig) {

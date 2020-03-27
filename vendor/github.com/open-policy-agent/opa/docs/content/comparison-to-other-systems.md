@@ -1,6 +1,6 @@
 ---
 title: Comparison to Other Systems
-kind: documentation
+kind: misc
 weight: 16
 ---
 
@@ -51,25 +51,17 @@ In this example, RBAC makes the following authorization decisions:
 With OPA, you can write the following snippets to implement the
 example RBAC policy shown above.
 
-```ruby
+```live:rbac:module:openable
 package rbac.authz
 
-# Policy decisions are made using the following input
-#   Not part of the policy but good as documentation
-# input = {
-#     "user": "bob",
-#     "action": "read",
-#     "object": "server123"
-# }
-
 # user-role assignments
-user_roles = {
+user_roles := {
     "alice": ["engineering", "webdev"],
     "bob": ["hr"]
 }
 
 # role-permissions assignments
-role_permissions = {
+role_permissions := {
     "engineering": [{"action": "read",  "object": "server123"}],
     "webdev":      [{"action": "read",  "object": "server123"},
                     {"action": "write", "object": "server123"}],
@@ -92,6 +84,25 @@ allow {
 }
 ```
 
+```live:rbac:query:hidden
+allow
+```
+
+As you can see, querying the `allow` rule with the following input
+
+```live:rbac:input
+{
+  "user": "bob",
+  "action": "read",
+  "object": "server123"
+}
+```
+
+Results in the response you'd expect.
+
+```live:rbac:output
+```
+
 ### RBAC Separation of duty (SOD)
 
 Separation of duty (SOD) refers to the idea that there are certain
@@ -111,11 +122,11 @@ as shown below.  (Here we assume the statements below are added to the RBAC
 statements above.)
 
 
-```ruby
+```live:rbac/sod:module:openable
 # Pairs of roles that no user can be assigned to simultaneously
 sod_roles = [
 	["create-payment", "approve-payment"],
-    ["create-vendor", "pay-vendor"]
+  ["create-vendor", "pay-vendor"],
 ]
 
 # Find all users violating SOD
@@ -172,16 +183,8 @@ An example ABAC policy in english might be:
 
 OPA supports ABAC policies as shown below.
 
-```ruby
+```live:abac:module:openable
 package abac
-
-# Sample input
-# input = {
-#    "user": "alice",
-#    "ticker": "MSFT",
-#    "action": "buy",
-#    "amount": 1000000
-# }
 
 # User attributes
 user_attributes = {
@@ -194,6 +197,8 @@ ticker_attributes = {
     "MSFT": {"exchange": "NASDAQ", "price": 59.20},
     "AMZN": {"exchange": "NASDAQ", "price": 813.64}
 }
+
+default allow = false
 
 # all traders may buy NASDAQ under $2M
 allow {
@@ -222,6 +227,24 @@ allow {
 }
 ```
 
+```live:abac:query:hidden
+allow
+```
+
+```live:abac:input
+{
+  "user": "alice",
+  "ticker": "MSFT",
+  "action": "buy",
+  "amount": 1000000
+}
+```
+
+Querying the `allow` rule with the input above returns the following answer:
+
+```live:abac:output
+```
+
 In OPA, there's nothing special about users and objects.  You can attach
 attributes to anything.  And the attributes can themselves be structured JSON objects
 and have attributes on attributes on attributes, etc.  Because OPA was designed to work
@@ -234,8 +257,8 @@ Amazon Web Services (AWS) lets you create policies that can be attached to users
 and selected resources. You write `allow` and `deny` statements to enforce which users/roles can/can't
 execute which API calls on which resources under certain conditions.
 By default all API access requests are implicitly denied (i.e., not allowed). Policy statements
-can explicitly allow or deny API requests. If a request is both allowed and denied, it is always denied. 
-Let's assume that the following [customer managed policy](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_managed-vs-inline.html#customer-managed-policies) is defined in AWS: 
+can explicitly allow or deny API requests. If a request is both allowed and denied, it is always denied.
+Let's assume that the following [customer managed policy](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_managed-vs-inline.html#customer-managed-policies) is defined in AWS:
 
 ```json
 {
@@ -269,25 +292,15 @@ Let's assume that the following [customer managed policy](https://docs.aws.amazo
 }
 ```
 
-And the above policy is attached to principal alice in AWS using 
+And the above policy is attached to principal alice in AWS using
 [attach-user-policy](https://docs.aws.amazon.com/cli/latest/reference/iam/attach-user-policy.html) API.
 In OPA, you write each of the AWS `allow` statements as a separate statement, and you
 expect the input to have `principal`, `action`, and `resource` fields.
 
-```ruby
+```live:iam:module:openable
 package aws
 
-# input = {
-#     "principal": "alice",
-#     "action": "ec2:StartInstance",
-#     "resource": "arn:aws:ec2:::instance/i78999879"
-# }
 default allow = false
-
-# principals_match is true if input.principal matches 
-principals_match {
-    input.principal == "alice"
-}
 
 # FirstStatement
 allow {
@@ -310,6 +323,11 @@ allow {
     resources_match
 }
 
+# principals_match is true if input.principal matches
+principals_match {
+    input.principal == "alice"
+}
+
 # actions_match is true if input.action matches one in the list
 actions_match {
     # iterate over the actions in the list
@@ -327,9 +345,24 @@ resources_match {
     # check if input.resource matches a resource
     regex.globs_match(input.resource, resource)
 }
-
 ```
 
+```live:iam:input
+{
+  "principal": "alice",
+  "action": "ec2:StartInstance",
+  "resource": "arn:aws:ec2:::instance/i78999879"
+}
+```
+
+Querying `allow` with the input above returns the following answer:
+
+```live:iam:query:hidden
+allow
+```
+
+```live:iam:output
+```
 
 ## XACML
 
@@ -396,20 +429,11 @@ The following policy says that users from the organization Curtiss or Packard wh
 </Policy>
 ```
 
-The same statement is shown below in OPA.  Here the inputs are assumed to be roughly the
-same as for XACML: attributes of users, actions, and resources.
+The same statement is shown below in OPA.  Here the inputs are assumed to be
+roughly the same as for XACML: attributes of users, actions, and resources.
 
-```ruby
+```live:xacml:module:openable
 package xacml
-
-# input = {
-#    "user": {"name": "alice",
-#            "organization": "Packard",
-#            "nationality": "GB",
-#            "work_effort": "DetailedDesign"},
-#    "resource": {"NavigationSystem": true},
-#    "action": {"name": "read"}
-# }
 
 permit {
     # Check that resource has a "NavigationSystem" entry
@@ -429,3 +453,28 @@ permit {
 }
 ```
 
+```live:xacml:input
+{
+  "user": {
+    "name": "alice",
+    "organization": "Packard",
+    "nationality": "GB",
+    "work_effort": "DetailedDesign"
+  },
+  "resource": {
+    "NavigationSystem": true
+  },
+  "action": {
+    "name": "read"
+  }
+}
+```
+
+Querying `permit` with the input above returns the following answer:
+
+```live:xacml:query:hidden
+permit
+```
+
+```live:xacml:output
+```

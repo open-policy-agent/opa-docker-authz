@@ -5,6 +5,7 @@
 {{ $pageType    := cond $isHome "website" "article" }}
 {{ $imageUrl    := "/img/logos/opa-horizontal-color.png" | absURL }}
 {{ $twitter     := site.Params.social.twitter }}
+{{ $version     := index (split .File.Path "/") 1 }}
 
 <!-- Basic metadata -->
 <meta charset="utf-8">
@@ -40,6 +41,10 @@
 <!-- Links -->
 <link rel="canonical" content="{{ .Permalink }}">
 <link rel="shortcut icon" href="/favicon.png" type="image/x-icon"/>
+
+<!-- Algolia metadata -->
+<meta name="docsearch:language" content="en" />
+<meta name="docsearch:version" content="{{ $version }}" />
 
 <!-- Site generator -->
 {{ hugo.Generator }}

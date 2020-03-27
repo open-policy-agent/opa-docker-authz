@@ -16,6 +16,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/plugins"
 	"github.com/open-policy-agent/opa/plugins/rest"
@@ -23,8 +26,6 @@ import (
 	"github.com/open-policy-agent/opa/server"
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/util"
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 // Logger defines the interface for decision logging plugins.
@@ -233,6 +234,8 @@ func New(parsedConfig *Config, manager *plugins.Manager) *Plugin {
 
 	manager.RegisterCompilerTrigger(plugin.compilerUpdated)
 
+	manager.UpdatePluginStatus(Name, &plugins.Status{State: plugins.StateNotReady})
+
 	return plugin
 }
 
@@ -251,6 +254,7 @@ func Lookup(manager *plugins.Manager) *Plugin {
 func (p *Plugin) Start(ctx context.Context) error {
 	p.logInfo("Starting decision logger.")
 	go p.loop()
+	p.manager.UpdatePluginStatus(Name, &plugins.Status{State: plugins.StateOK})
 	return nil
 }
 
@@ -260,12 +264,11 @@ func (p *Plugin) Stop(ctx context.Context) {
 	done := make(chan struct{})
 	p.stop <- done
 	_ = <-done
+	p.manager.UpdatePluginStatus(Name, &plugins.Status{State: plugins.StateNotReady})
 }
 
 // Log appends a decision log event to the buffer for uploading.
 func (p *Plugin) Log(ctx context.Context, decision *server.Info) error {
-
-	path := strings.Replace(strings.TrimPrefix(decision.Path, "data."), ".", "/", -1)
 
 	bundles := map[string]BundleInfoV1{}
 	for name, info := range decision.Bundles {
@@ -277,7 +280,7 @@ func (p *Plugin) Log(ctx context.Context, decision *server.Info) error {
 		DecisionID:  decision.DecisionID,
 		Revision:    decision.Revision,
 		Bundles:     bundles,
-		Path:        path,
+		Path:        decision.Path,
 		Query:       decision.Query,
 		Input:       decision.Input,
 		Result:      decision.Results,
@@ -301,7 +304,7 @@ func (p *Plugin) Log(ctx context.Context, decision *server.Info) error {
 	}
 
 	if p.config.ConsoleLogs {
-		err := p.logEvent(ctx, event)
+		err := p.logEvent(event)
 		if err != nil {
 			p.logError("Failed to log to console: %v.", err)
 		}
@@ -576,7 +579,7 @@ func (p *Plugin) logrusFields() logrus.Fields {
 	}
 }
 
-func (p *Plugin) logEvent(ctx context.Context, event EventV1) error {
+func (p *Plugin) logEvent(event EventV1) error {
 	eventBuf, err := json.Marshal(&event)
 	if err != nil {
 		return err
@@ -586,6 +589,8 @@ func (p *Plugin) logEvent(ctx context.Context, event EventV1) error {
 	if err != nil {
 		return err
 	}
-	logrus.WithFields(fields).Info("Decision Log")
+	logrus.WithFields(fields).WithFields(logrus.Fields{
+		"type": "openpolicyagent.org/decision_logs",
+	}).Info("Decision Log")
 	return nil
 }

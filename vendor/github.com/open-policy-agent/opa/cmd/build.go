@@ -9,18 +9,17 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/open-policy-agent/opa/loader"
-	"github.com/open-policy-agent/opa/storage/inmem"
+	"github.com/spf13/cobra"
 
 	"github.com/open-policy-agent/opa/rego"
-	"github.com/spf13/cobra"
 )
 
 var buildParams = struct {
-	outputFile string
-	debug      bool
-	dataPaths  repeatedStringFlag
-	ignore     []string
+	outputFile  string
+	debug       bool
+	dataPaths   repeatedStringFlag
+	ignore      []string
+	bundlePaths repeatedStringFlag
 }{}
 
 var buildCommand = &cobra.Command{
@@ -33,8 +32,8 @@ executable that can be loaded into an enforcement point and evaluated with
 input values. By default, the build command produces WebAssembly (WASM)
 executables.`,
 	PreRunE: func(Cmd *cobra.Command, args []string) error {
-		if len(args) == 0 {
-			return fmt.Errorf("specify query argument")
+		if len(args) != 1 {
+			return fmt.Errorf("specify exactly one query argument")
 		}
 		return nil
 	},
@@ -58,14 +57,14 @@ func build(args []string) error {
 		rego.Query(args[0]),
 	}
 
-	loaded, err := loader.Filtered(buildParams.dataPaths.v, f.Apply)
-	if err != nil {
-		return err
+	if buildParams.dataPaths.isFlagSet() {
+		regoArgs = append(regoArgs, rego.Load(buildParams.dataPaths.v, f.Apply))
 	}
 
-	regoArgs = append(regoArgs, rego.Store(inmem.NewFromObject(loaded.Documents)))
-	for _, file := range loaded.Modules {
-		regoArgs = append(regoArgs, rego.Module(file.Name, string(file.Raw)))
+	if buildParams.bundlePaths.isFlagSet() {
+		for _, bundleDir := range buildParams.bundlePaths.v {
+			regoArgs = append(regoArgs, rego.LoadBundle(bundleDir))
+		}
 	}
 
 	if buildParams.debug {
@@ -73,7 +72,7 @@ func build(args []string) error {
 	}
 
 	r := rego.New(regoArgs...)
-	cr, err := r.Compile(ctx, rego.CompilePartial(true))
+	cr, err := r.Compile(ctx, rego.CompilePartial(false))
 	if err != nil {
 		return err
 	}
@@ -93,6 +92,7 @@ func init() {
 	buildCommand.Flags().StringVarP(&buildParams.outputFile, "output", "o", "policy.wasm", "set the filename of the compiled policy")
 	buildCommand.Flags().BoolVarP(&buildParams.debug, "debug", "D", false, "enable debug output")
 	buildCommand.Flags().VarP(&buildParams.dataPaths, "data", "d", "set data file(s) or directory path(s)")
-	setIgnore(buildCommand.Flags(), &buildParams.ignore)
+	buildCommand.Flags().VarP(&buildParams.bundlePaths, "bundle", "b", "set bundle file(s) or directory path(s)")
+	addIgnoreFlag(buildCommand.Flags(), &buildParams.ignore)
 	RootCommand.AddCommand(buildCommand)
 }

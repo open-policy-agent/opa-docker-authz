@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/spf13/cobra"
+
 	"github.com/open-policy-agent/opa/ast"
+	pr "github.com/open-policy-agent/opa/internal/presentation"
 	"github.com/open-policy-agent/opa/loader"
 	"github.com/open-policy-agent/opa/util"
-	"github.com/spf13/cobra"
 )
 
 const (
@@ -42,19 +44,19 @@ var parseCommand = &cobra.Command{
 }
 
 func parse(args []string) int {
-
 	if len(args) == 0 {
 		return 0
 	}
 
 	result, err := loader.Rego(args[0])
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
 
 	switch parseParams.format.String() {
 	case parseFormatJSON:
+		if err != nil {
+			pr.JSON(os.Stderr, pr.Output{Errors: pr.NewOutputErrors(err)})
+			return 1
+		}
+
 		bs, err := json.MarshalIndent(result.Parsed, "", "  ")
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -62,6 +64,10 @@ func parse(args []string) int {
 		}
 		fmt.Println(string(bs))
 	default:
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
 		ast.Pretty(os.Stdout, result.Parsed)
 	}
 

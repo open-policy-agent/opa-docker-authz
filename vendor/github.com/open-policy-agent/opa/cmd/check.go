@@ -5,20 +5,23 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 
+	"github.com/spf13/cobra"
+
 	"github.com/open-policy-agent/opa/ast"
+	pr "github.com/open-policy-agent/opa/internal/presentation"
 	"github.com/open-policy-agent/opa/loader"
 	"github.com/open-policy-agent/opa/util"
-	"github.com/spf13/cobra"
 )
 
 var checkParams = struct {
-	format   *util.EnumFlag
-	errLimit int
-	ignore   []string
+	format     *util.EnumFlag
+	errLimit   int
+	ignore     []string
+	bundleMode bool
 }{
 	format: util.NewEnumFlag(checkFormatPretty, []string{
 		checkFormatPretty, checkFormatJSON,
@@ -52,21 +55,33 @@ and exit with a non-zero exit code.`,
 }
 
 func checkModules(args []string) int {
-
-	f := loaderFilter{
-		Ignore: checkParams.ignore,
-	}
-
-	result, err := loader.Filtered(args, f.Apply)
-	if err != nil {
-		outputErrors(err)
-		return 1
-	}
-
 	modules := map[string]*ast.Module{}
 
-	for _, m := range result.Modules {
-		modules[m.Name] = m.Parsed
+	if checkParams.bundleMode {
+		for _, path := range args {
+			b, err := loader.NewFileLoader().AsBundle(path)
+			if err != nil {
+				outputErrors(err)
+				return 1
+			}
+			for name, mod := range b.ParsedModules(path) {
+				modules[name] = mod
+			}
+		}
+	} else {
+		f := loaderFilter{
+			Ignore: checkParams.ignore,
+		}
+
+		result, err := loader.NewFileLoader().Filtered(args, f.Apply)
+		if err != nil {
+			outputErrors(err)
+			return 1
+		}
+
+		for _, m := range result.Modules {
+			modules[m.Name] = m.Parsed
+		}
 	}
 
 	compiler := ast.NewCompiler().SetErrorLimit(checkParams.errLimit)
@@ -83,25 +98,31 @@ func checkModules(args []string) int {
 }
 
 func outputErrors(err error) {
+	var out io.Writer
+	if err != nil {
+		out = os.Stderr
+	} else {
+		out = os.Stdout
+	}
+
 	switch checkParams.format.String() {
 	case checkFormatJSON:
-		result := map[string]error{
-			"errors": err,
+		result := pr.Output{
+			Errors: pr.NewOutputErrors(err),
 		}
-		bs, err := json.MarshalIndent(result, "", "  ")
+		err := pr.JSON(out, result)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-		} else {
-			fmt.Fprintln(os.Stdout, string(bs))
+			fmt.Fprintln(os.Stderr, err.Error())
 		}
 	default:
-		fmt.Fprintln(os.Stdout, err)
+		fmt.Fprintln(out, err)
 	}
 }
 
 func init() {
-	setMaxErrors(checkCommand.Flags(), &checkParams.errLimit)
-	setIgnore(checkCommand.Flags(), &checkParams.ignore)
+	addMaxErrorsFlag(checkCommand.Flags(), &checkParams.errLimit)
+	addIgnoreFlag(checkCommand.Flags(), &checkParams.ignore)
 	checkCommand.Flags().VarP(checkParams.format, "format", "f", "set output format")
+	checkCommand.Flags().BoolVarP(&checkParams.bundleMode, "bundle", "b", false, "load paths as bundle files or root directories")
 	RootCommand.AddCommand(checkCommand)
 }
