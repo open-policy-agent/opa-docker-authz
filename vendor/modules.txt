@@ -1,0 +1,80 @@
+# github.com/Microsoft/go-winio v0.4.15-0.20200113171025-3fe6c5262873
+## explicit
+github.com/Microsoft/go-winio
+github.com/Microsoft/go-winio/pkg/guid
+# github.com/OneOfOne/xxhash v1.2.8-0.20200311020249-e4128debb93e
+## explicit
+github.com/OneOfOne/xxhash
+# github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf
+## explicit
+github.com/coreos/go-systemd/activation
+# github.com/docker/go-connections v0.4.1-0.20200120150455-7dc0a2d6ddce
+## explicit
+github.com/docker/go-connections/sockets
+# github.com/docker/go-plugins-helpers v0.0.0-20170919092928-bd8c600f0cdd
+## explicit
+github.com/docker/go-plugins-helpers/authorization
+github.com/docker/go-plugins-helpers/sdk
+# github.com/ghodss/yaml v1.0.1-0.20190212211648-25d852aebe32
+## explicit
+github.com/ghodss/yaml
+# github.com/gobwas/glob v0.2.4-0.20181002190808-e7a84e9525fe
+## explicit
+github.com/gobwas/glob
+github.com/gobwas/glob/compiler
+github.com/gobwas/glob/match
+github.com/gobwas/glob/syntax
+github.com/gobwas/glob/syntax/ast
+github.com/gobwas/glob/syntax/lexer
+github.com/gobwas/glob/util/runes
+github.com/gobwas/glob/util/strings
+# github.com/open-policy-agent/opa v0.18.0
+## explicit
+github.com/open-policy-agent/opa/ast
+github.com/open-policy-agent/opa/bundle
+github.com/open-policy-agent/opa/internal/compiler/wasm
+github.com/open-policy-agent/opa/internal/compiler/wasm/opa
+github.com/open-policy-agent/opa/internal/file/archive
+github.com/open-policy-agent/opa/internal/file/url
+github.com/open-policy-agent/opa/internal/ir
+github.com/open-policy-agent/opa/internal/leb128
+github.com/open-policy-agent/opa/internal/merge
+github.com/open-policy-agent/opa/internal/planner
+github.com/open-policy-agent/opa/internal/version
+github.com/open-policy-agent/opa/internal/wasm/constant
+github.com/open-policy-agent/opa/internal/wasm/encoding
+github.com/open-policy-agent/opa/internal/wasm/instruction
+github.com/open-policy-agent/opa/internal/wasm/module
+github.com/open-policy-agent/opa/internal/wasm/opcode
+github.com/open-policy-agent/opa/internal/wasm/types
+github.com/open-policy-agent/opa/loader
+github.com/open-policy-agent/opa/metrics
+github.com/open-policy-agent/opa/rego
+github.com/open-policy-agent/opa/storage
+github.com/open-policy-agent/opa/storage/inmem
+github.com/open-policy-agent/opa/topdown
+github.com/open-policy-agent/opa/topdown/builtins
+github.com/open-policy-agent/opa/topdown/copypropagation
+github.com/open-policy-agent/opa/topdown/internal/jwx/buffer
+github.com/open-policy-agent/opa/topdown/internal/jwx/jwa
+github.com/open-policy-agent/opa/topdown/internal/jwx/jwk
+github.com/open-policy-agent/opa/topdown/internal/jwx/jws
+github.com/open-policy-agent/opa/topdown/internal/jwx/jws/sign
+github.com/open-policy-agent/opa/topdown/internal/jwx/jws/verify
+github.com/open-policy-agent/opa/types
+github.com/open-policy-agent/opa/util
+github.com/open-policy-agent/opa/version
+# github.com/pkg/errors v0.9.1
+## explicit
+github.com/pkg/errors
+# github.com/rcrowley/go-metrics v0.0.0-20200313005456-10cdbea86bc0
+## explicit
+github.com/rcrowley/go-metrics
+# github.com/yashtewari/glob-intersection v0.0.0-20180916065949-5c77d914dd0b
+github.com/yashtewari/glob-intersection
+# golang.org/x/sys v0.0.0-20200327173247-9dae0f8f5775
+## explicit
+golang.org/x/sys/windows
+# gopkg.in/yaml.v2 v2.2.8
+## explicit
+gopkg.in/yaml.v2
