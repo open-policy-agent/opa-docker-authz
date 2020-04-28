@@ -20,14 +20,7 @@ image: build
 		.
 
 plugin: build
-	@docker container run --rm \
-		-e REPO=$(REPO) \
-		-e VERSION=$(VERSION) \
-		-v /var/run/docker.sock:/var/run/docker.sock \
-		-v $(PWD):/opa-docker-authz \
-		-w /opa-docker-authz \
-		buildpack-deps:curl \
-		./plugin.sh
+	VERSION=$(VERSION) REPO=$(REPO) ./plugin.sh
 
 plugin-push:
 	@for plugin in `docker plugin ls --format '{{.Name}}'`; do \
