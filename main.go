@@ -6,12 +6,17 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
+	"time"
 
 	"github.com/docker/go-plugins-helpers/authorization"
 	version_pkg "github.com/open-policy-agent/opa-docker-authz/version"
@@ -27,6 +32,7 @@ import (
 type DockerAuthZPlugin struct {
 	policyFile string
 	allowPath  string
+	instanceID string
 }
 
 // AuthZReq is called when the Docker daemon receives an API request. AuthZReq
@@ -70,9 +76,6 @@ func (p DockerAuthZPlugin) evaluate(ctx context.Context, r authorization.Request
 		return false, err
 	}
 
-	pretty, _ := json.MarshalIndent(input, "", "  ")
-	log.Printf("Querying OPA policy %v. Input: %s", p.allowPath, pretty)
-
 	allowed, err := func() (bool, error) {
 
 		eval := rego.New(
@@ -100,10 +103,30 @@ func (p DockerAuthZPlugin) evaluate(ctx context.Context, r authorization.Request
 
 	}()
 
+	decision_id, _ := uuid4()
+	config_hash := sha256.Sum256(bs)
+	labels := map[string]string{
+		"app":            "opa-docker-authz",
+		"id":             p.instanceID,
+		"opa_version":    version_pkg.OPAVersion,
+		"plugin_version": version_pkg.Version,
+	}
+	decision_log := map[string]interface{}{
+		"labels":      labels,
+		"decision_id": decision_id,
+		"config_hash": hex.EncodeToString(config_hash[:]),
+		"input":       input,
+		"result":      allowed,
+		"timestamp":   time.Now().Format(time.RFC3339Nano),
+	}
+
 	if err != nil {
-		log.Printf("Returning OPA policy decision: %v (error: %v)", allowed, err)
+		i, _ := json.Marshal(input)
+		log.Printf("Returning OPA policy decision: %v (error: %v; input: %v)", allowed, err, i)
 	} else {
 		log.Printf("Returning OPA policy decision: %v", allowed)
+		dl, _ := json.Marshal(decision_log)
+		log.Println(string(dl))
 	}
 
 	return allowed, err
@@ -130,6 +153,18 @@ func makeInput(r authorization.Request) (interface{}, error) {
 
 	return input, nil
 }
+
+func uuid4() (string, error) {
+	bs := make([]byte, 16)
+	n, err := io.ReadFull(rand.Reader, bs)
+	if n != len(bs) || err != nil {
+		return "", err
+	}
+	bs[8] = bs[8]&^0xc0 | 0x80
+	bs[6] = bs[6]&^0xf0 | 0x40
+	return fmt.Sprintf("%x-%x-%x-%x-%x", bs[0:4], bs[4:6], bs[6:8], bs[8:10], bs[10:]), nil
+}
+
 
 func regoSyntax(p string) int {
 
@@ -175,9 +210,11 @@ func main() {
 		os.Exit(0)
 	}
 
+	instance_id, _ := uuid4()
 	p := DockerAuthZPlugin{
 		policyFile: *policyFile,
 		allowPath:  *allowPath,
+		instanceID: instance_id,
 	}
 
 	if *check {
