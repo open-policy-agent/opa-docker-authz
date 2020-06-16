@@ -86,28 +86,43 @@ Logs are generated in a json format similar to [decision logs](https://www.openp
 
 ```
 {
-  "config_hash": "bffa4f89a49962806b21d650aea8cf086a37f85f16402e1ff7b7f4f97b8d0d30",
-  "decision_id": "65752c84-87df-4f5d-b5a3-886049811d53",
+  "config_hash": "a2e84e38eafd14a816194357860b253becbc739e601cf4307078413a0a578a89",
+  "decision_id": "8d4c6d08-b56e-4625-b66c-3e6c00d7a6e7",
   "input": {
     "AuthMethod": "",
     "Body": null,
     "Headers": {
-      "Accept-Encoding": "gzip",
-      "Connection": "close",
-      "User-Agent": "go-dockerclient"
+      "Content-Length": "0",
+      "Content-Type": "text/plain",
+      "User-Agent": "Docker-Client/19.03.11 (linux)"
     },
-    "Method": "GET",
-    "Path": "/containers/json?",
+    "Method": "POST",
+    "Path": "/v1.40/images/create?fromImage=registry.company.com%3A8885%2Fbash\\u0026tag=latest",
+    "PathArr": [
+      "",
+      "v1.40",
+      "images",
+      "create"
+    ],
+    "PathPlain": "/v1.40/images/create",
+    "Query": {
+      "fromImage": [
+        "registry.company.com:8885/bash"
+      ],
+      "tag": [
+        "latest"
+      ]
+    },
     "User": ""
   },
   "labels": {
     "app": "opa-docker-authz",
-    "id": "ee6c52bb-496e-41c2-bbfa-d056f7783d7e",
+    "id": "396f1138-ea63-4be0-9ce0-3184cb20b1dd",
     "opa_version": "v0.18.0",
-    "plugin_version": "0.7"
+    "plugin_version": "0.8"
   },
   "result": true,
-  "timestamp": "2020-05-13T21:37:29.91447041Z"
+  "timestamp": "2020-06-16T16:44:54.328705305Z"
 }
 ```
 
