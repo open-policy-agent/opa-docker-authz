@@ -15,7 +15,9 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/docker/go-plugins-helpers/authorization"
@@ -142,9 +144,17 @@ func makeInput(r authorization.Request) (interface{}, error) {
 		}
 	}
 
+	u, err := url.Parse(r.RequestURI)
+	if err != nil {
+		return nil, err
+	}
+
 	input := map[string]interface{}{
 		"Headers":    r.RequestHeaders,
 		"Path":       r.RequestURI,
+		"PathPlain":  u.Path,
+		"PathArr":    strings.Split(u.Path, "/"),
+		"Query":      u.Query(),
 		"Method":     r.RequestMethod,
 		"Body":       body,
 		"User":       r.User,
@@ -164,7 +174,6 @@ func uuid4() (string, error) {
 	bs[6] = bs[6]&^0xf0 | 0x40
 	return fmt.Sprintf("%x-%x-%x-%x-%x", bs[0:4], bs[4:6], bs[6:8], bs[8:10], bs[10:]), nil
 }
-
 
 func regoSyntax(p string) int {
 
