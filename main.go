@@ -35,6 +35,7 @@ type DockerAuthZPlugin struct {
 	policyFile string
 	allowPath  string
 	instanceID string
+	quiet      bool
 }
 
 // AuthZReq is called when the Docker daemon receives an API request. AuthZReq
@@ -127,8 +128,10 @@ func (p DockerAuthZPlugin) evaluate(ctx context.Context, r authorization.Request
 		log.Printf("Returning OPA policy decision: %v (error: %v; input: %v)", allowed, err, i)
 	} else {
 		log.Printf("Returning OPA policy decision: %v", allowed)
-		dl, _ := json.Marshal(decision_log)
-		log.Println(string(dl))
+		if !p.quiet {
+			dl, _ := json.Marshal(decision_log)
+			log.Println(string(dl))
+		}
 	}
 
 	return allowed, err
@@ -210,6 +213,7 @@ func main() {
 	policyFile := flag.String("policy-file", "policy.rego", "sets the path of the policy file to load")
 	version := flag.Bool("version", false, "print the version of the plugin")
 	check := flag.Bool("check", false, "checks the syntax of the policy-file")
+	quiet := flag.Bool("quiet", false, "disable logging of each HTTP request")
 
 	flag.Parse()
 
@@ -224,6 +228,7 @@ func main() {
 		policyFile: *policyFile,
 		allowPath:  *allowPath,
 		instanceID: instance_id,
+		quiet:      *quiet,
 	}
 
 	if *check {
