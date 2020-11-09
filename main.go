@@ -127,8 +127,8 @@ func (p DockerAuthZPlugin) evaluate(ctx context.Context, r authorization.Request
 		i, _ := json.Marshal(input)
 		log.Printf("Returning OPA policy decision: %v (error: %v; input: %v)", allowed, err, i)
 	} else {
-		log.Printf("Returning OPA policy decision: %v", allowed)
 		if !p.quiet {
+			log.Printf("Returning OPA policy decision: %v", allowed)
 			dl, _ := json.Marshal(decision_log)
 			log.Println(string(dl))
 		}
