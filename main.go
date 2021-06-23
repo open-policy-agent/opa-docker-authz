@@ -25,6 +25,7 @@ import (
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/loader"
 	"github.com/open-policy-agent/opa/rego"
+	"github.com/open-policy-agent/opa/sdk"
 )
 
 // DockerAuthZPlugin implements the authorization.Plugin interface. Every
@@ -32,10 +33,13 @@ import (
 // function. The AuthZReq function returns a response that indicates whether
 // the request should be allowed or denied.
 type DockerAuthZPlugin struct {
+	configFile string
 	policyFile string
 	allowPath  string
 	instanceID string
+	skipPing   bool
 	quiet      bool
+	opa        *sdk.OPA
 }
 
 // AuthZReq is called when the Docker daemon receives an API request. AuthZReq
@@ -58,11 +62,11 @@ func (p DockerAuthZPlugin) AuthZReq(r authorization.Request) authorization.Respo
 
 // AuthZRes is called before the Docker daemon returns an API response. All responses
 // are allowed.
-func (p DockerAuthZPlugin) AuthZRes(r authorization.Request) authorization.Response {
+func (DockerAuthZPlugin) AuthZRes(authorization.Request) authorization.Response {
 	return authorization.Response{Allow: true}
 }
 
-func (p DockerAuthZPlugin) evaluate(ctx context.Context, r authorization.Request) (bool, error) {
+func (p DockerAuthZPlugin) evaluatePolicyFile(ctx context.Context, r authorization.Request) (bool, error) {
 
 	if _, err := os.Stat(p.policyFile); os.IsNotExist(err) {
 		log.Printf("OPA policy file %s does not exist, failing open and allowing request", p.policyFile)
@@ -106,18 +110,18 @@ func (p DockerAuthZPlugin) evaluate(ctx context.Context, r authorization.Request
 
 	}()
 
-	decision_id, _ := uuid4()
-	config_hash := sha256.Sum256(bs)
+	decisionId, _ := uuid4()
+	configHash := sha256.Sum256(bs)
 	labels := map[string]string{
 		"app":            "opa-docker-authz",
 		"id":             p.instanceID,
 		"opa_version":    version_pkg.OPAVersion,
 		"plugin_version": version_pkg.Version,
 	}
-	decision_log := map[string]interface{}{
+	decisionLog := map[string]interface{}{
 		"labels":      labels,
-		"decision_id": decision_id,
-		"config_hash": hex.EncodeToString(config_hash[:]),
+		"decision_id": decisionId,
+		"config_hash": hex.EncodeToString(configHash[:]),
 		"input":       input,
 		"result":      allowed,
 		"timestamp":   time.Now().Format(time.RFC3339Nano),
@@ -129,12 +133,45 @@ func (p DockerAuthZPlugin) evaluate(ctx context.Context, r authorization.Request
 	} else {
 		if !p.quiet {
 			log.Printf("Returning OPA policy decision: %v", allowed)
-			dl, _ := json.Marshal(decision_log)
+			dl, _ := json.Marshal(decisionLog)
 			log.Println(string(dl))
 		}
 	}
 
 	return allowed, err
+}
+
+func (p DockerAuthZPlugin) evaluate(ctx context.Context, r authorization.Request) (bool, error) {
+
+	if p.skipPing && r.RequestMethod == "HEAD" && r.RequestURI == "/_ping" {
+		return true, nil
+	}
+
+	if p.configFile != "" {
+		input, err := makeInput(r)
+		if err != nil {
+			return false, err
+		}
+
+		decisionOptions := sdk.DecisionOptions{
+			Input: input,
+			Path: p.allowPath,
+		}
+
+		result, err := p.opa.Decision(ctx, decisionOptions)
+		if err != nil {
+			return false, err
+		}
+
+		decision, ok := result.Result.(bool)
+		if !ok || decision != true {
+			return false, nil
+		}
+		return true, nil
+
+	} else {
+		return p.evaluatePolicyFile(ctx, r)
+	}
 }
 
 func makeInput(r authorization.Request) (interface{}, error) {
@@ -168,6 +205,7 @@ func makeInput(r authorization.Request) (interface{}, error) {
 }
 
 func uuid4() (string, error) {
+
 	bs := make([]byte, 16)
 	n, err := io.ReadFull(rand.Reader, bs)
 	if n != len(bs) || err != nil {
@@ -184,7 +222,7 @@ func regoSyntax(p string) int {
 
 	result, err := loader.AllRegos(stuffs)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		_, _ = fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 
@@ -198,7 +236,7 @@ func regoSyntax(p string) int {
 
 	if compiler.Compile(modules); compiler.Failed() {
 		for _, err := range compiler.Errors {
-			fmt.Fprintln(os.Stderr, err)
+			_, _ = fmt.Fprintln(os.Stderr, err)
 		}
 		return 1
 	}
@@ -206,14 +244,47 @@ func regoSyntax(p string) int {
 	return 0
 }
 
+func initOPA(ctx context.Context, configFile string) (*sdk.OPA, error) {
+
+	buf, err := os.Open(configFile)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		if err = buf.Close(); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	options := sdk.Options{
+		Config: buf,
+	}
+
+	return sdk.New(ctx, options)
+}
+
+func normalizeAllowPath(path string, useConfig bool) string {
+
+	if useConfig && strings.HasPrefix(path, "data") {
+		return strings.ReplaceAll(strings.TrimPrefix(path, "data"), ".", "/")
+	}
+	if !useConfig && strings.HasPrefix(path, "/") {
+		return "data" + strings.ReplaceAll(strings.TrimPrefix(path, "data"), "/", ".")
+	}
+	return path
+}
+
 func main() {
 
 	pluginName := flag.String("plugin-name", "opa-docker-authz", "sets the plugin name that will be registered with Docker")
 	allowPath := flag.String("allowPath", "data.docker.authz.allow", "sets the path of the allow decision in OPA")
-	policyFile := flag.String("policy-file", "policy.rego", "sets the path of the policy file to load")
+	configFile := flag.String("config-file", "", "sets the path of the config file to load")
+	policyFile := flag.String("policy-file", "", "sets the path of the policy file to load")
+	skipPing := flag.Bool("skip-ping", true, "skip policy evaluation for requests to /_ping endpoint")
 	version := flag.Bool("version", false, "print the version of the plugin")
 	check := flag.Bool("check", false, "checks the syntax of the policy-file")
-	quiet := flag.Bool("quiet", false, "disable logging of each HTTP request")
+	quiet := flag.Bool("quiet", false, "disable logging of each HTTP request (policy-file mode)")
 
 	flag.Parse()
 
@@ -223,19 +294,42 @@ func main() {
 		os.Exit(0)
 	}
 
-	instance_id, _ := uuid4()
-	p := DockerAuthZPlugin{
-		policyFile: *policyFile,
-		allowPath:  *allowPath,
-		instanceID: instance_id,
-		quiet:      *quiet,
+	ctx := context.Background()
+	useConfig := *configFile != ""
+
+	var opa *sdk.OPA
+	if useConfig {
+		if *policyFile != "" {
+			log.Fatal("Only one of config-file and policy-file arguments allowed")
+		}
+
+		var err error
+		opa, err = initOPA(ctx, *configFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer opa.Stop(ctx)
 	}
 
-	if *check {
+	instanceId, _ := uuid4()
+	p := DockerAuthZPlugin{
+		configFile: *configFile,
+		policyFile: *policyFile,
+		allowPath:  normalizeAllowPath(*allowPath, useConfig),
+		instanceID: instanceId,
+		skipPing:   *skipPing,
+		quiet:      *quiet,
+		opa:        opa,
+	}
+
+	if *check && *policyFile != "" {
 		os.Exit(regoSyntax(*policyFile))
 	}
 
 	h := authorization.NewHandler(p)
 	log.Println("Starting server.")
-	h.ServeUnix(*pluginName, 0)
+	err := h.ServeUnix(*pluginName, 0)
+	if err != nil {
+		log.Printf("Failed serving on socket: %v", err)
+	}
 }

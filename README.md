@@ -24,18 +24,18 @@ To make use of the `opa-docker-authz` plugin, [TLS must be enabled](https://docs
 
 **Managed Plugin**
 
-The managed plugin is a special pre-built Docker image, and as such, has no prior knowledge of the user's intended policy. OPA policy is defined using the [Rego language](https://www.openpolicyagent.org/docs/language-reference.html), which for the purposes of the `opa-docker-authz` plugin, is contained within a file. The plugin needs to be made aware of the location of the policy file, during its installation.
+The managed plugin is a special pre-built Docker image, and as such, has no prior knowledge of the user's intended policy. OPA policy is defined using the [Rego language](https://www.openpolicyagent.org/docs/language-reference.html), which for the purposes of the `opa-docker-authz` plugin, is either contained within a file (using the `-policy-file` argument) or fetched from bundles through an OPA [configuration](https://www.openpolicyagent.org/docs/latest/configuration/) file (using the `-config-file` argument). Since the latter option allows not just remote bundles, but any of the OPA management features such as decision logging, it is the recommended choice. The plugin needs to be made aware of either the location of the policy file, or the config file, during its installation.
 
- In order to provide user-defined OPA policy, the plugin is configured with a bind mount; `/etc/docker` is mounted at `/opa` inside the plugin's container, which is its working directory. If you define your policy in a file located at the path `/etc/docker/policies/authz.rego`, for example, it will be available to the plugin at `/opa/policies/authz.rego`.
+In order to provide user-defined OPA policy or config, the plugin is configured with a bind mount; `/etc/docker` is mounted at `/opa` inside the plugin's container, which is its working directory. If you define your config in a file located at the path `/etc/docker/config/opa-conf.yaml`, for example, it will be available to the plugin at `/opa/config/opa-conf.yaml`.
 
-If the plugin is installed without a reference to a Rego policy file, all authorization requests sent to the plugin by the Docker daemon, fail open, and are authorized by the plugin.
+If the plugin is installed without a reference to a Rego policy file, or a config file, all authorization requests sent to the plugin by the Docker daemon, fail open, and are authorized by the plugin.
 
 The following steps detail how to install the managed plugin.
 
-Download the `opa-docker-authz` plugin from the Docker Hub (depending on how your Docker environment is configured, you may need to execute the following commands using the `sudo` utility), and specify the location of the policy file, using the `opa-args` key, and an appropriate value:
+Download the `opa-docker-authz` plugin from the Docker Hub (depending on how your Docker environment is configured, you may need to execute the following commands using the `sudo` utility), and specify the location of the policy file, or config file, using the `opa-args` key, and an appropriate value:
 
 ```
-$ docker plugin install --alias opa-docker-authz openpolicyagent/opa-docker-authz-v2:0.6 opa-args="-policy-file /opa/policies/authz.rego"
+$ docker plugin install --alias opa-docker-authz openpolicyagent/opa-docker-authz-v2:0.8 opa-args="-config-file /opa/config/opa-conf.yaml"
 Plugin "openpolicyagent/opa-docker-authz-v2:<VERSION>" is requesting the following privileges:
  - mount: [/etc/docker]
 Do you grant the above permissions? [y/N] y
@@ -46,7 +46,7 @@ Installed plugin openpolicyagent/opa-docker-authz-v2:<VERSION>
 Check the plugin is installed and enabled:
 
 ```
-$ docker plugin ls --format 'table {{.ID}}\t{{.Name}}\t{{.Enabled}}'
+$ docker plugin ls
 ID                  NAME                      ENABLED
 cab1329e2a5a        opa-docker-authz:latest   true
 ```
@@ -55,7 +55,7 @@ With the plugin installed and enabled, the Docker daemon needs to be configured 
 
 ```json
 {
-    "authorization-plugins": ["opa-docker-authz"]
+    "authorization-plugins": ["openpolicyagent/opa-docker-authz-v2:0.8"]
 }
 ```
 
@@ -80,7 +80,9 @@ $ docker container run -d --restart=always --name opa-docker-authz \
 
 ### Logs
 
-The activity describing the interaction between the Docker daemon and the authorization plugin, and the authorization decisions made by OPA, can be found in the daemon's logs. Their [location](https://docs.docker.com/config/daemon/#read-the-logs) is dependent on the host operating system configuration.
+If using the plugin with the `-config-file` option, full decision logging capabilities - including configuring remote endpoints - is at your disposal.
+
+If using a policy file, the activity describing the interaction between the Docker daemon and the authorization plugin, and the authorization decisions made by OPA, can be found in the daemon's logs. Their [location](https://docs.docker.com/config/daemon/#read-the-logs) is dependent on the host operating system configuration.
 
 Logs are generated in a json format similar to [decision logs](https://www.openpolicyagent.org/docs/latest/management/#decision-logs):
 

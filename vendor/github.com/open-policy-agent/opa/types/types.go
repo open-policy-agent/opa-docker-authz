@@ -30,15 +30,15 @@ type Type interface {
 	json.Marshaler
 }
 
-func (Null) typeMarker() string     { return "null" }
-func (Boolean) typeMarker() string  { return "boolean" }
-func (Number) typeMarker() string   { return "number" }
-func (String) typeMarker() string   { return "string" }
-func (*Array) typeMarker() string   { return "array" }
-func (*Object) typeMarker() string  { return "object" }
-func (*Set) typeMarker() string     { return "set" }
-func (Any) typeMarker() string      { return "any" }
-func (Function) typeMarker() string { return "function" }
+func (Null) typeMarker() string     { return typeNull }
+func (Boolean) typeMarker() string  { return typeBoolean }
+func (Number) typeMarker() string   { return typeNumber }
+func (String) typeMarker() string   { return typeString }
+func (*Array) typeMarker() string   { return typeArray }
+func (*Object) typeMarker() string  { return typeObject }
+func (*Set) typeMarker() string     { return typeSet }
+func (Any) typeMarker() string      { return typeAny }
+func (Function) typeMarker() string { return typeFunction }
 
 // Null represents the null type.
 type Null struct{}
@@ -56,7 +56,7 @@ func (t Null) MarshalJSON() ([]byte, error) {
 }
 
 func (t Null) String() string {
-	return "null"
+	return typeNull
 }
 
 // Boolean represents the boolean type.
@@ -101,7 +101,7 @@ func (t String) MarshalJSON() ([]byte, error) {
 }
 
 func (t String) String() string {
-	return "string"
+	return typeString
 }
 
 // Number represents the number type.
@@ -123,7 +123,7 @@ func (t Number) MarshalJSON() ([]byte, error) {
 }
 
 func (Number) String() string {
-	return "number"
+	return typeNumber
 }
 
 // Array represents the array type.
@@ -217,7 +217,7 @@ func (t *Set) MarshalJSON() ([]byte, error) {
 }
 
 func (t *Set) String() string {
-	prefix := "set"
+	prefix := typeSet
 	return prefix + "[" + Sprint(t.of) + "]"
 }
 
@@ -311,6 +311,16 @@ func (t *Object) DynamicValue() Type {
 	return t.dynamic.Value
 }
 
+// DynamicProperties returns the type of the object's dynamic elements.
+func (t *Object) DynamicProperties() *DynamicProperty {
+	return t.dynamic
+}
+
+// StaticProperties returns the type of the object's static elements.
+func (t *Object) StaticProperties() []*StaticProperty {
+	return t.static
+}
+
 // Keys returns the keys of the object's static elements.
 func (t *Object) Keys() []interface{} {
 	sl := make([]interface{}, 0, len(t.static))
@@ -379,10 +389,13 @@ func (t Any) Contains(other Type) bool {
 
 // MarshalJSON returns the JSON encoding of t.
 func (t Any) MarshalJSON() ([]byte, error) {
-	return json.Marshal(map[string]interface{}{
+	data := map[string]interface{}{
 		"type": t.typeMarker(),
-		"of":   []Type(t),
-	})
+	}
+	if len(t) != 0 {
+		data["of"] = []Type(t)
+	}
+	return json.Marshal(data)
 }
 
 // Merge return a new Any type that is the superset of t and other.
@@ -486,6 +499,23 @@ func (t *Function) MarshalJSON() ([]byte, error) {
 		repr["result"] = t.result
 	}
 	return json.Marshal(repr)
+}
+
+// UnmarshalJSON decodes the JSON serialized function declaration.
+func (t *Function) UnmarshalJSON(bs []byte) error {
+
+	tpe, err := Unmarshal(bs)
+	if err != nil {
+		return err
+	}
+
+	f, ok := tpe.(*Function)
+	if !ok {
+		return fmt.Errorf("invalid type")
+	}
+
+	*t = *f
+	return nil
 }
 
 // Union returns a new function represnting the union of t and other. Functions
@@ -802,6 +832,15 @@ func TypeOf(x interface{}) Type {
 		return S
 	case json.Number:
 		return N
+	case map[string]interface{}:
+		// The ast.ValueToInterface() function returns ast.Object values as map[string]interface{}
+		// so map[string]interface{} must be handled here because the type checker uses the value
+		// to interface conversion when inferring object types.
+		static := make([]*StaticProperty, 0, len(x))
+		for k, v := range x {
+			static = append(static, NewStaticProperty(k, TypeOf(v)))
+		}
+		return NewObject(static, nil)
 	case map[interface{}]interface{}:
 		static := make([]*StaticProperty, 0, len(x))
 		for k, v := range x {

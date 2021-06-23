@@ -7,10 +7,18 @@ package topdown
 import (
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 
 	"github.com/open-policy-agent/opa/ast"
+	"github.com/open-policy-agent/opa/internal/lcss"
 	"github.com/open-policy-agent/opa/topdown/builtins"
+)
+
+const (
+	minLocationWidth      = 5 // len("query")
+	maxIdealLocationWidth = 64
+	locationPadding       = 4
 )
 
 // Op defines the types of tracing events.
@@ -36,12 +44,20 @@ const (
 	// FailOp is emitted when an expression evaluates to false.
 	FailOp Op = "Fail"
 
+	// DuplicateOp is emitted when a query has produced a duplicate value. The search
+	// will stop at the point where the duplicate was emitted and backtrack.
+	DuplicateOp Op = "Duplicate"
+
 	// NoteOp is emitted when an expression invokes a tracing built-in function.
 	NoteOp Op = "Note"
 
 	// IndexOp is emitted during an expression evaluation to represent lookup
 	// matches.
 	IndexOp Op = "Index"
+
+	// WasmOp is emitted when resolving a ref using an external
+	// Resolver.
+	WasmOp Op = "Wasm"
 )
 
 // VarMetadata provides some user facing information about
@@ -58,9 +74,10 @@ type Event struct {
 	Location      *ast.Location           // The location of the Node this event relates to.
 	QueryID       uint64                  // Identifies the query this event belongs to.
 	ParentID      uint64                  // Identifies the parent query this event belongs to.
-	Locals        *ast.ValueMap           // Contains local variable bindings from the query context.
-	LocalMetadata map[ast.Var]VarMetadata // Contains metadata for the local variable bindings.
+	Locals        *ast.ValueMap           // Contains local variable bindings from the query context. Nil if variables were not included in the trace event.
+	LocalMetadata map[ast.Var]VarMetadata // Contains metadata for the local variable bindings. Nil if variables were not included in the trace event.
 	Message       string                  // Contains message for Note events.
+	Ref           *ast.Ref                // Identifies the subject ref for the event. Only applies to Index and Wasm operations.
 }
 
 // HasRule returns true if the Event contains an ast.Rule.
@@ -123,13 +140,53 @@ func (evt *Event) equalNodes(other *Event) bool {
 }
 
 // Tracer defines the interface for tracing in the top-down evaluation engine.
+// Deprecated: Use QueryTracer instead.
 type Tracer interface {
 	Enabled() bool
 	Trace(*Event)
 }
 
-// BufferTracer implements the Tracer interface by simply buffering all events
-// received.
+// QueryTracer defines the interface for tracing in the top-down evaluation engine.
+// The implementation can provide additional configuration to modify the tracing
+// behavior for query evaluations.
+type QueryTracer interface {
+	Enabled() bool
+	TraceEvent(Event)
+	Config() TraceConfig
+}
+
+// TraceConfig defines some common configuration for Tracer implementations
+type TraceConfig struct {
+	PlugLocalVars bool // Indicate whether to plug local variable bindings before calling into the tracer.
+}
+
+// legacyTracer Implements the QueryTracer interface by wrapping an older Tracer instance.
+type legacyTracer struct {
+	t Tracer
+}
+
+func (l *legacyTracer) Enabled() bool {
+	return l.t.Enabled()
+}
+
+func (l *legacyTracer) Config() TraceConfig {
+	return TraceConfig{
+		PlugLocalVars: true, // For backwards compatibility old tracers will plug local variables
+	}
+}
+
+func (l *legacyTracer) TraceEvent(evt Event) {
+	l.t.Trace(&evt)
+}
+
+// WrapLegacyTracer will create a new QueryTracer which wraps an
+// older Tracer instance.
+func WrapLegacyTracer(tracer Tracer) QueryTracer {
+	return &legacyTracer{t: tracer}
+}
+
+// BufferTracer implements the Tracer and QueryTracer interface by
+// simply buffering all events received.
 type BufferTracer []*Event
 
 // NewBufferTracer returns a new BufferTracer.
@@ -139,15 +196,23 @@ func NewBufferTracer() *BufferTracer {
 
 // Enabled always returns true if the BufferTracer is instantiated.
 func (b *BufferTracer) Enabled() bool {
-	if b == nil {
-		return false
-	}
-	return true
+	return b != nil
 }
 
 // Trace adds the event to the buffer.
+// Deprecated: Use TraceEvent instead.
 func (b *BufferTracer) Trace(evt *Event) {
 	*b = append(*b, evt)
+}
+
+// TraceEvent adds the event to the buffer.
+func (b *BufferTracer) TraceEvent(evt Event) {
+	*b = append(*b, &evt)
+}
+
+// Config returns the Tracers standard configuration
+func (b *BufferTracer) Config() TraceConfig {
+	return TraceConfig{PlugLocalVars: true}
 }
 
 // PrettyTrace pretty prints the trace to the writer.
@@ -162,10 +227,16 @@ func PrettyTrace(w io.Writer, trace []*Event) {
 // PrettyTraceWithLocation prints the trace to the writer and includes location information
 func PrettyTraceWithLocation(w io.Writer, trace []*Event) {
 	depths := depths{}
+
+	filePathAliases, longest := getShortenedFileNames(trace)
+
+	// Always include some padding between the trace and location
+	locationWidth := longest + locationPadding
+
 	for _, event := range trace {
 		depth := depths.GetOrSet(event.QueryID, event.ParentID)
-		location := formatLocation(event)
-		fmt.Fprintln(w, fmt.Sprintf("%v %v", location, formatEvent(event, depth)))
+		location := formatLocation(event, filePathAliases)
+		fmt.Fprintf(w, "%-*s %s\n", locationWidth, location, formatEvent(event, depth))
 	}
 }
 
@@ -173,16 +244,26 @@ func formatEvent(event *Event, depth int) string {
 	padding := formatEventPadding(event, depth)
 	if event.Op == NoteOp {
 		return fmt.Sprintf("%v%v %q", padding, event.Op, event.Message)
-	} else if event.Message != "" {
-		return fmt.Sprintf("%v%v %v %v", padding, event.Op, event.Node, event.Message)
-	} else {
-		switch node := event.Node.(type) {
-		case *ast.Rule:
-			return fmt.Sprintf("%v%v %v", padding, event.Op, node.Path())
-		default:
-			return fmt.Sprintf("%v%v %v", padding, event.Op, rewrite(event).Node)
-		}
 	}
+
+	var details interface{}
+	if node, ok := event.Node.(*ast.Rule); ok {
+		details = node.Path()
+	} else if event.Ref != nil {
+		details = event.Ref
+	} else {
+		details = rewrite(event).Node
+	}
+
+	template := "%v%v %v"
+	opts := []interface{}{padding, event.Op, details}
+
+	if event.Message != "" {
+		template += " %v"
+		opts = append(opts, event.Message)
+	}
+
+	return fmt.Sprintf(template, opts...)
 }
 
 func formatEventPadding(event *Event, depth int) string {
@@ -206,21 +287,103 @@ func formatEventSpaces(event *Event, depth int) int {
 	return depth + 1
 }
 
-func formatLocation(event *Event) string {
-	if event.Op == NoteOp {
-		return fmt.Sprintf("%-19v", "note")
+// getShortenedFileNames will return a map of file paths to shortened aliases
+// that were found in the trace. It also returns the longest location expected
+func getShortenedFileNames(trace []*Event) (map[string]string, int) {
+	// Get a deduplicated list of all file paths
+	// and the longest file path size
+	fpAliases := map[string]string{}
+	var canShorten [][]byte
+	longestLocation := 0
+	for _, event := range trace {
+		if event.Location != nil {
+			if event.Location.File != "" {
+				// length of "<name>:<row>"
+				curLen := len(event.Location.File) + numDigits10(event.Location.Row) + 1
+				if curLen > longestLocation {
+					longestLocation = curLen
+				}
+
+				if _, ok := fpAliases[event.Location.File]; ok {
+					continue
+				}
+
+				// Only try and shorten the middle parts of paths, ex: bundle1/.../a/b/policy.rego
+				path := filepath.Dir(event.Location.File)
+				path = strings.TrimPrefix(path, string(filepath.Separator))
+				firstSlash := strings.IndexRune(path, filepath.Separator)
+				if firstSlash > 0 {
+					path = path[firstSlash+1:]
+				}
+				canShorten = append(canShorten, []byte(path))
+
+				// Default to just alias their full path
+				fpAliases[event.Location.File] = event.Location.File
+			} else {
+				// length of "<min width>:<row>"
+				curLen := minLocationWidth + numDigits10(event.Location.Row) + 1
+				if curLen > longestLocation {
+					longestLocation = curLen
+				}
+			}
+		}
 	}
+
+	if len(canShorten) > 0 && longestLocation > maxIdealLocationWidth {
+		// Find the longest common path segment..
+		var lcs string
+		if len(canShorten) > 1 {
+			lcs = string(lcss.LongestCommonSubstring(canShorten...))
+		} else {
+			lcs = string(canShorten[0])
+		}
+
+		// Don't just swap in the full LCSS, trim it down to be the least amount of
+		// characters to reach our "ideal" width boundary giving as much
+		// detail as possible without going too long.
+		diff := maxIdealLocationWidth - (longestLocation - len(lcs) + 3)
+		if diff > 0 {
+			if diff > len(lcs) {
+				lcs = ""
+			} else {
+				// Favor data on the right hand side of the path
+				lcs = lcs[:len(lcs)-diff]
+			}
+		}
+
+		// Swap in "..." for the longest common path, but if it makes things better
+		if len(lcs) > 3 {
+			for path := range fpAliases {
+				fpAliases[path] = strings.Replace(path, lcs, "...", 1)
+			}
+
+			// Drop the overall length down to match our substitution
+			longestLocation = longestLocation - (len(lcs) - 3)
+		}
+	}
+
+	return fpAliases, longestLocation
+}
+
+func numDigits10(n int) int {
+	if n < 10 {
+		return 1
+	}
+	return numDigits10(n/10) + 1
+}
+
+func formatLocation(event *Event, fileAliases map[string]string) string {
 
 	location := event.Location
 	if location == nil {
-		return fmt.Sprintf("%-19v", "")
+		return ""
 	}
 
 	if location.File == "" {
-		return fmt.Sprintf("%-19v", fmt.Sprintf("%.15v:%v", "query", location.Row))
+		return fmt.Sprintf("query:%v", location.Row)
 	}
 
-	return fmt.Sprintf("%-19v", fmt.Sprintf("%.15v:%v", location.File, location.Row))
+	return fmt.Sprintf("%v:%v", fileAliases[location.File], location.Row)
 }
 
 // depths is a helper for computing the depth of an event. Events within the
@@ -245,31 +408,23 @@ func builtinTrace(bctx BuiltinContext, args []*ast.Term, iter func(*ast.Term) er
 		return handleBuiltinErr(ast.Trace.Name, bctx.Location, err)
 	}
 
-	if !traceIsEnabled(bctx.Tracers) {
+	if !bctx.TraceEnabled {
 		return iter(ast.BooleanTerm(true))
 	}
 
-	evt := &Event{
+	evt := Event{
 		Op:       NoteOp,
+		Location: bctx.Location,
 		QueryID:  bctx.QueryID,
 		ParentID: bctx.ParentID,
 		Message:  string(str),
 	}
 
-	for i := range bctx.Tracers {
-		bctx.Tracers[i].Trace(evt)
+	for i := range bctx.QueryTracers {
+		bctx.QueryTracers[i].TraceEvent(evt)
 	}
 
 	return iter(ast.BooleanTerm(true))
-}
-
-func traceIsEnabled(tracers []Tracer) bool {
-	for i := range tracers {
-		if tracers[i].Enabled() {
-			return true
-		}
-	}
-	return false
 }
 
 func rewrite(event *Event) *Event {
@@ -287,7 +442,7 @@ func rewrite(event *Event) *Event {
 		node = v.Copy()
 	}
 
-	ast.TransformVars(node, func(v ast.Var) (ast.Value, error) {
+	_, _ = ast.TransformVars(node, func(v ast.Var) (ast.Value, error) {
 		if meta, ok := cpy.LocalMetadata[v]; ok {
 			return meta.Name, nil
 		}

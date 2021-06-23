@@ -1,7 +1,7 @@
 .PHONY: all build
 
-VERSION := 0.7
-GO_VERSION := 1.14.1
+VERSION := 0.8
+GO_VERSION := 1.16.5
 REPO := openpolicyagent/opa-docker-authz
 
 all: build

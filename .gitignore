@@ -1,5 +1,7 @@
 # Development environments
 /.vscode
 
+.idea/
+
 # Build output
 /opa-docker-authz
