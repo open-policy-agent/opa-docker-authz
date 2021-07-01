@@ -1,8 +1,14 @@
 # github.com/Microsoft/go-winio v0.4.14
 github.com/Microsoft/go-winio
 github.com/Microsoft/go-winio/pkg/guid
-# github.com/OneOfOne/xxhash v1.2.7
+# github.com/OneOfOne/xxhash v1.2.8
 github.com/OneOfOne/xxhash
+# github.com/bytecodealliance/wasmtime-go v0.27.0
+github.com/bytecodealliance/wasmtime-go
+github.com/bytecodealliance/wasmtime-go/build/include
+github.com/bytecodealliance/wasmtime-go/build/linux-x86_64
+github.com/bytecodealliance/wasmtime-go/build/macos-x86_64
+github.com/bytecodealliance/wasmtime-go/build/windows-x86_64
 # github.com/coreos/go-systemd v0.0.0-20190719114852-fd7a80b32e1f
 github.com/coreos/go-systemd/activation
 # github.com/docker/go-connections v0.4.1-0.20190612165340-fd1b1942c4d5
@@ -21,38 +27,81 @@ github.com/gobwas/glob/syntax/ast
 github.com/gobwas/glob/syntax/lexer
 github.com/gobwas/glob/util/runes
 github.com/gobwas/glob/util/strings
-# github.com/open-policy-agent/opa v0.18.0
+# github.com/gorilla/mux v1.8.0
+github.com/gorilla/mux
+# github.com/open-policy-agent/opa v0.29.4
 github.com/open-policy-agent/opa/ast
+github.com/open-policy-agent/opa/ast/internal/scanner
+github.com/open-policy-agent/opa/ast/internal/tokens
+github.com/open-policy-agent/opa/ast/location
 github.com/open-policy-agent/opa/bundle
+github.com/open-policy-agent/opa/config
+github.com/open-policy-agent/opa/download
+github.com/open-policy-agent/opa/format
+github.com/open-policy-agent/opa/internal/bundle
+github.com/open-policy-agent/opa/internal/cidr/merge
 github.com/open-policy-agent/opa/internal/compiler/wasm
 github.com/open-policy-agent/opa/internal/compiler/wasm/opa
+github.com/open-policy-agent/opa/internal/config
+github.com/open-policy-agent/opa/internal/debug
+github.com/open-policy-agent/opa/internal/deepcopy
 github.com/open-policy-agent/opa/internal/file/archive
 github.com/open-policy-agent/opa/internal/file/url
+github.com/open-policy-agent/opa/internal/gojsonschema
 github.com/open-policy-agent/opa/internal/ir
+github.com/open-policy-agent/opa/internal/jwx/buffer
+github.com/open-policy-agent/opa/internal/jwx/jwa
+github.com/open-policy-agent/opa/internal/jwx/jwk
+github.com/open-policy-agent/opa/internal/jwx/jws
+github.com/open-policy-agent/opa/internal/jwx/jws/sign
+github.com/open-policy-agent/opa/internal/jwx/jws/verify
+github.com/open-policy-agent/opa/internal/lcss
 github.com/open-policy-agent/opa/internal/leb128
 github.com/open-policy-agent/opa/internal/merge
 github.com/open-policy-agent/opa/internal/planner
+github.com/open-policy-agent/opa/internal/ref
+github.com/open-policy-agent/opa/internal/rego/opa
+github.com/open-policy-agent/opa/internal/runtime/init
+github.com/open-policy-agent/opa/internal/semver
+github.com/open-policy-agent/opa/internal/strvals
+github.com/open-policy-agent/opa/internal/uuid
 github.com/open-policy-agent/opa/internal/version
 github.com/open-policy-agent/opa/internal/wasm/constant
 github.com/open-policy-agent/opa/internal/wasm/encoding
 github.com/open-policy-agent/opa/internal/wasm/instruction
 github.com/open-policy-agent/opa/internal/wasm/module
 github.com/open-policy-agent/opa/internal/wasm/opcode
+github.com/open-policy-agent/opa/internal/wasm/sdk/internal/wasm
+github.com/open-policy-agent/opa/internal/wasm/sdk/opa
+github.com/open-policy-agent/opa/internal/wasm/sdk/opa/capabilities
+github.com/open-policy-agent/opa/internal/wasm/sdk/opa/errors
 github.com/open-policy-agent/opa/internal/wasm/types
+github.com/open-policy-agent/opa/keys
 github.com/open-policy-agent/opa/loader
+github.com/open-policy-agent/opa/logging
 github.com/open-policy-agent/opa/metrics
+github.com/open-policy-agent/opa/plugins
+github.com/open-policy-agent/opa/plugins/bundle
+github.com/open-policy-agent/opa/plugins/discovery
+github.com/open-policy-agent/opa/plugins/logs
+github.com/open-policy-agent/opa/plugins/rest
+github.com/open-policy-agent/opa/plugins/status
 github.com/open-policy-agent/opa/rego
+github.com/open-policy-agent/opa/resolver
+github.com/open-policy-agent/opa/resolver/wasm
+github.com/open-policy-agent/opa/sdk
+github.com/open-policy-agent/opa/server
+github.com/open-policy-agent/opa/server/authorizer
+github.com/open-policy-agent/opa/server/identifier
+github.com/open-policy-agent/opa/server/types
+github.com/open-policy-agent/opa/server/writer
 github.com/open-policy-agent/opa/storage
 github.com/open-policy-agent/opa/storage/inmem
 github.com/open-policy-agent/opa/topdown
 github.com/open-policy-agent/opa/topdown/builtins
+github.com/open-policy-agent/opa/topdown/cache
 github.com/open-policy-agent/opa/topdown/copypropagation
-github.com/open-policy-agent/opa/topdown/internal/jwx/buffer
-github.com/open-policy-agent/opa/topdown/internal/jwx/jwa
-github.com/open-policy-agent/opa/topdown/internal/jwx/jwk
-github.com/open-policy-agent/opa/topdown/internal/jwx/jws
-github.com/open-policy-agent/opa/topdown/internal/jwx/jws/sign
-github.com/open-policy-agent/opa/topdown/internal/jwx/jws/verify
+github.com/open-policy-agent/opa/topdown/lineage
 github.com/open-policy-agent/opa/types
 github.com/open-policy-agent/opa/util
 github.com/open-policy-agent/opa/version
@@ -60,9 +109,30 @@ github.com/open-policy-agent/opa/version
 github.com/pkg/errors
 # github.com/rcrowley/go-metrics v0.0.0-20200313005456-10cdbea86bc0
 github.com/rcrowley/go-metrics
+# github.com/sirupsen/logrus v1.8.1
+github.com/sirupsen/logrus
+# github.com/xeipuuv/gojsonpointer v0.0.0-20190905194746-02993c407bfb
+github.com/xeipuuv/gojsonpointer
+# github.com/xeipuuv/gojsonreference v0.0.0-20180127040603-bd5ef7bd5415
+github.com/xeipuuv/gojsonreference
 # github.com/yashtewari/glob-intersection v0.0.0-20180916065949-5c77d914dd0b
 github.com/yashtewari/glob-intersection
-# golang.org/x/sys v0.0.0-20200406113430-c6e801f48ba2
+# golang.org/x/net v0.0.0-20210405180319-a5a99cb37ef4
+golang.org/x/net/http/httpguts
+golang.org/x/net/http2
+golang.org/x/net/http2/h2c
+golang.org/x/net/http2/hpack
+golang.org/x/net/idna
+# golang.org/x/sys v0.0.0-20210510120138-977fb7262007
+golang.org/x/sys/internal/unsafeheader
+golang.org/x/sys/unix
 golang.org/x/sys/windows
-# gopkg.in/yaml.v2 v2.2.8
+# golang.org/x/text v0.3.5
+golang.org/x/text/secure/bidirule
+golang.org/x/text/transform
+golang.org/x/text/unicode/bidi
+golang.org/x/text/unicode/norm
+# golang.org/x/time v0.0.0-20210220033141-f8bda1e9f3ba
+golang.org/x/time/rate
+# gopkg.in/yaml.v2 v2.4.0
 gopkg.in/yaml.v2
