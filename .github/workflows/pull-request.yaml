@@ -1,0 +1,35 @@
+name: PR Check
+
+on: [pull_request]
+
+jobs:
+
+  build:
+    name: Build
+    runs-on: ubuntu-20.04
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v2
+
+    - name: Build (Linux)
+      run: make build
+
+  test:
+    name: Test
+    runs-on: ubuntu-20.04
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v2
+
+    - name: Unit Test
+      run: make test
+
+  lint:
+    name: Go Lint
+    runs-on: ubuntu-18.04
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v2
+
+    - name: Golang Style and Lint Check
+      run: make check

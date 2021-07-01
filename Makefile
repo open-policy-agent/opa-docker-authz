@@ -7,6 +7,15 @@ REPO := openpolicyagent/opa-docker-authz
 
 all: build
 
+check:
+	docker run --rm -v $(shell pwd):/app -w /app golangci/golangci-lint:${GOLANGCI_LINT_VERSION} golangci-lint run -v
+
+fmt:
+	docker run --rm -v $(shell pwd):/app -w /app golangci/golangci-lint:${GOLANGCI_LINT_VERSION} golangci-lint run -v --fix
+
+test:
+	go test
+
 build:
 	@docker container run --rm \
 		-e VERSION=$(VERSION) \
@@ -32,12 +41,6 @@ plugin-push:
 		fi \
 	done; \
 	echo "\nNo local copy of $(REPO)-v2:$(VERSION) exists, create it before attempting push"
-
-check:
-	docker run --rm -v $(shell pwd):/app -w /app golangci/golangci-lint:${GOLANGCI_LINT_VERSION} golangci-lint run -v
-
-fmt:
-	docker run --rm -v $(shell pwd):/app -w /app golangci/golangci-lint:${GOLANGCI_LINT_VERSION} golangci-lint run -v --fix
 
 clean:
 	@if [ -f ./opa-docker-authz ]; then \
