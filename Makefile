@@ -2,9 +2,19 @@
 
 VERSION := 0.8
 GO_VERSION := 1.16.5
+GOLANGCI_LINT_VERSION := v1.40.1
 REPO := openpolicyagent/opa-docker-authz
 
 all: build
+
+check:
+	docker run --rm -v $(shell pwd):/app -w /app golangci/golangci-lint:${GOLANGCI_LINT_VERSION} golangci-lint run -v
+
+fmt:
+	docker run --rm -v $(shell pwd):/app -w /app golangci/golangci-lint:${GOLANGCI_LINT_VERSION} golangci-lint run -v --fix
+
+test:
+	go test
 
 build:
 	@docker container run --rm \

@@ -110,7 +110,7 @@ func (p DockerAuthZPlugin) evaluatePolicyFile(ctx context.Context, r authorizati
 
 	}()
 
-	decisionId, _ := uuid4()
+	decisionID, _ := uuid4()
 	configHash := sha256.Sum256(bs)
 	labels := map[string]string{
 		"app":            "opa-docker-authz",
@@ -120,7 +120,7 @@ func (p DockerAuthZPlugin) evaluatePolicyFile(ctx context.Context, r authorizati
 	}
 	decisionLog := map[string]interface{}{
 		"labels":      labels,
-		"decision_id": decisionId,
+		"decision_id": decisionID,
 		"config_hash": hex.EncodeToString(configHash[:]),
 		"input":       input,
 		"result":      allowed,
@@ -155,7 +155,7 @@ func (p DockerAuthZPlugin) evaluate(ctx context.Context, r authorization.Request
 
 		decisionOptions := sdk.DecisionOptions{
 			Input: input,
-			Path: p.allowPath,
+			Path:  p.allowPath,
 		}
 
 		result, err := p.opa.Decision(ctx, decisionOptions)
@@ -164,14 +164,14 @@ func (p DockerAuthZPlugin) evaluate(ctx context.Context, r authorization.Request
 		}
 
 		decision, ok := result.Result.(bool)
-		if !ok || decision != true {
+		if !ok || !decision {
 			return false, nil
 		}
 		return true, nil
 
-	} else {
-		return p.evaluatePolicyFile(ctx, r)
 	}
+
+	return p.evaluatePolicyFile(ctx, r)
 }
 
 func makeInput(r authorization.Request) (interface{}, error) {
@@ -311,12 +311,12 @@ func main() {
 		defer opa.Stop(ctx)
 	}
 
-	instanceId, _ := uuid4()
+	instanceID, _ := uuid4()
 	p := DockerAuthZPlugin{
 		configFile: *configFile,
 		policyFile: *policyFile,
 		allowPath:  normalizeAllowPath(*allowPath, useConfig),
-		instanceID: instanceId,
+		instanceID: instanceID,
 		skipPing:   *skipPing,
 		quiet:      *quiet,
 		opa:        opa,
