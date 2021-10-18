@@ -17,6 +17,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -176,7 +177,7 @@ func (p DockerAuthZPlugin) evaluate(ctx context.Context, r authorization.Request
 
 func makeInput(r authorization.Request) (interface{}, error) {
 
-	var body interface{}
+	var body map[string]interface{}
 
 	if r.RequestHeaders["Content-Type"] == "application/json" && len(r.RequestBody) > 0 {
 		if err := json.Unmarshal(r.RequestBody, &body); err != nil {
@@ -189,6 +190,23 @@ func makeInput(r authorization.Request) (interface{}, error) {
 		return nil, err
 	}
 
+	// resolve bind mount paths to symlink targets
+	var bindMounts []string
+	hostConfig, ok := body["HostConfig"].(map[string]interface{})
+	if ok {
+		for _, v := range hostConfig["Binds"].([]interface{}) {
+			bind := v.(string)
+			if strings.HasPrefix(bind, "/") {
+				hostPath := strings.Split(bind, ":")[0]
+				resolved, err := filepath.EvalSymlinks(hostPath)
+				if err == nil {
+					bindMounts = append(bindMounts, resolved)
+				}
+			}
+		}
+		// TODO: check Mounts of Type bind as well
+	}
+
 	input := map[string]interface{}{
 		"Headers":    r.RequestHeaders,
 		"Path":       r.RequestURI,
@@ -199,6 +217,7 @@ func makeInput(r authorization.Request) (interface{}, error) {
 		"Body":       body,
 		"User":       r.User,
 		"AuthMethod": r.UserAuthNMethod,
+		"BindMounts": bindMounts,
 	}
 
 	return input, nil
