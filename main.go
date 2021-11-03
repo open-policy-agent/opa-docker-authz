@@ -192,15 +192,26 @@ func makeInput(r authorization.Request) (interface{}, error) {
 
 	// resolve bind mount paths to symlink targets
 	var bindMounts []string
+	var bindMountsResolved []string
+	var bindMountsResolvedRO []string
 	hostConfig, ok := body["HostConfig"].(map[string]interface{})
 	if ok {
 		for _, v := range hostConfig["Binds"].([]interface{}) {
-			bind := v.(string)
-			if strings.HasPrefix(bind, "/") {
-				hostPath := strings.Split(bind, ":")[0]
+			bindParts := strings.Split(v.(string), ":")
+			hostPath := bindParts[0]
+			if strings.HasPrefix(hostPath, "/") {
+				bindMounts = append(bindMounts, hostPath)
 				resolved, err := filepath.EvalSymlinks(hostPath)
 				if err == nil {
-					bindMounts = append(bindMounts, resolved)
+					// if it exists add to bindMountsResolved
+					bindMountsResolved = append(bindMountsResolved, resolved)
+					// if it also is a ReadOnly mount, add to bindMountsResolvedRO
+					if len(bindParts) == 3 {
+						opt := bindParts[2]
+						if opt == "ro" {
+							bindMountsResolvedRO = append(bindMountsResolvedRO, resolved)
+						}
+					}
 				}
 			}
 		}
@@ -208,16 +219,18 @@ func makeInput(r authorization.Request) (interface{}, error) {
 	}
 
 	input := map[string]interface{}{
-		"Headers":    r.RequestHeaders,
-		"Path":       r.RequestURI,
-		"PathPlain":  u.Path,
-		"PathArr":    strings.Split(u.Path, "/"),
-		"Query":      u.Query(),
-		"Method":     r.RequestMethod,
-		"Body":       body,
-		"User":       r.User,
-		"AuthMethod": r.UserAuthNMethod,
-		"BindMounts": bindMounts,
+		"Headers":              r.RequestHeaders,
+		"Path":                 r.RequestURI,
+		"PathPlain":            u.Path,
+		"PathArr":              strings.Split(u.Path, "/"),
+		"Query":                u.Query(),
+		"Method":               r.RequestMethod,
+		"Body":                 body,
+		"User":                 r.User,
+		"AuthMethod":           r.UserAuthNMethod,
+		"BindMounts":           bindMounts,
+		"BindMountsResolved":   bindMountsResolved,
+		"BindMountsResolvedRO": bindMountsResolvedRO,
 	}
 
 	return input, nil
