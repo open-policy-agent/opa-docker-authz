@@ -33,13 +33,14 @@ import (
 // function. The AuthZReq function returns a response that indicates whether
 // the request should be allowed or denied.
 type DockerAuthZPlugin struct {
-	configFile string
-	policyFile string
-	allowPath  string
-	instanceID string
-	skipPing   bool
-	quiet      bool
-	opa        *sdk.OPA
+	configFile    string
+	policyFile    string
+	allowPath     string
+	instanceID    string
+	skipPing      bool
+	quiet         bool
+	logOnlyDenied bool
+	opa           *sdk.OPA
 }
 
 // AuthZReq is called when the Docker daemon receives an API request. AuthZReq
@@ -132,8 +133,10 @@ func (p DockerAuthZPlugin) evaluatePolicyFile(ctx context.Context, r authorizati
 		log.Printf("Returning OPA policy decision: %v (error: %v; input: %v)", allowed, err, i)
 	} else {
 		if !p.quiet {
-			dl, _ := json.Marshal(decisionLog)
-			log.Printf("Returning OPA policy decision: %v: %s", allowed, string(dl))
+			if !(p.logOnlyDenied && allowed) {
+				dl, _ := json.Marshal(decisionLog)
+				log.Printf("Returning OPA policy decision: %v: %s", allowed, string(dl))
+			}
 		}
 	}
 
@@ -284,6 +287,7 @@ func main() {
 	version := flag.Bool("version", false, "print the version of the plugin")
 	check := flag.Bool("check", false, "checks the syntax of the policy-file")
 	quiet := flag.Bool("quiet", false, "disable logging of each HTTP request (policy-file mode)")
+	logOnlyDenied := flag.Bool("log-only-denied", false, "only log denied requests (policy-file mode)")
 
 	flag.Parse()
 
@@ -312,13 +316,14 @@ func main() {
 
 	instanceID, _ := uuid4()
 	p := DockerAuthZPlugin{
-		configFile: *configFile,
-		policyFile: *policyFile,
-		allowPath:  normalizeAllowPath(*allowPath, useConfig),
-		instanceID: instanceID,
-		skipPing:   *skipPing,
-		quiet:      *quiet,
-		opa:        opa,
+		configFile:    *configFile,
+		policyFile:    *policyFile,
+		allowPath:     normalizeAllowPath(*allowPath, useConfig),
+		instanceID:    instanceID,
+		skipPing:      *skipPing,
+		quiet:         *quiet,
+		logOnlyDenied: *logOnlyDenied,
+		opa:           opa,
 	}
 
 	if *check && *policyFile != "" {
