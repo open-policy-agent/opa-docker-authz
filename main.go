@@ -132,9 +132,8 @@ func (p DockerAuthZPlugin) evaluatePolicyFile(ctx context.Context, r authorizati
 		log.Printf("Returning OPA policy decision: %v (error: %v; input: %v)", allowed, err, i)
 	} else {
 		if !p.quiet {
-			log.Printf("Returning OPA policy decision: %v", allowed)
 			dl, _ := json.Marshal(decisionLog)
-			log.Println(string(dl))
+			log.Printf("Returning OPA policy decision: %v: %s", allowed, string(dl))
 		}
 	}
 
