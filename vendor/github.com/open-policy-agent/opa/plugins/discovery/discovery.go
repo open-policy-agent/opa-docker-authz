@@ -9,6 +9,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/open-policy-agent/opa/ast"
@@ -34,15 +37,17 @@ const Name = "discovery"
 // started it will periodically download a configuration bundle and try to
 // reconfigure the OPA.
 type Discovery struct {
-	manager    *plugins.Manager
-	config     *Config
-	factories  map[string]plugins.Factory
-	downloader *download.Downloader // discovery bundle downloader
-	status     *bundle.Status       // discovery status
-	etag       string               // discovery bundle etag for caching purposes
-	metrics    metrics.Metrics
-	readyOnce  sync.Once
-	logger     logging.Logger
+	manager      *plugins.Manager
+	config       *Config
+	factories    map[string]plugins.Factory
+	downloader   bundle.Loader                       // discovery bundle downloader
+	status       *bundle.Status                      // discovery status
+	listenersMtx sync.Mutex                          // lock for listener map
+	listeners    map[interface{}]func(bundle.Status) // listeners for discovery update events
+	etag         string                              // discovery bundle etag for caching purposes
+	metrics      metrics.Metrics
+	readyOnce    sync.Once
+	logger       logging.Logger
 }
 
 // Factories provides a set of factory functions to use for
@@ -76,19 +81,29 @@ func New(manager *plugins.Manager, opts ...func(*Discovery)) (*Discovery, error)
 	if err != nil {
 		return nil, err
 	} else if config == nil {
-		if _, err := getPluginSet(result.factories, manager, manager.Config, result.metrics); err != nil {
+		if _, err := getPluginSet(result.factories, manager, manager.Config, result.metrics, nil); err != nil {
 			return nil, err
 		}
 		return result, nil
 	}
 
-	if manager.Config.PluginsEnabled() {
-		return nil, fmt.Errorf("plugins cannot be specified in the bootstrap configuration when discovery enabled")
+	if names := manager.Config.PluginNames(); len(names) > 0 {
+		return nil, fmt.Errorf("discovery prohibits manual configuration of %v", strings.Join(names, " and "))
 	}
 
 	result.config = config
-	result.downloader = download.New(config.Config, manager.Client(config.service), config.path).WithCallback(result.oneShot).
-		WithBundleVerificationConfig(config.Signing)
+	restClient := manager.Client(config.service)
+	if strings.ToLower(restClient.Config().Type) == "oci" {
+		ociStorePath := filepath.Join(os.TempDir(), "opa", "oci") // use temporary folder /tmp/opa/oci
+		if manager.Config.PersistenceDirectory != nil {
+			ociStorePath = filepath.Join(*manager.Config.PersistenceDirectory, "oci")
+		}
+		result.downloader = download.NewOCI(config.Config, restClient, config.path, ociStorePath).WithCallback(result.oneShot).
+			WithBundleVerificationConfig(config.Signing)
+	} else {
+		result.downloader = download.New(config.Config, restClient, config.path).WithCallback(result.oneShot).
+			WithBundleVerificationConfig(config.Signing)
+	}
 	result.status = &bundle.Status{
 		Name: Name,
 	}
@@ -123,12 +138,52 @@ func (c *Discovery) Stop(ctx context.Context) {
 func (*Discovery) Reconfigure(context.Context, interface{}) {
 }
 
+// Lookup returns the discovery plugin registered with the manager.
+func Lookup(manager *plugins.Manager) *Discovery {
+	if p := manager.Plugin(Name); p != nil {
+		return p.(*Discovery)
+	}
+	return nil
+}
+
+func (c *Discovery) TriggerMode() *plugins.TriggerMode {
+	if c.config == nil {
+		return nil
+	}
+	return c.config.Trigger
+}
+
+func (c *Discovery) Trigger(ctx context.Context) error {
+	if c.downloader == nil {
+		return nil
+	}
+	return c.downloader.Trigger(ctx)
+}
+
+func (c *Discovery) RegisterListener(name interface{}, f func(bundle.Status)) {
+	c.listenersMtx.Lock()
+	defer c.listenersMtx.Unlock()
+
+	if c.listeners == nil {
+		c.listeners = map[interface{}]func(bundle.Status){}
+	}
+
+	c.listeners[name] = f
+}
+
 func (c *Discovery) oneShot(ctx context.Context, u download.Update) {
 
 	c.processUpdate(ctx, u)
 
 	if p := status.Lookup(c.manager); p != nil {
 		p.UpdateDiscoveryStatus(*c.status)
+	}
+
+	c.listenersMtx.Lock()
+	defer c.listenersMtx.Unlock()
+
+	for _, f := range c.listeners {
+		f(*c.status)
 	}
 }
 
@@ -145,7 +200,9 @@ func (c *Discovery) processUpdate(ctx context.Context, u download.Update) {
 	c.status.LastSuccessfulRequest = c.status.LastRequest
 
 	if u.Bundle != nil {
+		c.status.Type = u.Bundle.Type()
 		c.status.LastSuccessfulDownload = c.status.LastSuccessfulRequest
+		c.status.SetBundleSize(u.Size)
 
 		if err := c.reconfigure(ctx, u); err != nil {
 			c.logger.Error("Discovery reconfiguration error occurred: %v", err)
@@ -214,7 +271,7 @@ func (c *Discovery) processBundle(ctx context.Context, b *bundleApi.Bundle) (*pl
 		Raw:        config.Services,
 		AuthPlugin: c.manager.AuthPlugin,
 		Keys:       c.manager.PublicKeys(),
-		Logger:     c.logger.WithFields(c.manager.Client(c.config.service).Logger().GetFields()),
+		Logger:     c.logger.WithFields(c.manager.Client(c.config.service).LoggerFields()),
 	}
 	services, err := cfg.ParseServicesConfig(opts)
 	if err != nil {
@@ -234,10 +291,12 @@ func (c *Discovery) processBundle(ctx context.Context, b *bundleApi.Bundle) (*pl
 		return nil, err
 	}
 
-	for key, kc := range keys {
-		if curr, ok := c.config.Signing.PublicKeys[key]; ok {
-			if !curr.Equal(kc) {
-				return nil, fmt.Errorf("updates to keys specified in the boot configuration are not allowed")
+	if c.config.Signing != nil {
+		for key, kc := range keys {
+			if curr, ok := c.config.Signing.PublicKeys[key]; ok {
+				if !curr.Equal(kc) {
+					return nil, fmt.Errorf("updates to keys specified in the boot configuration are not allowed")
+				}
 			}
 		}
 	}
@@ -246,7 +305,7 @@ func (c *Discovery) processBundle(ctx context.Context, b *bundleApi.Bundle) (*pl
 		return nil, err
 	}
 
-	return getPluginSet(c.factories, c.manager, config, c.metrics)
+	return getPluginSet(c.factories, c.manager, config, c.metrics, c.config.Trigger)
 }
 
 func evaluateBundle(ctx context.Context, id string, info *ast.Term, b *bundleApi.Bundle, query string) (*config.Config, error) {
@@ -259,7 +318,7 @@ func evaluateBundle(ctx context.Context, id string, info *ast.Term, b *bundleApi
 		return nil, compiler.Errors
 	}
 
-	store := inmem.NewFromObject(b.Data)
+	store := inmem.NewFromObjectWithOpts(b.Data, inmem.OptRoundTripOnWrite(false))
 
 	rego := rego.New(
 		rego.Query(query),
@@ -301,7 +360,7 @@ type pluginfactory struct {
 	config  interface{}
 }
 
-func getPluginSet(factories map[string]plugins.Factory, manager *plugins.Manager, config *config.Config, m metrics.Metrics) (*pluginSet, error) {
+func getPluginSet(factories map[string]plugins.Factory, manager *plugins.Manager, config *config.Config, m metrics.Metrics, trigger *plugins.TriggerMode) (*pluginSet, error) {
 
 	// Parse and validate plugin configurations.
 	pluginNames := []string{}
@@ -336,7 +395,7 @@ func getPluginSet(factories map[string]plugins.Factory, manager *plugins.Manager
 	}
 	if bundleConfig == nil {
 		bundleConfig, err = bundle.NewConfigBuilder().WithBytes(config.Bundles).WithServices(manager.Services()).
-			WithKeyConfigs(manager.PublicKeys()).Parse()
+			WithKeyConfigs(manager.PublicKeys()).WithTriggerMode(trigger).Parse()
 		if err != nil {
 			return nil, err
 		}
@@ -344,12 +403,14 @@ func getPluginSet(factories map[string]plugins.Factory, manager *plugins.Manager
 		manager.Logger().Warn("Deprecated 'bundle' configuration specified. Use 'bundles' instead. See https://www.openpolicyagent.org/docs/latest/configuration/#bundles")
 	}
 
-	decisionLogsConfig, err := logs.ParseConfig(config.DecisionLogs, manager.Services(), pluginNames)
+	decisionLogsConfig, err := logs.NewConfigBuilder().WithBytes(config.DecisionLogs).WithServices(manager.Services()).
+		WithPlugins(pluginNames).WithTriggerMode(trigger).Parse()
 	if err != nil {
 		return nil, err
 	}
 
-	statusConfig, err := status.ParseConfig(config.Status, manager.Services(), pluginNames)
+	statusConfig, err := status.NewConfigBuilder().WithBytes(config.Status).WithServices(manager.Services()).
+		WithPlugins(pluginNames).WithTriggerMode(trigger).Parse()
 	if err != nil {
 		return nil, err
 	}

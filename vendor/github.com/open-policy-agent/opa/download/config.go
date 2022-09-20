@@ -7,11 +7,19 @@ package download
 import (
 	"fmt"
 	"time"
+
+	"github.com/open-policy-agent/opa/plugins"
 )
 
 const (
 	defaultMinDelaySeconds = int64(60)
 	defaultMaxDelaySeconds = int64(120)
+
+	// deltaBundleMode indicates that OPA supports delta bundle processing
+	deltaBundleMode = "delta"
+
+	// defaultBundleMode indicates that OPA supports snapshot bundle processing
+	defaultBundleMode = "snapshot"
 )
 
 // PollingConfig represents polling configuration for the downloader.
@@ -23,12 +31,25 @@ type PollingConfig struct {
 
 // Config represents the configuration for the downloader.
 type Config struct {
-	Polling PollingConfig `json:"polling"`
+	Trigger *plugins.TriggerMode `json:"trigger,omitempty"`
+	Polling PollingConfig        `json:"polling"`
 }
 
 // ValidateAndInjectDefaults checks for configuration errors and ensures all
 // values are set on the Config object.
 func (c *Config) ValidateAndInjectDefaults() error {
+
+	if c.Trigger == nil {
+		t := plugins.DefaultTriggerMode
+		c.Trigger = &t
+	}
+
+	switch *c.Trigger {
+	case plugins.TriggerPeriodic, plugins.TriggerManual:
+		break
+	default:
+		return fmt.Errorf("invalid trigger mode %q (want %q or %q)", *c.Trigger, plugins.TriggerPeriodic, plugins.TriggerManual)
+	}
 
 	min := defaultMinDelaySeconds
 	max := defaultMaxDelaySeconds

@@ -1,6 +1,8 @@
 package logging
 
 import (
+	"io"
+
 	"github.com/sirupsen/logrus"
 )
 
@@ -26,23 +28,36 @@ type Logger interface {
 	Warn(fmt string, a ...interface{})
 
 	WithFields(map[string]interface{}) Logger
-	GetFields() map[string]interface{}
 
 	GetLevel() Level
 	SetLevel(Level)
 }
 
-// StandardLogger is the default OPA logger
+// StandardLogger is the default OPA logger implementation.
 type StandardLogger struct {
 	logger *logrus.Logger
 	fields map[string]interface{}
 }
 
-// NewStandardLogger instantiates new default OPA logger
-func NewStandardLogger() *StandardLogger {
+// New returns a new standard logger.
+func New() *StandardLogger {
+	return &StandardLogger{
+		logger: logrus.New(),
+	}
+}
+
+// Get returns the standard logger used throughout OPA.
+//
+// Deprecated. Do not rely on the global logger.
+func Get() *StandardLogger {
 	return &StandardLogger{
 		logger: logrus.StandardLogger(),
 	}
+}
+
+// SetOutput sets the underlying logrus output.
+func (l *StandardLogger) SetOutput(w io.Writer) {
+	l.logger.SetOutput(w)
 }
 
 // SetFormatter sets the underlying logrus formatter.
@@ -63,8 +78,8 @@ func (l *StandardLogger) WithFields(fields map[string]interface{}) Logger {
 	return &cp
 }
 
-// GetFields returns additional fields of this logger
-func (l *StandardLogger) GetFields() map[string]interface{} {
+// getFields returns additional fields of this logger
+func (l *StandardLogger) getFields() map[string]interface{} {
 	return l.fields
 }
 
@@ -72,8 +87,8 @@ func (l *StandardLogger) GetFields() map[string]interface{} {
 func (l *StandardLogger) SetLevel(level Level) {
 	var logrusLevel logrus.Level
 	switch level {
-	case Error:
-		logrusLevel = logrus.ErrorLevel
+	case Error: // set logging level report Warn or higher (includes Error)
+		logrusLevel = logrus.WarnLevel
 	case Warn:
 		logrusLevel = logrus.WarnLevel
 	case Info:
@@ -94,10 +109,8 @@ func (l *StandardLogger) GetLevel() Level {
 
 	var level Level
 	switch logrusLevel {
-	case logrus.ErrorLevel:
-		level = Error
 	case logrus.WarnLevel:
-		level = Warn
+		level = Error
 	case logrus.InfoLevel:
 		level = Info
 	case logrus.DebugLevel:
@@ -112,22 +125,22 @@ func (l *StandardLogger) GetLevel() Level {
 
 // Debug logs at debug level
 func (l *StandardLogger) Debug(fmt string, a ...interface{}) {
-	l.logger.WithFields(l.GetFields()).Debugf(fmt, a...)
+	l.logger.WithFields(l.getFields()).Debugf(fmt, a...)
 }
 
 // Info logs at info level
 func (l *StandardLogger) Info(fmt string, a ...interface{}) {
-	l.logger.WithFields(l.GetFields()).Infof(fmt, a...)
+	l.logger.WithFields(l.getFields()).Infof(fmt, a...)
 }
 
 // Error logs at error level
 func (l *StandardLogger) Error(fmt string, a ...interface{}) {
-	l.logger.WithFields(l.GetFields()).Errorf(fmt, a...)
+	l.logger.WithFields(l.getFields()).Errorf(fmt, a...)
 }
 
 // Warn logs at warn level
 func (l *StandardLogger) Warn(fmt string, a ...interface{}) {
-	l.logger.WithFields(l.GetFields()).Errorf(fmt, a...)
+	l.logger.WithFields(l.getFields()).Warnf(fmt, a...)
 }
 
 // NoOpLogger logging implementation that does nothing
@@ -149,12 +162,6 @@ func (l *NoOpLogger) WithFields(fields map[string]interface{}) Logger {
 	cp := *l
 	cp.fields = fields
 	return &cp
-}
-
-// GetFields returns additional fields of this logger
-// Implemented here primarily to be able to switch between implementations without loss of data.
-func (l *NoOpLogger) GetFields() map[string]interface{} {
-	return l.fields
 }
 
 // Debug noop
