@@ -18,16 +18,21 @@ import (
 	"github.com/open-policy-agent/opa/server/types"
 	"github.com/open-policy-agent/opa/server/writer"
 	"github.com/open-policy-agent/opa/storage"
+	"github.com/open-policy-agent/opa/topdown/cache"
+	"github.com/open-policy-agent/opa/topdown/print"
 	"github.com/open-policy-agent/opa/util"
 )
 
 // Basic provides policy-based authorization over incoming requests.
 type Basic struct {
-	inner    http.Handler
-	compiler func() *ast.Compiler
-	store    storage.Store
-	runtime  *ast.Term
-	decision func() ast.Ref
+	inner                 http.Handler
+	compiler              func() *ast.Compiler
+	store                 storage.Store
+	runtime               *ast.Term
+	decision              func() ast.Ref
+	printHook             print.Hook
+	enablePrintStatements bool
+	interQueryCache       cache.InterQueryCache
 }
 
 // Runtime returns an argument that sets the runtime on the authorizer.
@@ -42,6 +47,30 @@ func Runtime(term *ast.Term) func(*Basic) {
 func Decision(ref func() ast.Ref) func(*Basic) {
 	return func(b *Basic) {
 		b.decision = ref
+	}
+}
+
+// PrintHook sets the object to use for handling print statement outputs.
+func PrintHook(printHook print.Hook) func(*Basic) {
+	return func(b *Basic) {
+		b.printHook = printHook
+	}
+}
+
+// EnablePrintStatements enables print() calls. If this option is not provided,
+// print() calls will be erased from the policy. This option only applies to
+// queries and policies that passed as raw strings, i.e., this function will not
+// have any affect if the caller supplies the ast.Compiler instance.
+func EnablePrintStatements(yes bool) func(r *Basic) {
+	return func(b *Basic) {
+		b.enablePrintStatements = yes
+	}
+}
+
+// InterQueryCache enables the inter-query cache on the authorizer
+func InterQueryCache(interQueryCache cache.InterQueryCache) func(*Basic) {
+	return func(b *Basic) {
+		b.interQueryCache = interQueryCache
 	}
 }
 
@@ -76,6 +105,9 @@ func (h *Basic) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rego.Store(h.store),
 		rego.Input(input),
 		rego.Runtime(h.runtime),
+		rego.EnablePrintStatements(h.enablePrintStatements),
+		rego.PrintHook(h.printHook),
+		rego.InterQueryBuiltinCache(h.interQueryCache),
 	)
 
 	rs, err := rego.Eval(r.Context())

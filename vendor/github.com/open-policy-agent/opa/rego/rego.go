@@ -18,6 +18,7 @@ import (
 	"github.com/open-policy-agent/opa/bundle"
 	bundleUtils "github.com/open-policy-agent/opa/internal/bundle"
 	"github.com/open-policy-agent/opa/internal/compiler/wasm"
+	"github.com/open-policy-agent/opa/internal/future"
 	"github.com/open-policy-agent/opa/internal/ir"
 	"github.com/open-policy-agent/opa/internal/planner"
 	"github.com/open-policy-agent/opa/internal/rego/opa"
@@ -28,15 +29,23 @@ import (
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/storage/inmem"
 	"github.com/open-policy-agent/opa/topdown"
+	"github.com/open-policy-agent/opa/topdown/builtins"
 	"github.com/open-policy-agent/opa/topdown/cache"
+	"github.com/open-policy-agent/opa/topdown/print"
+	"github.com/open-policy-agent/opa/tracing"
 	"github.com/open-policy-agent/opa/types"
 	"github.com/open-policy-agent/opa/util"
 )
 
 const (
 	defaultPartialNamespace = "partial"
-	targetWasm              = "wasm"
 	wasmVarPrefix           = "^"
+)
+
+// nolint: deadcode,varcheck
+const (
+	targetWasm = "wasm"
+	targetRego = "rego"
 )
 
 // CompileResult represents the result of compiling a Rego query, zero or more
@@ -91,6 +100,7 @@ type preparedQuery struct {
 type EvalContext struct {
 	hasInput               bool
 	time                   time.Time
+	seed                   io.Reader
 	rawInput               *interface{}
 	parsedInput            ast.Value
 	metrics                metrics.Metrics
@@ -104,9 +114,13 @@ type EvalContext struct {
 	disableInlining        []ast.Ref
 	parsedUnknowns         []*ast.Term
 	indexing               bool
+	earlyExit              bool
 	interQueryBuiltinCache cache.InterQueryCache
+	ndBuiltinCache         builtins.NDBCache
 	resolvers              []refResolver
 	sortSets               bool
+	printHook              print.Hook
+	capabilities           *ast.Capabilities
 }
 
 // EvalOption defines a function to set an option on an EvalConfig
@@ -209,6 +223,14 @@ func EvalRuleIndexing(enabled bool) EvalOption {
 	}
 }
 
+// EvalEarlyExit will disable 'early exit' optimizations for the
+// evaluation. This should only be used when tracing in debug mode.
+func EvalEarlyExit(enabled bool) EvalOption {
+	return func(e *EvalContext) {
+		e.earlyExit = enabled
+	}
+}
+
 // EvalTime sets the wall clock time to use during policy evaluation.
 // time.now_ns() calls will return this value.
 func EvalTime(x time.Time) EvalOption {
@@ -217,11 +239,27 @@ func EvalTime(x time.Time) EvalOption {
 	}
 }
 
+// EvalSeed sets a reader that will seed randomization required by built-in functions.
+// If a seed is not provided crypto/rand.Reader is used.
+func EvalSeed(r io.Reader) EvalOption {
+	return func(e *EvalContext) {
+		e.seed = r
+	}
+}
+
 // EvalInterQueryBuiltinCache sets the inter-query cache that built-in functions can utilize
 // during evaluation.
 func EvalInterQueryBuiltinCache(c cache.InterQueryCache) EvalOption {
 	return func(e *EvalContext) {
 		e.interQueryBuiltinCache = c
+	}
+}
+
+// EvalNDBuiltinCache sets the non-deterministic builtin cache that built-in functions can
+// use during evaluation.
+func EvalNDBuiltinCache(c builtins.NDBCache) EvalOption {
+	return func(e *EvalContext) {
+		e.ndBuiltinCache = c
 	}
 }
 
@@ -236,6 +274,13 @@ func EvalResolver(ref ast.Ref, r resolver.Resolver) EvalOption {
 func EvalSortSets(yes bool) EvalOption {
 	return func(e *EvalContext) {
 		e.sortSets = yes
+	}
+}
+
+// EvalPrintHook sets the object to use for handling print statement outputs.
+func EvalPrintHook(ph print.Hook) EvalOption {
+	return func(e *EvalContext) {
+		e.printHook = ph
 	}
 }
 
@@ -274,7 +319,10 @@ func (pq preparedQuery) newEvalContext(ctx context.Context, options []EvalOption
 		parsedUnknowns:   pq.r.parsedUnknowns,
 		compiledQuery:    compiledQuery{},
 		indexing:         true,
+		earlyExit:        true,
 		resolvers:        pq.r.resolvers,
+		printHook:        pq.r.printHook,
+		capabilities:     pq.r.capabilities,
 	}
 
 	for _, o := range options {
@@ -321,9 +369,11 @@ func (pq preparedQuery) newEvalContext(ctx context.Context, options []EvalOption
 			// Note that it could still be nil
 			ectx.rawInput = pq.r.rawInput
 		}
-		ectx.parsedInput, err = pq.r.parseRawInput(ectx.rawInput, ectx.metrics)
-		if err != nil {
-			return nil, finishFunc, err
+		if pq.r.target != targetWasm {
+			ectx.parsedInput, err = pq.r.parseRawInput(ectx.rawInput, ectx.metrics)
+			if err != nil {
+				return nil, finishFunc, err
+			}
 		}
 	}
 
@@ -372,69 +422,6 @@ func (pq PreparedPartialQuery) Partial(ctx context.Context, options ...EvalOptio
 	ectx.compiledQuery = pq.r.compiledQueries[partialQueryType]
 
 	return pq.r.partial(ctx, ectx)
-}
-
-// Result defines the output of Rego evaluation.
-type Result struct {
-	Expressions []*ExpressionValue `json:"expressions"`
-	Bindings    Vars               `json:"bindings,omitempty"`
-}
-
-func newResult() Result {
-	return Result{
-		Bindings: Vars{},
-	}
-}
-
-// Location defines a position in a Rego query or module.
-type Location struct {
-	Row int `json:"row"`
-	Col int `json:"col"`
-}
-
-// ExpressionValue defines the value of an expression in a Rego query.
-type ExpressionValue struct {
-	Value    interface{} `json:"value"`
-	Text     string      `json:"text"`
-	Location *Location   `json:"location"`
-}
-
-func newExpressionValue(expr *ast.Expr, value interface{}) *ExpressionValue {
-	result := &ExpressionValue{
-		Value: value,
-	}
-	if expr.Location != nil {
-		result.Text = string(expr.Location.Text)
-		result.Location = &Location{
-			Row: expr.Location.Row,
-			Col: expr.Location.Col,
-		}
-	}
-	return result
-}
-
-func (ev *ExpressionValue) String() string {
-	return fmt.Sprint(ev.Value)
-}
-
-// ResultSet represents a collection of output from Rego evaluation. An empty
-// result set represents an undefined query.
-type ResultSet []Result
-
-// Vars represents a collection of variable bindings. The keys are the variable
-// names and the values are the binding values.
-type Vars map[string]interface{}
-
-// WithoutWildcards returns a copy of v with wildcard variables removed.
-func (v Vars) WithoutWildcards() Vars {
-	n := Vars{}
-	for k, v := range v {
-		if ast.Var(k).IsWildcard() || ast.Var(k).IsGenerated() {
-			continue
-		}
-		n[k] = v
-	}
-	return n
 }
 
 // Errors represents a collection of errors returned when evaluating Rego.
@@ -521,6 +508,8 @@ type Rego struct {
 	dump                   io.Writer
 	runtime                *ast.Term
 	time                   time.Time
+	seed                   io.Reader
+	capabilities           *ast.Capabilities
 	builtinDecls           map[string]*ast.Builtin
 	builtinFuncs           map[string]*topdown.Builtin
 	unsafeBuiltins         map[string]struct{}
@@ -529,11 +518,16 @@ type Rego struct {
 	bundles                map[string]*bundle.Bundle
 	skipBundleVerification bool
 	interQueryBuiltinCache cache.InterQueryCache
+	ndBuiltinCache         builtins.NDBCache
 	strictBuiltinErrors    bool
 	resolvers              []refResolver
 	schemaSet              *ast.SchemaSet
 	target                 string // target type (wasm, rego, etc.)
-	opa                    *opa.OPA
+	opa                    opa.EvalEngine
+	generateJSON           func(*ast.Term, *EvalContext) (interface{}, error)
+	printHook              print.Hook
+	enablePrintStatements  bool
+	distributedTacingOpts  tracing.Options
 }
 
 // Function represents a built-in function that is callable in Rego.
@@ -825,7 +819,7 @@ func ShallowInlining(yes bool) func(r *Rego) {
 // rules generated from policy. Synthetic support rules are still namespaced.
 func SkipPartialNamespace(yes bool) func(r *Rego) {
 	return func(r *Rego) {
-		r.skipPartialNamespace = true
+		r.skipPartialNamespace = yes
 	}
 }
 
@@ -981,6 +975,14 @@ func Time(x time.Time) func(r *Rego) {
 	}
 }
 
+// Seed sets a reader that will seed randomization required by built-in functions.
+// If a seed is not provided crypto/rand.Reader is used.
+func Seed(r io.Reader) func(*Rego) {
+	return func(e *Rego) {
+		e.seed = r
+	}
+}
+
 // PrintTrace is a helper function to write a human-readable version of the
 // trace to the writer w.
 func PrintTrace(w io.Writer, r *Rego) {
@@ -1024,6 +1026,13 @@ func InterQueryBuiltinCache(c cache.InterQueryCache) func(r *Rego) {
 	}
 }
 
+// NDBuiltinCache sets the non-deterministic builtins cache.
+func NDBuiltinCache(c builtins.NDBCache) func(r *Rego) {
+	return func(r *Rego) {
+		r.ndBuiltinCache = c
+	}
+}
+
 // StrictBuiltinErrors tells the evaluator to treat all built-in function errors as fatal errors.
 func StrictBuiltinErrors(yes bool) func(r *Rego) {
 	return func(r *Rego) {
@@ -1045,10 +1054,50 @@ func Schemas(x *ast.SchemaSet) func(r *Rego) {
 	}
 }
 
+// Capabilities configures the underlying compiler's capabilities.
+// This option is ignored for module compilation if the caller supplies the
+// compiler.
+func Capabilities(c *ast.Capabilities) func(r *Rego) {
+	return func(r *Rego) {
+		r.capabilities = c
+	}
+}
+
 // Target sets the runtime to exercise.
 func Target(t string) func(r *Rego) {
 	return func(r *Rego) {
 		r.target = t
+	}
+}
+
+// GenerateJSON sets the AST to JSON converter for the results.
+func GenerateJSON(f func(*ast.Term, *EvalContext) (interface{}, error)) func(r *Rego) {
+	return func(r *Rego) {
+		r.generateJSON = f
+	}
+}
+
+// PrintHook sets the object to use for handling print statement outputs.
+func PrintHook(h print.Hook) func(r *Rego) {
+	return func(r *Rego) {
+		r.printHook = h
+	}
+}
+
+// DistributedTracingOpts sets the options to be used by distributed tracing.
+func DistributedTracingOpts(tr tracing.Options) func(r *Rego) {
+	return func(r *Rego) {
+		r.distributedTacingOpts = tr
+	}
+}
+
+// EnablePrintStatements enables print() calls. If this option is not provided,
+// print() calls will be erased from the policy. This option only applies to
+// queries and policies that passed as raw strings, i.e., this function will not
+// have any affect if the caller supplies the ast.Compiler instance.
+func EnablePrintStatements(yes bool) func(r *Rego) {
+	return func(r *Rego) {
+		r.enablePrintStatements = yes
 	}
 }
 
@@ -1072,10 +1121,10 @@ func New(options ...func(r *Rego)) *Rego {
 		r.compiler = ast.NewCompiler().
 			WithUnsafeBuiltins(r.unsafeBuiltins).
 			WithBuiltins(r.builtinDecls).
-			WithDebug(r.dump)
-		if r.schemaSet != nil {
-			r.compiler.WithSchemas(r.schemaSet)
-		}
+			WithDebug(r.dump).
+			WithSchemas(r.schemaSet).
+			WithCapabilities(r.capabilities).
+			WithEnablePrintStatements(r.enablePrintStatements)
 	}
 
 	if r.store == nil {
@@ -1103,6 +1152,10 @@ func New(options ...func(r *Rego)) *Rego {
 		r.partialNamespace = defaultPartialNamespace
 	}
 
+	if r.generateJSON == nil {
+		r.generateJSON = generateJSON
+	}
+
 	return r
 }
 
@@ -1127,6 +1180,8 @@ func (r *Rego) Eval(ctx context.Context) (ResultSet, error) {
 		EvalInstrument(r.instrument),
 		EvalTime(r.time),
 		EvalInterQueryBuiltinCache(r.interQueryBuiltinCache),
+		EvalNDBuiltinCache(r.ndBuiltinCache),
+		EvalSeed(r.seed),
 	}
 
 	for _, qt := range r.queryTracers {
@@ -1199,6 +1254,7 @@ func (r *Rego) Partial(ctx context.Context) (*PartialQueries, error) {
 		EvalMetrics(r.metrics),
 		EvalInstrument(r.instrument),
 		EvalInterQueryBuiltinCache(r.interQueryBuiltinCache),
+		EvalNDBuiltinCache(r.ndBuiltinCache),
 	}
 
 	for _, t := range r.queryTracers {
@@ -1461,6 +1517,11 @@ func (r *Rego) PrepareForEval(ctx context.Context, opts ...PrepareOption) (Prepa
 
 		queries := []ast.Body{r.compiledQueries[evalQueryType].query}
 
+		e, err := opa.LookupEngine(targetWasm)
+		if err != nil {
+			return PreparedEvalQuery{}, err
+		}
+
 		// nolint: staticcheck // SA4006 false positive
 		cr, err := r.compileWasm(modules, queries, evalQueryType)
 		if err != nil {
@@ -1475,7 +1536,7 @@ func (r *Rego) PrepareForEval(ctx context.Context, opts ...PrepareOption) (Prepa
 			return PreparedEvalQuery{}, err
 		}
 
-		o, err := opa.New().WithPolicyBytes(cr.Bytes).WithDataJSON(data).Init()
+		o, err := e.New().WithPolicyBytes(cr.Bytes).WithDataJSON(data).Init()
 		if err != nil {
 			_ = txnClose(ctx, err) // Ignore error
 			return PreparedEvalQuery{}, err
@@ -1542,11 +1603,6 @@ func (r *Rego) prepare(ctx context.Context, qType queryType, extras []extraStage
 		return err
 	}
 
-	r.schemaSet, err = r.schemas()
-	if err != nil {
-		return err
-	}
-
 	err = r.loadFiles(ctx, r.txn, r.metrics)
 	if err != nil {
 		return err
@@ -1569,12 +1625,24 @@ func (r *Rego) prepare(ctx context.Context, qType queryType, extras []extraStage
 		return err
 	}
 
-	r.parsedQuery, err = r.parseQuery(r.metrics)
+	imports, err := r.prepareImports()
 	if err != nil {
 		return err
 	}
 
-	err = r.compileAndCacheQuery(qType, r.parsedQuery, r.metrics, extras)
+	futureImports := []*ast.Import{}
+	for _, imp := range imports {
+		if imp.Path.Value.(ast.Ref).HasPrefix(ast.Ref([]*ast.Term{ast.FutureRootDocument})) {
+			futureImports = append(futureImports, imp)
+		}
+	}
+
+	r.parsedQuery, err = r.parseQuery(futureImports, r.metrics)
+	if err != nil {
+		return err
+	}
+
+	err = r.compileAndCacheQuery(qType, r.parsedQuery, imports, r.metrics, extras)
 	if err != nil {
 		return err
 	}
@@ -1692,13 +1760,6 @@ func (r *Rego) parseInput() (ast.Value, error) {
 	return r.parseRawInput(r.rawInput, r.metrics)
 }
 
-func (r *Rego) schemas() (*ast.SchemaSet, error) {
-	if r.schemaSet != nil {
-		return r.schemaSet, nil
-	}
-	return nil, nil
-}
-
 func (r *Rego) parseRawInput(rawInput *interface{}, m metrics.Metrics) (ast.Value, error) {
 	var input ast.Value
 
@@ -1720,7 +1781,7 @@ func (r *Rego) parseRawInput(rawInput *interface{}, m metrics.Metrics) (ast.Valu
 	return ast.InterfaceToValue(*rawPtr)
 }
 
-func (r *Rego) parseQuery(m metrics.Metrics) (ast.Body, error) {
+func (r *Rego) parseQuery(futureImports []*ast.Import, m metrics.Metrics) (ast.Body, error) {
 	if r.parsedQuery != nil {
 		return r.parsedQuery, nil
 	}
@@ -1728,7 +1789,11 @@ func (r *Rego) parseQuery(m metrics.Metrics) (ast.Body, error) {
 	m.Timer(metrics.RegoQueryParse).Start()
 	defer m.Timer(metrics.RegoQueryParse).Stop()
 
-	return ast.ParseBody(r.query)
+	popts, err := future.ParserOptionsFromFutureImports(futureImports)
+	if err != nil {
+		return nil, err
+	}
+	return ast.ParseBodyWithOpts(r.query, popts)
 }
 
 func (r *Rego) compileModules(ctx context.Context, txn storage.Transaction, m metrics.Metrics) error {
@@ -1773,7 +1838,7 @@ func (r *Rego) compileModules(ctx context.Context, txn storage.Transaction, m me
 	return nil
 }
 
-func (r *Rego) compileAndCacheQuery(qType queryType, query ast.Body, m metrics.Metrics, extras []extraStage) error {
+func (r *Rego) compileAndCacheQuery(qType queryType, query ast.Body, imports []*ast.Import, m metrics.Metrics, extras []extraStage) error {
 	m.Timer(metrics.RegoQueryCompile).Start()
 	defer m.Timer(metrics.RegoQueryCompile).Stop()
 
@@ -1782,7 +1847,7 @@ func (r *Rego) compileAndCacheQuery(qType queryType, query ast.Body, m metrics.M
 		return nil
 	}
 
-	qc, compiled, err := r.compileQuery(query, m, extras)
+	qc, compiled, err := r.compileQuery(query, imports, m, extras)
 	if err != nil {
 		return err
 	}
@@ -1795,7 +1860,24 @@ func (r *Rego) compileAndCacheQuery(qType queryType, query ast.Body, m metrics.M
 	return nil
 }
 
-func (r *Rego) compileQuery(query ast.Body, m metrics.Metrics, extras []extraStage) (ast.QueryCompiler, ast.Body, error) {
+func (r *Rego) prepareImports() ([]*ast.Import, error) {
+	imports := r.parsedImports
+
+	if len(r.imports) > 0 {
+		s := make([]string, len(r.imports))
+		for i := range r.imports {
+			s[i] = fmt.Sprintf("import %v", r.imports[i])
+		}
+		parsed, err := ast.ParseImports(strings.Join(s, "\n"))
+		if err != nil {
+			return nil, err
+		}
+		imports = append(imports, parsed...)
+	}
+	return imports, nil
+}
+
+func (r *Rego) compileQuery(query ast.Body, imports []*ast.Import, m metrics.Metrics, extras []extraStage) (ast.QueryCompiler, ast.Body, error) {
 	var pkg *ast.Package
 
 	if r.pkg != "" {
@@ -1808,27 +1890,14 @@ func (r *Rego) compileQuery(query ast.Body, m metrics.Metrics, extras []extraSta
 		pkg = r.parsedPackage
 	}
 
-	imports := r.parsedImports
-
-	if len(r.imports) > 0 {
-		s := make([]string, len(r.imports))
-		for i := range r.imports {
-			s[i] = fmt.Sprintf("import %v", r.imports[i])
-		}
-		parsed, err := ast.ParseImports(strings.Join(s, "\n"))
-		if err != nil {
-			return nil, nil, err
-		}
-		imports = append(imports, parsed...)
-	}
-
 	qctx := ast.NewQueryContext().
 		WithPackage(pkg).
 		WithImports(imports)
 
 	qc := r.compiler.QueryCompiler().
 		WithContext(qctx).
-		WithUnsafeBuiltins(r.unsafeBuiltins)
+		WithUnsafeBuiltins(r.unsafeBuiltins).
+		WithEnablePrintStatements(r.enablePrintStatements)
 
 	for _, extra := range extras {
 		qc = qc.WithStageAfter(extra.after, extra.stage)
@@ -1855,8 +1924,13 @@ func (r *Rego) eval(ctx context.Context, ectx *EvalContext) (ResultSet, error) {
 		WithInstrumentation(ectx.instrumentation).
 		WithRuntime(r.runtime).
 		WithIndexing(ectx.indexing).
+		WithEarlyExit(ectx.earlyExit).
 		WithInterQueryBuiltinCache(ectx.interQueryBuiltinCache).
-		WithStrictBuiltinErrors(r.strictBuiltinErrors)
+		WithNDBuiltinCache(ectx.ndBuiltinCache).
+		WithStrictBuiltinErrors(r.strictBuiltinErrors).
+		WithSeed(ectx.seed).
+		WithPrintHook(ectx.printHook).
+		WithDistributedTracingOpts(r.distributedTacingOpts)
 
 	if !ectx.time.IsZero() {
 		q = q.WithTime(ectx.time)
@@ -1906,16 +1980,21 @@ func (r *Rego) eval(ctx context.Context, ectx *EvalContext) (ResultSet, error) {
 
 func (r *Rego) evalWasm(ctx context.Context, ectx *EvalContext) (ResultSet, error) {
 
-	var input *interface{}
+	input := ectx.rawInput
 	if ectx.parsedInput != nil {
-		i, err := ast.JSON(ectx.parsedInput)
-		if err != nil {
-			return nil, err
-		}
+		i := interface{}(ectx.parsedInput)
 		input = &i
 	}
-
-	result, err := r.opa.Eval(ctx, opa.EvalOpts{Metrics: r.metrics, Input: input, Time: ectx.time})
+	result, err := r.opa.Eval(ctx, opa.EvalOpts{
+		Metrics:                r.metrics,
+		Input:                  input,
+		Time:                   ectx.time,
+		Seed:                   ectx.seed,
+		InterQueryBuiltinCache: ectx.interQueryBuiltinCache,
+		NDBuiltinCache:         ectx.ndBuiltinCache,
+		PrintHook:              ectx.printHook,
+		Capabilities:           ectx.capabilities,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1962,7 +2041,7 @@ func (r *Rego) generateResult(qr topdown.QueryResult, ectx *EvalContext) (Result
 
 	result := newResult()
 	for k, term := range qr {
-		v, err := ast.JSONWithOpt(term.Value, ast.JSONOpt{SortSets: ectx.sortSets})
+		v, err := r.generateJSON(term, ectx)
 		if err != nil {
 			return result, err
 		}
@@ -1982,7 +2061,7 @@ func (r *Rego) generateResult(qr topdown.QueryResult, ectx *EvalContext) (Result
 		}
 
 		if k, ok := r.capture[expr]; ok {
-			v, err := ast.JSONWithOpt(qr[k].Value, ast.JSONOpt{SortSets: ectx.sortSets})
+			v, err := r.generateJSON(qr[k], ectx)
 			if err != nil {
 				return result, err
 			}
@@ -2021,6 +2100,7 @@ func (r *Rego) partialResult(ctx context.Context, pCfg *PrepareConfig) (PartialR
 		instrumentation:  r.instrumentation,
 		indexing:         true,
 		resolvers:        r.resolvers,
+		capabilities:     r.capabilities,
 	}
 
 	disableInlining := r.disableInlining
@@ -2089,9 +2169,10 @@ func (r *Rego) partial(ctx context.Context, ectx *EvalContext) (*PartialQueries,
 
 	var unknowns []*ast.Term
 
-	if ectx.parsedUnknowns != nil {
+	switch {
+	case ectx.parsedUnknowns != nil:
 		unknowns = ectx.parsedUnknowns
-	} else if ectx.unknowns != nil {
+	case ectx.unknowns != nil:
 		unknowns = make([]*ast.Term, len(ectx.unknowns))
 		for i := range ectx.unknowns {
 			var err error
@@ -2100,7 +2181,7 @@ func (r *Rego) partial(ctx context.Context, ectx *EvalContext) (*PartialQueries,
 				return nil, err
 			}
 		}
-	} else {
+	default:
 		// Use input document as unknown if caller has not specified any.
 		unknowns = []*ast.Term{ast.NewTerm(ast.InputRootRef)}
 	}
@@ -2117,11 +2198,15 @@ func (r *Rego) partial(ctx context.Context, ectx *EvalContext) (*PartialQueries,
 		WithDisableInlining(ectx.disableInlining).
 		WithRuntime(r.runtime).
 		WithIndexing(ectx.indexing).
+		WithEarlyExit(ectx.earlyExit).
 		WithPartialNamespace(ectx.partialNamespace).
 		WithSkipPartialNamespace(r.skipPartialNamespace).
 		WithShallowInlining(r.shallowInlining).
 		WithInterQueryBuiltinCache(ectx.interQueryBuiltinCache).
-		WithStrictBuiltinErrors(r.strictBuiltinErrors)
+		WithNDBuiltinCache(ectx.ndBuiltinCache).
+		WithStrictBuiltinErrors(r.strictBuiltinErrors).
+		WithSeed(ectx.seed).
+		WithPrintHook(ectx.printHook)
 
 	if !ectx.time.IsZero() {
 		q = q.WithTime(ectx.time)
@@ -2186,7 +2271,8 @@ func (r *Rego) rewriteQueryToCaptureValue(qc ast.QueryCompiler, query ast.Body) 
 			expr.Terms = ast.Equality.Expr(terms, capture).Terms
 			r.capture[expr] = capture.Value.(ast.Var)
 		case []*ast.Term:
-			if r.compiler.GetArity(expr.Operator()) == len(terms)-1 {
+			tpe := r.compiler.TypeEnv.Get(terms[0])
+			if !types.Void(tpe) && types.Arity(tpe) == len(terms)-1 {
 				capture = r.generateTermVar()
 				expr.Terms = append(terms, capture)
 				r.capture[expr] = capture.Value.(ast.Var)
@@ -2433,6 +2519,14 @@ func parseStringsToRefs(s []string) ([]ast.Ref, error) {
 // was defined.
 func finishFunction(name string, bctx topdown.BuiltinContext, result *ast.Term, err error, iter func(*ast.Term) error) error {
 	if err != nil {
+		var e *HaltError
+		if errors.As(err, &e) {
+			return topdown.Halt{Err: &topdown.Error{
+				Code:     topdown.BuiltinErr,
+				Message:  fmt.Sprintf("%v: %v", name, e.Error()),
+				Location: bctx.Location,
+			}}
+		}
 		return &topdown.Error{
 			Code:     topdown.BuiltinErr,
 			Message:  fmt.Sprintf("%v: %v", name, err.Error()),
@@ -2457,4 +2551,8 @@ func newFunction(decl *Function, f topdown.BuiltinFunc) func(*Rego) {
 			Func: f,
 		}
 	}
+}
+
+func generateJSON(term *ast.Term, ectx *EvalContext) (interface{}, error) {
+	return ast.JSONWithOpt(term.Value, ast.JSONOpt{SortSets: ectx.sortSets})
 }

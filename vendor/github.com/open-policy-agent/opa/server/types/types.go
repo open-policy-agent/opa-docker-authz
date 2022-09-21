@@ -149,6 +149,24 @@ type DataResponseV1 struct {
 	Explanation TraceV1       `json:"explanation,omitempty"`
 	Metrics     MetricsV1     `json:"metrics,omitempty"`
 	Result      *interface{}  `json:"result,omitempty"`
+	Warning     *Warning      `json:"warning,omitempty"`
+}
+
+// Warning models DataResponse warnings
+type Warning struct {
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+// Warning Codes
+const CodeAPIUsageWarn = "api_usage_warning"
+
+// Warning Messages
+const MsgInputKeyMissing = "'input' key missing from the request"
+
+// NewWarning returns a new Warning object
+func NewWarning(code, message string) *Warning {
+	return &Warning{Code: code, Message: message}
 }
 
 // MetricsV1 models a collection of performance metrics.
@@ -352,6 +370,9 @@ type CompileRequestV1 struct {
 	Input    *interface{} `json:"input"`
 	Query    string       `json:"query"`
 	Unknowns *[]string    `json:"unknowns"`
+	Options  struct {
+		DisableInlining []string `json:"disableInlining,omitempty"`
+	} `json:"options,omitempty"`
 }
 
 // CompileResponseV1 models the response message for Compile API operations.
@@ -370,12 +391,23 @@ type PartialEvaluationResultV1 struct {
 
 // QueryRequestV1 models the request message for Query API operations.
 type QueryRequestV1 struct {
-	Query string `json:"query"`
+	Query string       `json:"query"`
+	Input *interface{} `json:"input"`
 }
 
 // ConfigResponseV1 models the response message for Config API operations.
 type ConfigResponseV1 struct {
 	Result *interface{} `json:"result,omitempty"`
+}
+
+// StatusResponseV1 models the response message for Status API (pull) operations.
+type StatusResponseV1 struct {
+	Result *interface{} `json:"result,omitempty"`
+}
+
+// HealthResponseV1 models the response message for Health API operations.
+type HealthResponseV1 struct {
+	Error string `json:"error,omitempty"`
 }
 
 const (
@@ -429,6 +461,11 @@ const (
 	// indicates the client wants to include bundle status in the results
 	// of the health API.
 	ParamPluginsV1 = "plugins"
+
+	// ParamExcludePluginV1 defines the name of the HTTP URL parameter that
+	// indicates the client wants to exclude plugin status in the results
+	// of the health API for the specified plugin(s)
+	ParamExcludePluginV1 = "exclude-plugin"
 
 	// ParamStrictBuiltinErrors names the HTTP URL parameter that indicates the client
 	// wants built-in function errors to be treated as fatal.

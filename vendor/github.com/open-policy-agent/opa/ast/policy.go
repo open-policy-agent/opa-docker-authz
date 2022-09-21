@@ -33,6 +33,15 @@ var InputRootDocument = VarTerm("input")
 // SchemaRootDocument names the document containing external data schemas.
 var SchemaRootDocument = VarTerm("schema")
 
+// FunctionArgRootDocument names the document containing function arguments.
+// It's only for internal usage, for referencing function arguments between
+// the index and topdown.
+var FunctionArgRootDocument = VarTerm("args")
+
+// FutureRootDocument names the document containing new, to-become-default,
+// features.
+var FutureRootDocument = VarTerm("future")
+
 // RootDocumentNames contains the names of top-level documents that can be
 // referred to in modules and queries.
 //
@@ -135,27 +144,13 @@ type (
 		Annotations []*Annotations `json:"annotations,omitempty"`
 		Rules       []*Rule        `json:"rules,omitempty"`
 		Comments    []*Comment     `json:"comments,omitempty"`
+		stmts       []Statement
 	}
 
 	// Comment contains the raw text from the comment in the definition.
 	Comment struct {
 		Text     []byte
 		Location *Location
-	}
-
-	// Annotations represents metadata attached to other AST nodes such as rules.
-	Annotations struct {
-		Location *Location           `json:"-"`
-		Scope    string              `json:"scope"`
-		Schemas  []*SchemaAnnotation `json:"schemas,omitempty"`
-		node     Node
-	}
-
-	// SchemaAnnotation contains a schema declaration for the document identified by the path.
-	SchemaAnnotation struct {
-		Path       Ref          `json:"path"`
-		Schema     Ref          `json:"schema,omitempty"`
-		Definition *interface{} `json:"definition,omitempty"`
 	}
 
 	// Package represents the namespace of the documents produced
@@ -222,6 +217,14 @@ type (
 		Symbols  []*Term   `json:"symbols"`
 	}
 
+	Every struct {
+		Location *Location `json:"-"`
+		Key      *Term     `json:"key"`
+		Value    *Term     `json:"value"`
+		Domain   *Term     `json:"domain"`
+		Body     Body      `json:"body"`
+	}
+
 	// With represents a modifier on an expression.
 	With struct {
 		Location *Location `json:"-"`
@@ -229,122 +232,6 @@ type (
 		Value    *Term     `json:"value"`
 	}
 )
-
-func (s *Annotations) String() string {
-	bs, _ := json.Marshal(s)
-	return string(bs)
-}
-
-// Loc returns the location of this annotation.
-func (s *Annotations) Loc() *Location {
-	return s.Location
-}
-
-// SetLoc updates the location of this annotation.
-func (s *Annotations) SetLoc(l *Location) {
-	s.Location = l
-}
-
-// Compare returns an integer indicating if s is less than, equal to, or greater
-// than other.
-func (s *Annotations) Compare(other *Annotations) int {
-
-	if cmp := scopeCompare(s.Scope, other.Scope); cmp != 0 {
-		return cmp
-	}
-
-	max := len(s.Schemas)
-	if len(other.Schemas) < max {
-		max = len(other.Schemas)
-	}
-
-	for i := 0; i < max; i++ {
-		if cmp := s.Schemas[i].Compare(other.Schemas[i]); cmp != 0 {
-			return cmp
-		}
-	}
-
-	if len(s.Schemas) > len(other.Schemas) {
-		return 1
-	} else if len(s.Schemas) < len(other.Schemas) {
-		return -1
-	}
-
-	return 0
-}
-
-// Copy returns a deep copy of s.
-func (s *Annotations) Copy(node Node) *Annotations {
-	cpy := *s
-	cpy.Schemas = make([]*SchemaAnnotation, len(s.Schemas))
-	for i := range cpy.Schemas {
-		cpy.Schemas[i] = s.Schemas[i].Copy()
-	}
-	cpy.node = node
-	return &cpy
-}
-
-// Copy returns a deep copy of s.
-func (s *SchemaAnnotation) Copy() *SchemaAnnotation {
-	cpy := *s
-	return &cpy
-}
-
-// Compare returns an integer indicating if s is less than, equal to, or greater
-// than other.
-func (s *SchemaAnnotation) Compare(other *SchemaAnnotation) int {
-
-	if cmp := s.Path.Compare(other.Path); cmp != 0 {
-		return cmp
-	}
-
-	if cmp := s.Schema.Compare(other.Schema); cmp != 0 {
-		return cmp
-	}
-
-	if s.Definition != nil && other.Definition == nil {
-		return -1
-	} else if s.Definition == nil && other.Definition != nil {
-		return 1
-	} else if s.Definition != nil && other.Definition != nil {
-		return util.Compare(*s.Definition, *other.Definition)
-	}
-
-	return 0
-}
-
-func (s *SchemaAnnotation) String() string {
-	bs, _ := json.Marshal(s)
-	return string(bs)
-}
-
-func scopeCompare(s1, s2 string) int {
-
-	o1 := scopeOrder(s1)
-	o2 := scopeOrder(s2)
-
-	if o2 < o1 {
-		return 1
-	} else if o2 > o1 {
-		return -1
-	}
-
-	if s1 < s2 {
-		return -1
-	} else if s2 < s1 {
-		return 1
-	}
-
-	return 0
-}
-
-func scopeOrder(s string) int {
-	switch s {
-	case annotationScopeRule:
-		return 1
-	}
-	return 0
-}
 
 // Compare returns an integer indicating whether mod is less than, equal to,
 // or greater than other.
@@ -374,36 +261,36 @@ func (mod *Module) Copy() *Module {
 	cpy := *mod
 	cpy.Rules = make([]*Rule, len(mod.Rules))
 
-	var nodes map[Node]Node
-
-	if len(mod.Annotations) > 0 {
-		nodes = make(map[Node]Node)
-	}
+	nodes := make(map[Node]Node, len(mod.Rules)+len(mod.Imports)+1 /* package */)
 
 	for i := range mod.Rules {
 		cpy.Rules[i] = mod.Rules[i].Copy()
 		cpy.Rules[i].Module = &cpy
-		if nodes != nil {
-			nodes[mod.Rules[i]] = cpy.Rules[i]
-		}
+		nodes[mod.Rules[i]] = cpy.Rules[i]
 	}
 
 	cpy.Imports = make([]*Import, len(mod.Imports))
 	for i := range mod.Imports {
 		cpy.Imports[i] = mod.Imports[i].Copy()
-		if nodes != nil {
-			nodes[mod.Imports[i]] = cpy.Imports[i]
-		}
+		nodes[mod.Imports[i]] = cpy.Imports[i]
 	}
 
 	cpy.Package = mod.Package.Copy()
-	if nodes != nil {
-		nodes[mod.Package] = cpy.Package
-	}
+	nodes[mod.Package] = cpy.Package
 
 	cpy.Annotations = make([]*Annotations, len(mod.Annotations))
 	for i := range mod.Annotations {
 		cpy.Annotations[i] = mod.Annotations[i].Copy(nodes[mod.Annotations[i].node])
+	}
+
+	cpy.Comments = make([]*Comment, len(mod.Comments))
+	for i := range mod.Comments {
+		cpy.Comments[i] = mod.Comments[i].Copy()
+	}
+
+	cpy.stmts = make([]Statement, len(mod.stmts))
+	for i := range mod.stmts {
+		cpy.stmts[i] = nodes[mod.stmts[i]]
 	}
 
 	return &cpy
@@ -782,10 +669,10 @@ const (
 	CompleteDoc = iota
 
 	// PartialSetDoc represents a set document that is partially defined by the rule.
-	PartialSetDoc = iota
+	PartialSetDoc
 
 	// PartialObjectDoc represents an object document that is partially defined by the rule.
-	PartialObjectDoc = iota
+	PartialObjectDoc
 )
 
 // DocKind returns the type of document produced by this rule.
@@ -1139,6 +1026,10 @@ func (expr *Expr) Compare(other *Expr) int {
 		if cmp := Compare(t, other.Terms.(*SomeDecl)); cmp != 0 {
 			return cmp
 		}
+	case *Every:
+		if cmp := Compare(t, other.Terms.(*Every)); cmp != 0 {
+			return cmp
+		}
 	}
 
 	return withSliceCompare(expr.With, other.With)
@@ -1152,14 +1043,28 @@ func (expr *Expr) sortOrder() int {
 		return 1
 	case []*Term:
 		return 2
+	case *Every:
+		return 3
 	}
 	return -1
+}
+
+// CopyWithoutTerms returns a deep copy of expr without its Terms
+func (expr *Expr) CopyWithoutTerms() *Expr {
+	cpy := *expr
+
+	cpy.With = make([]*With, len(expr.With))
+	for i := range expr.With {
+		cpy.With[i] = expr.With[i].Copy()
+	}
+
+	return &cpy
 }
 
 // Copy returns a deep copy of expr.
 func (expr *Expr) Copy() *Expr {
 
-	cpy := *expr
+	cpy := expr.CopyWithoutTerms()
 
 	switch ts := expr.Terms.(type) {
 	case *SomeDecl:
@@ -1172,14 +1077,11 @@ func (expr *Expr) Copy() *Expr {
 		cpy.Terms = cpyTs
 	case *Term:
 		cpy.Terms = ts.Copy()
+	case *Every:
+		cpy.Terms = ts.Copy()
 	}
 
-	cpy.With = make([]*With, len(expr.With))
-	for i := range expr.With {
-		cpy.With[i] = expr.With[i].Copy()
-	}
-
-	return &cpy
+	return cpy
 }
 
 // Hash returns the hash code of the Expr.
@@ -1220,12 +1122,12 @@ func (expr *Expr) NoWith() *Expr {
 
 // IsEquality returns true if this is an equality expression.
 func (expr *Expr) IsEquality() bool {
-	return isglobalbuiltin(expr, Var(Equality.Name))
+	return isGlobalBuiltin(expr, Var(Equality.Name))
 }
 
 // IsAssignment returns true if this an assignment expression.
 func (expr *Expr) IsAssignment() bool {
-	return isglobalbuiltin(expr, Var(Assign.Name))
+	return isGlobalBuiltin(expr, Var(Assign.Name))
 }
 
 // IsCall returns true if this expression calls a function.
@@ -1234,14 +1136,36 @@ func (expr *Expr) IsCall() bool {
 	return ok
 }
 
+// IsEvery returns true if this expression is an 'every' expression.
+func (expr *Expr) IsEvery() bool {
+	_, ok := expr.Terms.(*Every)
+	return ok
+}
+
+// IsSome returns true if this expression is a 'some' expression.
+func (expr *Expr) IsSome() bool {
+	_, ok := expr.Terms.(*SomeDecl)
+	return ok
+}
+
 // Operator returns the name of the function or built-in this expression refers
 // to. If this expression is not a function call, returns nil.
 func (expr *Expr) Operator() Ref {
+	op := expr.OperatorTerm()
+	if op == nil {
+		return nil
+	}
+	return op.Value.(Ref)
+}
+
+// OperatorTerm returns the name of the function or built-in this expression
+// refers to. If this expression is not a function call, returns nil.
+func (expr *Expr) OperatorTerm() *Term {
 	terms, ok := expr.Terms.([]*Term)
 	if !ok || len(terms) == 0 {
 		return nil
 	}
-	return terms[0].Value.(Ref)
+	return terms[0]
 }
 
 // Operand returns the term at the zero-based pos. If the expr does not include
@@ -1320,9 +1244,7 @@ func (expr *Expr) String() string {
 		} else {
 			buf = append(buf, Call(t).String())
 		}
-	case *Term:
-		buf = append(buf, t.String())
-	case *SomeDecl:
+	case fmt.Stringer:
 		buf = append(buf, t.String())
 	}
 
@@ -1357,6 +1279,12 @@ func NewBuiltinExpr(terms ...*Term) *Expr {
 }
 
 func (d *SomeDecl) String() string {
+	if call, ok := d.Symbols[0].Value.(Call); ok {
+		if len(call) == 4 {
+			return "some " + call[1].String() + ", " + call[2].String() + " in " + call[3].String()
+		}
+		return "some " + call[1].String() + " in " + call[2].String()
+	}
 	buf := make([]string, len(d.Symbols))
 	for i := range buf {
 		buf[i] = d.Symbols[i].String()
@@ -1390,6 +1318,62 @@ func (d *SomeDecl) Compare(other *SomeDecl) int {
 // Hash returns a hash code of d.
 func (d *SomeDecl) Hash() int {
 	return termSliceHash(d.Symbols)
+}
+
+func (q *Every) String() string {
+	if q.Key != nil {
+		return fmt.Sprintf("every %s, %s in %s { %s }",
+			q.Key,
+			q.Value,
+			q.Domain,
+			q.Body)
+	}
+	return fmt.Sprintf("every %s in %s { %s }",
+		q.Value,
+		q.Domain,
+		q.Body)
+}
+
+func (q *Every) Loc() *Location {
+	return q.Location
+}
+
+func (q *Every) SetLoc(l *Location) {
+	q.Location = l
+}
+
+// Copy returns a deep copy of d.
+func (q *Every) Copy() *Every {
+	cpy := *q
+	cpy.Key = q.Key.Copy()
+	cpy.Value = q.Value.Copy()
+	cpy.Domain = q.Domain.Copy()
+	cpy.Body = q.Body.Copy()
+	return &cpy
+}
+
+func (q *Every) Compare(other *Every) int {
+	for _, terms := range [][2]*Term{
+		{q.Key, other.Key},
+		{q.Value, other.Value},
+		{q.Domain, other.Domain},
+	} {
+		if d := Compare(terms[0], terms[1]); d != 0 {
+			return d
+		}
+	}
+	return q.Body.Compare(other.Body)
+}
+
+// KeyValueVars returns the key and val arguments of an `every`
+// expression, if they are non-nil and not wildcards.
+func (q *Every) KeyValueVars() VarSet {
+	vis := &VarVisitor{vars: VarSet{}}
+	if q.Key != nil {
+		vis.Walk(q.Key)
+	}
+	vis.Walk(q.Value)
+	return vis.vars
 }
 
 func (w *With) String() string {
@@ -1472,6 +1456,8 @@ func Copy(x interface{}) interface{} {
 	case *With:
 		return x.Copy()
 	case *SomeDecl:
+		return x.Copy()
+	case *Every:
 		return x.Copy()
 	case *Term:
 		return x.Copy()
@@ -1573,7 +1559,7 @@ func validEqAssignArgCount(expr *Expr) bool {
 
 // this function checks if the expr refers to a non-namespaced (global) built-in
 // function like eq, gt, plus, etc.
-func isglobalbuiltin(expr *Expr, name Var) bool {
+func isGlobalBuiltin(expr *Expr, name Var) bool {
 	terms, ok := expr.Terms.([]*Term)
 	if !ok {
 		return false
@@ -1584,9 +1570,9 @@ func isglobalbuiltin(expr *Expr, name Var) bool {
 	ref, ok := terms[0].Value.(Ref)
 	if !ok || len(ref) != 1 {
 		return false
-	} else if head, ok := ref[0].Value.(Var); !ok {
-		return false
-	} else {
+	}
+	if head, ok := ref[0].Value.(Var); ok {
 		return head.Equal(name)
 	}
+	return false
 }

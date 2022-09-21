@@ -13,7 +13,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/url"
 	"os"
@@ -74,7 +73,7 @@ func (p DockerAuthZPlugin) evaluatePolicyFile(ctx context.Context, r authorizati
 		return true, err
 	}
 
-	bs, err := ioutil.ReadFile(p.policyFile)
+	bs, err := os.ReadFile(p.policyFile)
 	if err != nil {
 		return false, err
 	}

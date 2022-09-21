@@ -11,6 +11,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/open-policy-agent/opa/logging"
+	"github.com/open-policy-agent/opa/plugins"
 )
 
 // Options contains parameters to setup and configure OPA.
@@ -35,6 +36,13 @@ type Options struct {
 	// is closed to signal readiness.
 	Ready chan struct{}
 
+	// Plugins provides a set of plugins.Factory instances that will be
+	// registered with the OPA SDK instance.
+	Plugins map[string]plugins.Factory
+
+	// When calling the sdk the user can specify an opa id so that repeat calls to the sdk don't have a unique opa id
+	ID string
+
 	config []byte
 	block  bool
 }
@@ -51,17 +59,21 @@ func (o *Options) init() error {
 	}
 
 	if o.ConsoleLogger == nil {
-		l := logging.NewStandardLogger()
+		l := logging.New()
 		l.SetFormatter(&logrus.JSONFormatter{})
 		o.ConsoleLogger = l
 	}
 
-	bs, err := ioutil.ReadAll(o.Config)
-	if err != nil {
-		return err
+	if o.Config == nil {
+		o.config = []byte("{}")
+	} else {
+		bs, err := ioutil.ReadAll(o.Config)
+		if err != nil {
+			return err
+		}
+		o.config = bs
 	}
 
-	o.config = bs
 	return nil
 }
 

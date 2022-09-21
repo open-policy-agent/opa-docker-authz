@@ -7,10 +7,9 @@ package init
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
-
-	"github.com/pkg/errors"
 
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/bundle"
@@ -22,11 +21,12 @@ import (
 
 // InsertAndCompileOptions contains the input for the operation.
 type InsertAndCompileOptions struct {
-	Store     storage.Store
-	Txn       storage.Transaction
-	Files     loader.Result
-	Bundles   map[string]*bundle.Bundle
-	MaxErrors int
+	Store                 storage.Store
+	Txn                   storage.Transaction
+	Files                 loader.Result
+	Bundles               map[string]*bundle.Bundle
+	MaxErrors             int
+	EnablePrintStatements bool
 }
 
 // InsertAndCompileResult contains the output of the operation.
@@ -38,10 +38,9 @@ type InsertAndCompileResult struct {
 // InsertAndCompile writes data and policy into the store and returns a compiler for the
 // store contents.
 func InsertAndCompile(ctx context.Context, opts InsertAndCompileOptions) (*InsertAndCompileResult, error) {
-
 	if len(opts.Files.Documents) > 0 {
 		if err := opts.Store.Write(ctx, opts.Txn, storage.AddOp, storage.Path{}, opts.Files.Documents); err != nil {
-			return nil, errors.Wrap(err, "storage error")
+			return nil, fmt.Errorf("storage error: %w", err)
 		}
 	}
 
@@ -51,7 +50,10 @@ func InsertAndCompile(ctx context.Context, opts InsertAndCompileOptions) (*Inser
 		policies[id] = parsed.Parsed
 	}
 
-	compiler := ast.NewCompiler().SetErrorLimit(opts.MaxErrors).WithPathConflictsCheck(storage.NonEmpty(ctx, opts.Store, opts.Txn))
+	compiler := ast.NewCompiler().
+		SetErrorLimit(opts.MaxErrors).
+		WithPathConflictsCheck(storage.NonEmpty(ctx, opts.Store, opts.Txn)).
+		WithEnablePrintStatements(opts.EnablePrintStatements)
 	m := metrics.New()
 
 	activation := &bundle.ActivateOpts{
@@ -73,13 +75,13 @@ func InsertAndCompile(ctx context.Context, opts InsertAndCompileOptions) (*Inser
 	// modules loaded outside of bundles will need to be added manually.
 	for id, parsed := range opts.Files.Modules {
 		if err := opts.Store.UpsertPolicy(ctx, opts.Txn, id, parsed.Raw); err != nil {
-			return nil, errors.Wrap(err, "storage error")
+			return nil, fmt.Errorf("storage error: %w", err)
 		}
 	}
 
 	// Set the version in the store last to prevent data files from overwriting.
 	if err := storedversion.Write(ctx, opts.Store, opts.Txn); err != nil {
-		return nil, errors.Wrap(err, "storage error")
+		return nil, fmt.Errorf("storage error: %w", err)
 	}
 
 	return &InsertAndCompileResult{Compiler: compiler, Metrics: m}, nil
@@ -120,7 +122,7 @@ func LoadPaths(paths []string, filter loader.Filter, asBundle bool, bvc *bundle.
 		result.Bundles = make(map[string]*bundle.Bundle, len(paths))
 		for _, path := range paths {
 			result.Bundles[path], err = loader.NewFileLoader().WithBundleVerificationConfig(bvc).
-				WithSkipBundleVerification(skipVerify).AsBundle(path)
+				WithSkipBundleVerification(skipVerify).WithFilter(filter).AsBundle(path)
 			if err != nil {
 				return nil, err
 			}
