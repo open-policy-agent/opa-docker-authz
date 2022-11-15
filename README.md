@@ -92,6 +92,7 @@ Logs are generated in a json format similar to [decision logs](https://www.openp
   "decision_id": "8d4c6d08-b56e-4625-b66c-3e6c00d7a6e7",
   "input": {
     "AuthMethod": "",
+    "BindMounts": [],
     "Body": null,
     "Headers": {
       "Content-Length": "0",
@@ -127,6 +128,46 @@ Logs are generated in a json format similar to [decision logs](https://www.openp
   "timestamp": "2020-06-16T16:44:54.328705305Z"
 }
 ```
+
+### Input Processing
+
+The Rego `input` document is largely identical to the JSON data structure given to opa-docker-authz by Docker, with the following additions
+to enrich the document with additional information and assist policy authoring:
+ - PathPlain - the Path portion of the RequestURI (exposed as 'Path'), i.e. without the query string 
+ - PathArr - PathPlain split into an array of path elements by '/'
+ - BindMounts - an array of bind mount objects, as specified via either 'Binds' or 'Mounts' (see below)
+ 
+#### BindMounts
+
+The BindMounts array is populated with information about the source, readonly status and resolved symlink path of each bind.  The each object in the array
+has the schema
+
+```
+{
+  "Source": "<source path>",
+  "ReadOnly": true|false,
+  "Resolved": "<resolved source path>"
+}
+```
+
+where 'Resolved' is either the empty string ("") or the full host path that corresponds to `Source` after resolving any symbolic links. 
+This allows for effective policy checking of bind mount sources, including where the true source path is obfuscated with symlinks. This
+mitigates against a known trivial bypass of policy that check for binds, for example
+
+```
+cd /home/user
+ln -sf / root
+docker run --rm -it -v/home/user/root:/mnt image
+# /mnt is now / in the hostfs
+docker run --rm -it -v/home/user/root/var:/mnt image
+# /mnt is now /var on the host
+```
+
+In each of the above examples, the 'Resolved' path allows for the situation to be detected by policy (it will resolve to "/" and "/var", respectively).
+
+**Note**: in order for the bind mount resolution to work, the opa-docker-authz plugin must have read access to all parts of the filesystem for which
+these checks are required by the policy.  The easiest way to achieve this is to run the plugin as a legacy plugin as `root`.  If using a managed plugin,
+the `config.json` would need to rebuilt with a custom bind configuration that exposes the relevant parts of the hostfs to the plugin as read only binds. 
 
 ### Uninstall
 
