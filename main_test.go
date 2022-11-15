@@ -67,7 +67,7 @@ func TestListBindMounts(t *testing.T) {
 		},
 		{
 			statement: "handle when neither bind nor mounts provided",
-			input:     `{ "HostConfig": {{} }`,
+			input:     `{ "HostConfig": {} }`,
 			expected:  []BindMount{},
 		},
 		{
@@ -115,7 +115,10 @@ func TestListBindMounts(t *testing.T) {
 	for _, tc := range tests {
 		t.Run("listBindMounts should "+tc.statement, func(t *testing.T) {
 			var body map[string]interface{}
-			json.Unmarshal([]byte(tc.input), &body)
+			err := json.Unmarshal([]byte(tc.input), &body)
+			if err != nil {
+				t.Fatalf("Improper JSON input - got %v for '%s'", err, tc.input)
+			}
 
 			result := listBindMounts(body)
 			if len(result) > 0 && len(tc.expected) > 0 && !reflect.DeepEqual(result, tc.expected) {
