@@ -16,6 +16,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -175,9 +176,56 @@ func (p DockerAuthZPlugin) evaluate(ctx context.Context, r authorization.Request
 	return p.evaluatePolicyFile(ctx, r)
 }
 
+type BindMount struct {
+	Source   string
+	ReadOnly bool
+	Resolved string
+}
+
+func listBindMounts(body map[string]interface{}) []BindMount {
+	var result []BindMount
+
+	hostConfig, ok := body["HostConfig"].(map[string]interface{})
+	if ok {
+		binds, ok := hostConfig["Binds"].([]interface{})
+		if ok {
+			for _, v := range binds {
+				bind, ok := v.(string)
+				if ok && strings.HasPrefix(bind, "/") {
+					bindParts := strings.Split(bind, ":")
+					hostPath := bindParts[0]
+					mount := BindMount{hostPath, false, ""}
+					if len(bindParts) == 3 && bindParts[2] == "ro" {
+						mount.ReadOnly = true
+					}
+					result = append(result, mount)
+				}
+			}
+		}
+
+		mounts, ok := hostConfig["Mounts"].([]interface{})
+		if ok {
+			for _, v := range mounts {
+				mount, ok := v.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				mountType, typeOk := mount["Type"].(string)
+				source, srcOk := mount["Source"].(string)
+				if typeOk && srcOk && mountType == "bind" {
+					readonly, ok := mount["ReadOnly"].(bool)
+					result = append(result, BindMount{source, ok && readonly, ""})
+				}
+			}
+		}
+	}
+
+	return result
+}
+
 func makeInput(r authorization.Request) (interface{}, error) {
 
-	var body interface{}
+	var body map[string]interface{}
 
 	if r.RequestHeaders["Content-Type"] == "application/json" && len(r.RequestBody) > 0 {
 		if err := json.Unmarshal(r.RequestBody, &body); err != nil {
@@ -190,6 +238,17 @@ func makeInput(r authorization.Request) (interface{}, error) {
 		return nil, err
 	}
 
+	bindMountList := listBindMounts(body)
+
+	// resolve bind mount paths to symlink targets
+	for idx, bindMount := range bindMountList {
+		resolved, err := filepath.EvalSymlinks(bindMount.Source)
+		if err == nil {
+			bindMountList[idx].Resolved = resolved
+		}
+
+	}
+
 	input := map[string]interface{}{
 		"Headers":    r.RequestHeaders,
 		"Path":       r.RequestURI,
@@ -200,6 +259,7 @@ func makeInput(r authorization.Request) (interface{}, error) {
 		"Body":       body,
 		"User":       r.User,
 		"AuthMethod": r.UserAuthNMethod,
+		"BindMounts": bindMountList,
 	}
 
 	return input, nil
