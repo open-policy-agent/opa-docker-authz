@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
 	"reflect"
 	"testing"
 )
@@ -50,6 +52,15 @@ func TestNormalizeAllowPath(t *testing.T) {
 }
 
 func TestListBindMounts(t *testing.T) {
+	dotDotPath := fmt.Sprintf("%s/../../../../", t.TempDir())
+	symlinkSourcePath := t.TempDir()
+	symlinkTargetPath := fmt.Sprintf("%s/target", t.TempDir())
+	err := os.Symlink(symlinkSourcePath, symlinkTargetPath)
+
+	if err != nil {
+		t.Fatalf("Failed to symlink '%s' to '%s' - got %v", symlinkSourcePath, symlinkTargetPath, err)
+	}
+
 	tests := []struct {
 		statement string
 		input     string
@@ -58,12 +69,22 @@ func TestListBindMounts(t *testing.T) {
 		{
 			statement: "parse a simple bind list",
 			input:     `{ "HostConfig": { "Binds" : [ "/var:/home", "volume:/var/lib/app:ro" ] } }`,
-			expected:  []BindMount{{"/var", false, ""}},
+			expected:  []BindMount{{"/var", false, "/var"}},
+		},
+		{
+			statement: "expand ..",
+			input:     fmt.Sprintf(`{ "HostConfig": { "Binds" : [ "%s:/host" ] } }`, dotDotPath),
+			expected:  []BindMount{{dotDotPath, false, "/"}},
+		},
+		{
+			statement: "resolve symlinks",
+			input:     fmt.Sprintf(`{ "HostConfig": { "Binds" : [ "%s:/host" ] } }`, symlinkTargetPath),
+			expected:  []BindMount{{symlinkTargetPath, false, symlinkSourcePath}},
 		},
 		{
 			statement: "parse the readonly attribute",
-			input:     `{ "HostConfig": { "Binds" : [ "/var:/home:ro", "/home/user:/mnt:rw" ] } }`,
-			expected:  []BindMount{{"/var", true, ""}, {"/home/user", false, ""}},
+			input:     `{ "HostConfig": { "Binds" : [ "/var:/home:ro", "/var/lib:/mnt:rw" ] } }`,
+			expected:  []BindMount{{"/var", true, "/var"}, {"/var/lib", false, "/var/lib"}},
 		},
 		{
 			statement: "handle when neither bind nor mounts provided",
@@ -86,7 +107,7 @@ func TestListBindMounts(t *testing.T) {
 				{ "Source": "/var", "Target": "/mnt", "Type": "bind" },
 				{ "Source": "vol", "Target": "/vol", "Type": "volume", "Labels":{"color":"red"} }
 				] } }`,
-			expected: []BindMount{{"/var", false, ""}},
+			expected: []BindMount{{"/var", false, "/var"}},
 		},
 		{
 			statement: "parse a readonly mount list",
@@ -94,7 +115,7 @@ func TestListBindMounts(t *testing.T) {
 				{ "Source": "/var", "Target": "/mnt", "Type": "bind", "ReadOnly": true },
 				{ "Source": "/home", "Target": "/home", "Type": "bind" }
 				] } }`,
-			expected: []BindMount{{"/var", true, ""}, {"/home", false, ""}},
+			expected: []BindMount{{"/var", true, "/var"}, {"/home", false, "/home"}},
 		},
 		{
 			statement: "ignore an invalid mount list",
@@ -102,13 +123,13 @@ func TestListBindMounts(t *testing.T) {
 				{ "Source": "/var", "Target": "/mnt", "Type": "bind", "ReadOnly": true },
 				{ "Source1": "/home", "Target": "/home", "Type": "bind" }
 				] } }`,
-			expected: []BindMount{{"/var", true, ""}},
+			expected: []BindMount{{"/var", true, "/var"}},
 		},
 		{
 			statement: "ignore a mount list of the wrong type, whlile reading binds",
 			input: `{ "HostConfig": { "Binds": ["/var:/mnt/var:ro","/home:/home"],
 				"Mounts" : null } }`,
-			expected: []BindMount{{"/var", true, ""}, {"/home", false, ""}},
+			expected: []BindMount{{"/var", true, "/var"}, {"/home", false, "/home"}},
 		},
 	}
 

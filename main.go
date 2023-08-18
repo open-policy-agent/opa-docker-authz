@@ -220,6 +220,17 @@ func listBindMounts(body map[string]interface{}) []BindMount {
 		}
 	}
 
+	// resolve bind mount paths to symlink targets
+	// and expand /example/../ to avoid bypassing rules
+	for idx, bindMount := range result {
+		resolved, err := filepath.EvalSymlinks(bindMount.Source)
+		if err == nil {
+			resolved = filepath.Clean(resolved)
+			result[idx].Resolved = resolved
+		}
+
+	}
+
 	return result
 }
 
@@ -239,15 +250,6 @@ func makeInput(r authorization.Request) (interface{}, error) {
 	}
 
 	bindMountList := listBindMounts(body)
-
-	// resolve bind mount paths to symlink targets
-	for idx, bindMount := range bindMountList {
-		resolved, err := filepath.EvalSymlinks(bindMount.Source)
-		if err == nil {
-			bindMountList[idx].Resolved = resolved
-		}
-
-	}
 
 	input := map[string]interface{}{
 		"Headers":    r.RequestHeaders,
