@@ -2,8 +2,9 @@ package rest
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"time"
@@ -49,6 +50,10 @@ type azureManagedIdentitiesAuthPlugin struct {
 }
 
 func (ap *azureManagedIdentitiesAuthPlugin) NewClient(c Config) (*http.Client, error) {
+	if c.Type == "oci" {
+		return nil, errors.New("azure managed identities auth: OCI service not supported")
+	}
+
 	if ap.Endpoint == "" {
 		ap.Endpoint = azureIMDSEndpoint
 	}
@@ -102,7 +107,7 @@ func azureManagedIdentitiesTokenRequest(
 	}
 	defer response.Body.Close()
 
-	data, err := ioutil.ReadAll(response.Body)
+	data, err := io.ReadAll(response.Body)
 	if err != nil {
 		return token, err
 	}

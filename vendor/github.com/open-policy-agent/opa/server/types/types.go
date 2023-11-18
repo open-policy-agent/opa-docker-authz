@@ -80,6 +80,8 @@ const (
 	MsgUnauthorizedUndefinedError = "authorization policy missing or undefined"
 	MsgUnauthorizedError          = "request rejected by administrative policy"
 	MsgUndefinedError             = "document missing or undefined"
+	MsgMissingError               = "document missing"
+	MsgFoundUndefinedError        = "document undefined"
 	MsgPluginConfigError          = "error(s) occurred while configuring plugin(s)"
 )
 
@@ -191,6 +193,7 @@ const (
 	ExplainFullV1  ExplainModeV1 = "full"
 	ExplainNotesV1 ExplainModeV1 = "notes"
 	ExplainFailsV1 ExplainModeV1 = "fails"
+	ExplainDebugV1 ExplainModeV1 = "debug"
 )
 
 // TraceV1 models the trace result returned for queries that include the

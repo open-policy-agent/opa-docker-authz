@@ -8,6 +8,7 @@ package init
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 	"strings"
 
@@ -113,7 +114,18 @@ type Descriptor struct {
 
 // LoadPaths reads data and policy from the given paths and returns a set of bundles or
 // raw loader file results.
-func LoadPaths(paths []string, filter loader.Filter, asBundle bool, bvc *bundle.VerificationConfig, skipVerify bool) (*LoadPathsResult, error) {
+func LoadPaths(paths []string,
+	filter loader.Filter,
+	asBundle bool,
+	bvc *bundle.VerificationConfig,
+	skipVerify bool,
+	processAnnotations bool,
+	caps *ast.Capabilities,
+	fsys fs.FS) (*LoadPathsResult, error) {
+
+	if caps == nil {
+		caps = ast.CapabilitiesForThisVersion()
+	}
 
 	var result LoadPathsResult
 	var err error
@@ -121,8 +133,14 @@ func LoadPaths(paths []string, filter loader.Filter, asBundle bool, bvc *bundle.
 	if asBundle {
 		result.Bundles = make(map[string]*bundle.Bundle, len(paths))
 		for _, path := range paths {
-			result.Bundles[path], err = loader.NewFileLoader().WithBundleVerificationConfig(bvc).
-				WithSkipBundleVerification(skipVerify).WithFilter(filter).AsBundle(path)
+			result.Bundles[path], err = loader.NewFileLoader().
+				WithFS(fsys).
+				WithBundleVerificationConfig(bvc).
+				WithSkipBundleVerification(skipVerify).
+				WithFilter(filter).
+				WithProcessAnnotation(processAnnotations).
+				WithCapabilities(caps).
+				AsBundle(path)
 			if err != nil {
 				return nil, err
 			}
@@ -130,7 +148,11 @@ func LoadPaths(paths []string, filter loader.Filter, asBundle bool, bvc *bundle.
 		return &result, nil
 	}
 
-	files, err := loader.NewFileLoader().Filtered(paths, filter)
+	files, err := loader.NewFileLoader().
+		WithFS(fsys).
+		WithProcessAnnotation(processAnnotations).
+		WithCapabilities(caps).
+		Filtered(paths, filter)
 	if err != nil {
 		return nil, err
 	}
