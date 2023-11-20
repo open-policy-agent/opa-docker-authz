@@ -32,7 +32,6 @@ jobs:
       - name: Build and publish docker plugin
         env:
           REPO: ghcr.io/${{ github.repository }}
-          VERSION: ${{ env.TAG_NAME }}
         run: |-
-          make plugin
-          docker plugin push "$REPO:${TAG_NAME}"
+          REPO=${{ env.REPO }} VERSION=${{ env.TAG_NAME }} make plugin
+          docker plugin push "${{ env.REPO }}:${{ env.TAG_NAME }}"

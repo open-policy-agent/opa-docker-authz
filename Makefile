@@ -1,9 +1,9 @@
 .PHONY: all build
 
 VERSION ?= 0.8
-GO_VERSION := 1.19.1
-GOLANGCI_LINT_VERSION := v1.49.0
-REPO := openpolicyagent/opa-docker-authz-v2
+GO_VERSION := 1.21.4
+GOLANGCI_LINT_VERSION := v1.55.2
+REPO ?= openpolicyagent/opa-docker-authz-v2
 
 all: build
 
