@@ -6,6 +6,7 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -14,7 +15,6 @@ import (
 	"fmt"
 	"html/template"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -24,6 +24,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	serverEncodingPlugin "github.com/open-policy-agent/opa/plugins/server/encoding"
 
 	"github.com/gorilla/mux"
 	"go.opentelemetry.io/otel/attribute"
@@ -35,17 +37,20 @@ import (
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/bundle"
 	"github.com/open-policy-agent/opa/internal/json/patch"
+	"github.com/open-policy-agent/opa/logging"
 	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/plugins"
 	bundlePlugin "github.com/open-policy-agent/opa/plugins/bundle"
 	"github.com/open-policy-agent/opa/plugins/status"
 	"github.com/open-policy-agent/opa/rego"
 	"github.com/open-policy-agent/opa/server/authorizer"
+	"github.com/open-policy-agent/opa/server/handlers"
 	"github.com/open-policy-agent/opa/server/identifier"
 	"github.com/open-policy-agent/opa/server/types"
 	"github.com/open-policy-agent/opa/server/writer"
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/topdown"
+	"github.com/open-policy-agent/opa/topdown/builtins"
 	iCache "github.com/open-policy-agent/opa/topdown/cache"
 	"github.com/open-policy-agent/opa/topdown/lineage"
 	"github.com/open-policy-agent/opa/tracing"
@@ -90,6 +95,7 @@ const (
 	PromHandlerIndex      = "index"
 	PromHandlerCatch      = "catchall"
 	PromHandlerHealth     = "health"
+	PromHandlerAPIAuthz   = "authz"
 )
 
 const pqMaxCacheSize = 100
@@ -136,6 +142,7 @@ type Server struct {
 	interQueryBuiltinCache iCache.InterQueryCache
 	allPluginsOkOnce       bool
 	distributedTracingOpts tracing.Options
+	ndbCacheEnabled        bool
 }
 
 // Metrics defines the interface that the server requires for recording HTTP
@@ -177,12 +184,16 @@ func (s *Server) Init(ctx context.Context) (*Server, error) {
 	s.partials = map[string]rego.PartialResult{}
 	s.preparedEvalQueries = newCache(pqMaxCacheSize)
 	s.defaultDecisionPath = s.generateDefaultDecisionPath()
-	s.interQueryBuiltinCache = iCache.NewInterQueryCache(s.manager.InterQueryBuiltinCacheConfig())
-	s.manager.RegisterCacheTrigger(s.updateCacheConfig)
+	s.manager.RegisterNDCacheTrigger(s.updateNDCache)
 
-	// authorizer, if configured, needs the iCache to be set up already
-	s.Handler = s.initHandlerAuth(s.Handler)
-	s.DiagnosticHandler = s.initHandlerAuth(s.DiagnosticHandler)
+	s.Handler = s.initHandlerAuthn(s.Handler)
+
+	// compression handler
+	s.Handler, err = s.initHandlerCompression(s.Handler)
+	if err != nil {
+		return nil, err
+	}
+	s.DiagnosticHandler = s.initHandlerAuthn(s.DiagnosticHandler)
 
 	return s, s.store.Commit(ctx, txn)
 }
@@ -346,6 +357,12 @@ func (s *Server) WithMinTLSVersion(minTLSVersion uint16) *Server {
 // WithDistributedTracingOpts sets the options to be used by distributed tracing.
 func (s *Server) WithDistributedTracingOpts(opts tracing.Options) *Server {
 	s.distributedTracingOpts = opts
+	return s
+}
+
+// WithNDBCacheEnabled sets whether the ND builtins cache is to be used.
+func (s *Server) WithNDBCacheEnabled(ndbCacheEnabled bool) *Server {
+	s.ndbCacheEnabled = ndbCacheEnabled
 	return s
 }
 
@@ -623,9 +640,18 @@ func (s *Server) getListenerForUNIXSocket(u *url.URL, h http.Handler, t httpList
 	return domainSocketLoop, l, nil
 }
 
-func (s *Server) initHandlerAuth(handler http.Handler) http.Handler {
-	// Add authorization handler. This must come BEFORE authentication handler
-	// so that the latter can run first.
+func (s *Server) initHandlerAuthn(handler http.Handler) http.Handler {
+	switch s.authentication {
+	case AuthenticationToken:
+		handler = identifier.NewTokenBased(handler)
+	case AuthenticationTLS:
+		handler = identifier.NewTLSBased(handler)
+	}
+
+	return handler
+}
+
+func (s *Server) initHandlerAuthz(handler http.Handler) http.Handler {
 	switch s.authorization {
 	case AuthorizationBasic:
 		handler = authorizer.NewBasic(
@@ -637,16 +663,28 @@ func (s *Server) initHandlerAuth(handler http.Handler) http.Handler {
 			authorizer.PrintHook(s.manager.PrintHook()),
 			authorizer.EnablePrintStatements(s.manager.EnablePrintStatements()),
 			authorizer.InterQueryCache(s.interQueryBuiltinCache))
-	}
 
-	switch s.authentication {
-	case AuthenticationToken:
-		handler = identifier.NewTokenBased(handler)
-	case AuthenticationTLS:
-		handler = identifier.NewTLSBased(handler)
+		if s.metrics != nil {
+			handler = s.instrumentHandler(handler.ServeHTTP, PromHandlerAPIAuthz)
+		}
 	}
 
 	return handler
+}
+
+func (s *Server) initHandlerCompression(handler http.Handler) (http.Handler, error) {
+	var encodingRawConfig json.RawMessage
+	serverConfig := s.manager.Config.Server
+	if serverConfig != nil {
+		encodingRawConfig = serverConfig.Encoding
+	}
+	encodingConfig, err := serverEncodingPlugin.NewConfigBuilder().WithBytes(encodingRawConfig).Parse()
+	if err != nil {
+		return nil, err
+	}
+	compressHandler := handlers.CompressHandler(handler, *encodingConfig.Gzip.MinLength, *encodingConfig.Gzip.CompressionLevel)
+
+	return compressHandler, nil
 }
 
 func (s *Server) initRouters() {
@@ -656,6 +694,16 @@ func (s *Server) initRouters() {
 	}
 
 	diagRouter := mux.NewRouter()
+
+	// authorizer, if configured, needs the iCache to be set up already
+	s.interQueryBuiltinCache = iCache.NewInterQueryCache(s.manager.InterQueryBuiltinCacheConfig())
+	s.manager.RegisterCacheTrigger(s.updateCacheConfig)
+
+	// Add authorization handler. This must come BEFORE authentication handler
+	// so that the latter can run first.
+	handlerAuthz := s.initHandlerAuthz(mainRouter)
+
+	handlerAuthzDiag := s.initHandlerAuthz(diagRouter)
 
 	// All routers get the same base configuration *and* diagnostic API's
 	for _, router := range []*mux.Router{mainRouter, diagRouter} {
@@ -738,6 +786,10 @@ func (s *Server) initRouters() {
 
 	s.Handler = mainRouter
 	s.DiagnosticHandler = diagRouter
+
+	// Add authorization handler in the end so that it can run first
+	s.Handler = handlerAuthz
+	s.DiagnosticHandler = handlerAuthzDiag
 }
 
 func (s *Server) instrumentHandler(handler func(http.ResponseWriter, *http.Request), label string) http.Handler {
@@ -751,7 +803,7 @@ func (s *Server) instrumentHandler(handler func(http.ResponseWriter, *http.Reque
 	return httpHandler
 }
 
-func (s *Server) execQuery(ctx context.Context, r *http.Request, br bundleRevisions, txn storage.Transaction, decisionID string, parsedQuery ast.Body, input ast.Value, m metrics.Metrics, explainMode types.ExplainModeV1, includeMetrics, includeInstrumentation, pretty bool) (results types.QueryResponseV1, err error) {
+func (s *Server) execQuery(ctx context.Context, r *http.Request, br bundleRevisions, txn storage.Transaction, parsedQuery ast.Body, input ast.Value, m metrics.Metrics, explainMode types.ExplainModeV1, includeMetrics, includeInstrumentation, pretty bool) (results types.QueryResponseV1, err error) {
 
 	logger := s.getDecisionLogger(br)
 
@@ -769,6 +821,11 @@ func (s *Server) execQuery(ctx context.Context, r *http.Request, br bundleRevisi
 		rawInput = &x
 	}
 
+	var ndbCache builtins.NDBCache
+	if s.ndbCacheEnabled {
+		ndbCache = builtins.NDBCache{}
+	}
+
 	opts := []func(*rego.Rego){
 		rego.Store(s.store),
 		rego.Transaction(txn),
@@ -784,6 +841,7 @@ func (s *Server) execQuery(ctx context.Context, r *http.Request, br bundleRevisi
 		rego.PrintHook(s.manager.PrintHook()),
 		rego.EnablePrintStatements(s.manager.EnablePrintStatements()),
 		rego.DistributedTracingOpts(s.distributedTracingOpts),
+		rego.NDBuiltinCache(ndbCache),
 	}
 
 	for _, r := range s.manager.GetWasmResolvers() {
@@ -796,7 +854,7 @@ func (s *Server) execQuery(ctx context.Context, r *http.Request, br bundleRevisi
 
 	output, err := rego.Eval(ctx)
 	if err != nil {
-		_ = logger.Log(ctx, txn, decisionID, r.RemoteAddr, "", parsedQuery.String(), rawInput, input, nil, err, m)
+		_ = logger.Log(ctx, txn, "", parsedQuery.String(), rawInput, input, nil, ndbCache, err, m)
 		return results, err
 	}
 
@@ -813,7 +871,7 @@ func (s *Server) execQuery(ctx context.Context, r *http.Request, br bundleRevisi
 	}
 
 	var x interface{} = results.Result
-	err = logger.Log(ctx, txn, decisionID, r.RemoteAddr, "", parsedQuery.String(), rawInput, input, &x, nil, m)
+	err = logger.Log(ctx, txn, "", parsedQuery.String(), rawInput, input, &x, ndbCache, nil, m)
 	return results, err
 }
 
@@ -898,7 +956,7 @@ func (s *Server) v0QueryPath(w http.ResponseWriter, r *http.Request, urlPath str
 	m.Timer(metrics.ServerHandler).Start()
 
 	decisionID := s.generateDecisionID()
-	ctx := r.Context()
+	ctx := logging.WithDecisionID(r.Context(), decisionID)
 	annotateSpan(ctx, decisionID)
 
 	input, err := readInputV0(r)
@@ -938,6 +996,11 @@ func (s *Server) v0QueryPath(w http.ResponseWriter, r *http.Request, urlPath str
 
 	logger := s.getDecisionLogger(br)
 
+	var ndbCache builtins.NDBCache
+	if s.ndbCacheEnabled {
+		ndbCache = builtins.NDBCache{}
+	}
+
 	pqID := "v0QueryPath::" + urlPath
 	preparedQuery, ok := s.getCachedPreparedEvalQuery(pqID, m)
 	if !ok {
@@ -957,14 +1020,14 @@ func (s *Server) v0QueryPath(w http.ResponseWriter, r *http.Request, urlPath str
 		partial, strictBuiltinErrors, instrument := false, false, false
 		rego, err := s.makeRego(ctx, partial, strictBuiltinErrors, txn, input, urlPath, m, instrument, nil, opts)
 		if err != nil {
-			_ = logger.Log(ctx, txn, decisionID, r.RemoteAddr, urlPath, "", goInput, input, nil, err, m)
+			_ = logger.Log(ctx, txn, urlPath, "", goInput, input, nil, ndbCache, err, m)
 			writer.ErrorAuto(w, err)
 			return
 		}
 
 		pq, err := rego.PrepareForEval(ctx)
 		if err != nil {
-			_ = logger.Log(ctx, txn, decisionID, r.RemoteAddr, urlPath, "", goInput, input, nil, err, m)
+			_ = logger.Log(ctx, txn, urlPath, "", goInput, input, nil, ndbCache, err, m)
 			writer.ErrorAuto(w, err)
 			return
 		}
@@ -977,6 +1040,7 @@ func (s *Server) v0QueryPath(w http.ResponseWriter, r *http.Request, urlPath str
 		rego.EvalParsedInput(input),
 		rego.EvalMetrics(m),
 		rego.EvalInterQueryBuiltinCache(s.interQueryBuiltinCache),
+		rego.EvalNDBuiltinCache(ndbCache),
 	}
 
 	rs, err := preparedQuery.Eval(
@@ -988,14 +1052,20 @@ func (s *Server) v0QueryPath(w http.ResponseWriter, r *http.Request, urlPath str
 
 	// Handle results.
 	if err != nil {
-		_ = logger.Log(ctx, txn, decisionID, r.RemoteAddr, urlPath, "", goInput, input, nil, err, m)
+		_ = logger.Log(ctx, txn, urlPath, "", goInput, input, nil, ndbCache, err, m)
 		writer.ErrorAuto(w, err)
 		return
 	}
 
 	if len(rs) == 0 {
-		err := types.NewErrorV1(types.CodeUndefinedDocument, fmt.Sprintf("%v: %v", types.MsgUndefinedError, stringPathToDataRef(urlPath)))
-		if logErr := logger.Log(ctx, txn, decisionID, r.RemoteAddr, urlPath, "", goInput, input, nil, err, m); logErr != nil {
+		ref := stringPathToDataRef(urlPath)
+
+		var messageType = types.MsgMissingError
+		if len(s.getCompiler().GetRulesForVirtualDocument(ref)) > 0 {
+			messageType = types.MsgFoundUndefinedError
+		}
+		err := types.NewErrorV1(types.CodeUndefinedDocument, fmt.Sprintf("%v: %v", messageType, ref))
+		if logErr := logger.Log(ctx, txn, urlPath, "", goInput, input, nil, ndbCache, err, m); logErr != nil {
 			writer.ErrorAuto(w, logErr)
 			return
 		}
@@ -1003,7 +1073,7 @@ func (s *Server) v0QueryPath(w http.ResponseWriter, r *http.Request, urlPath str
 		writer.Error(w, http.StatusNotFound, err)
 		return
 	}
-	err = logger.Log(ctx, txn, decisionID, r.RemoteAddr, urlPath, "", goInput, input, &rs[0].Expressions[0].Value, nil, m)
+	err = logger.Log(ctx, txn, urlPath, "", goInput, input, &rs[0].Expressions[0].Value, ndbCache, nil, m)
 	if err != nil {
 		writer.ErrorAuto(w, err)
 		return
@@ -1216,7 +1286,15 @@ func (s *Server) v1CompilePost(w http.ResponseWriter, r *http.Request) {
 	m.Timer(metrics.ServerHandler).Start()
 	m.Timer(metrics.RegoQueryParse).Start()
 
-	request, reqErr := readInputCompilePostV1(r.Body)
+	// decompress the input if sent as zip
+	body, err := readPlainBody(r)
+	if err != nil {
+		reqErr := types.NewErrorV1(types.CodeInvalidParameter, "could not decompress the body")
+		writer.Error(w, http.StatusBadRequest, reqErr)
+		return
+	}
+
+	request, reqErr := readInputCompilePostV1(body)
 	if reqErr != nil {
 		writer.Error(w, http.StatusBadRequest, reqErr)
 		return
@@ -1294,7 +1372,7 @@ func (s *Server) v1DataGet(w http.ResponseWriter, r *http.Request) {
 	m.Timer(metrics.ServerHandler).Start()
 
 	decisionID := s.generateDecisionID()
-	ctx := r.Context()
+	ctx := logging.WithDecisionID(r.Context(), decisionID)
 	annotateSpan(ctx, decisionID)
 
 	vars := mux.Vars(r)
@@ -1350,6 +1428,11 @@ func (s *Server) v1DataGet(w http.ResponseWriter, r *http.Request) {
 
 	logger := s.getDecisionLogger(br)
 
+	var ndbCache builtins.NDBCache
+	if s.ndbCacheEnabled {
+		ndbCache = builtins.NDBCache{}
+	}
+
 	var buf *topdown.BufferTracer
 
 	if explainMode != types.ExplainOffV1 {
@@ -1377,14 +1460,14 @@ func (s *Server) v1DataGet(w http.ResponseWriter, r *http.Request) {
 		partial := false
 		rego, err := s.makeRego(ctx, partial, strictBuiltinErrors, txn, input, urlPath, m, includeInstrumentation, buf, opts)
 		if err != nil {
-			_ = logger.Log(ctx, txn, decisionID, r.RemoteAddr, urlPath, "", goInput, input, nil, err, m)
+			_ = logger.Log(ctx, txn, urlPath, "", goInput, input, nil, ndbCache, err, m)
 			writer.ErrorAuto(w, err)
 			return
 		}
 
 		pq, err := rego.PrepareForEval(ctx)
 		if err != nil {
-			_ = logger.Log(ctx, txn, decisionID, r.RemoteAddr, urlPath, "", goInput, input, nil, err, m)
+			_ = logger.Log(ctx, txn, urlPath, "", goInput, input, nil, ndbCache, err, m)
 			writer.ErrorAuto(w, err)
 			return
 		}
@@ -1399,6 +1482,7 @@ func (s *Server) v1DataGet(w http.ResponseWriter, r *http.Request) {
 		rego.EvalQueryTracer(buf),
 		rego.EvalInterQueryBuiltinCache(s.interQueryBuiltinCache),
 		rego.EvalInstrument(includeInstrumentation),
+		rego.EvalNDBuiltinCache(ndbCache),
 	}
 
 	rs, err := preparedQuery.Eval(
@@ -1410,7 +1494,7 @@ func (s *Server) v1DataGet(w http.ResponseWriter, r *http.Request) {
 
 	// Handle results.
 	if err != nil {
-		_ = logger.Log(ctx, txn, decisionID, r.RemoteAddr, urlPath, "", goInput, input, nil, err, m)
+		_ = logger.Log(ctx, txn, urlPath, "", goInput, input, nil, ndbCache, err, m)
 		writer.ErrorAuto(w, err)
 		return
 	}
@@ -1429,13 +1513,14 @@ func (s *Server) v1DataGet(w http.ResponseWriter, r *http.Request) {
 
 	if len(rs) == 0 {
 		if explainMode == types.ExplainFullV1 {
-			result.Explanation, err = types.NewTraceV1(*buf, pretty)
+			result.Explanation, err = types.NewTraceV1(lineage.Full(*buf), pretty)
 			if err != nil {
 				writer.ErrorAuto(w, err)
 				return
 			}
 		}
-		err = logger.Log(ctx, txn, decisionID, r.RemoteAddr, urlPath, "", goInput, input, nil, nil, m)
+
+		err = logger.Log(ctx, txn, urlPath, "", goInput, input, nil, ndbCache, nil, m)
 		if err != nil {
 			writer.ErrorAuto(w, err)
 			return
@@ -1450,7 +1535,7 @@ func (s *Server) v1DataGet(w http.ResponseWriter, r *http.Request) {
 		result.Explanation = s.getExplainResponse(explainMode, *buf, pretty)
 	}
 
-	err = logger.Log(ctx, txn, decisionID, r.RemoteAddr, urlPath, "", goInput, input, result.Result, nil, m)
+	err = logger.Log(ctx, txn, urlPath, "", goInput, input, result.Result, ndbCache, nil, m)
 	if err != nil {
 		writer.ErrorAuto(w, err)
 		return
@@ -1528,7 +1613,7 @@ func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
 	m.Timer(metrics.ServerHandler).Start()
 
 	decisionID := s.generateDecisionID()
-	ctx := r.Context()
+	ctx := logging.WithDecisionID(r.Context(), decisionID)
 	annotateSpan(ctx, decisionID)
 
 	vars := mux.Vars(r)
@@ -1577,6 +1662,11 @@ func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
 
 	logger := s.getDecisionLogger(br)
 
+	var ndbCache builtins.NDBCache
+	if s.ndbCacheEnabled {
+		ndbCache = builtins.NDBCache{}
+	}
+
 	var buf *topdown.BufferTracer
 
 	if explainMode != types.ExplainOffV1 {
@@ -1608,14 +1698,14 @@ func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
 
 		rego, err := s.makeRego(ctx, partial, strictBuiltinErrors, txn, input, urlPath, m, includeInstrumentation, buf, opts)
 		if err != nil {
-			_ = logger.Log(ctx, txn, decisionID, r.RemoteAddr, urlPath, "", goInput, input, nil, err, m)
+			_ = logger.Log(ctx, txn, urlPath, "", goInput, input, nil, ndbCache, err, m)
 			writer.ErrorAuto(w, err)
 			return
 		}
 
 		pq, err := rego.PrepareForEval(ctx)
 		if err != nil {
-			_ = logger.Log(ctx, txn, decisionID, r.RemoteAddr, urlPath, "", goInput, input, nil, err, m)
+			_ = logger.Log(ctx, txn, urlPath, "", goInput, input, nil, ndbCache, err, m)
 			writer.ErrorAuto(w, err)
 			return
 		}
@@ -1630,6 +1720,7 @@ func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
 		rego.EvalQueryTracer(buf),
 		rego.EvalInterQueryBuiltinCache(s.interQueryBuiltinCache),
 		rego.EvalInstrument(includeInstrumentation),
+		rego.EvalNDBuiltinCache(ndbCache),
 	}
 
 	rs, err := preparedQuery.Eval(
@@ -1641,7 +1732,7 @@ func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
 
 	// Handle results.
 	if err != nil {
-		_ = logger.Log(ctx, txn, decisionID, r.RemoteAddr, urlPath, "", goInput, input, nil, err, m)
+		_ = logger.Log(ctx, txn, urlPath, "", goInput, input, nil, ndbCache, err, m)
 		writer.ErrorAuto(w, err)
 		return
 	}
@@ -1664,13 +1755,13 @@ func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
 
 	if len(rs) == 0 {
 		if explainMode == types.ExplainFullV1 {
-			result.Explanation, err = types.NewTraceV1(*buf, pretty)
+			result.Explanation, err = types.NewTraceV1(lineage.Full(*buf), pretty)
 			if err != nil {
 				writer.ErrorAuto(w, err)
 				return
 			}
 		}
-		err = logger.Log(ctx, txn, decisionID, r.RemoteAddr, urlPath, "", goInput, input, nil, nil, m)
+		err = logger.Log(ctx, txn, urlPath, "", goInput, input, nil, ndbCache, nil, m)
 		if err != nil {
 			writer.ErrorAuto(w, err)
 			return
@@ -1685,7 +1776,7 @@ func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
 		result.Explanation = s.getExplainResponse(explainMode, *buf, pretty)
 	}
 
-	err = logger.Log(ctx, txn, decisionID, r.RemoteAddr, urlPath, "", goInput, input, result.Result, nil, m)
+	err = logger.Log(ctx, txn, urlPath, "", goInput, input, result.Result, ndbCache, nil, m)
 	if err != nil {
 		writer.ErrorAuto(w, err)
 		return
@@ -1994,7 +2085,7 @@ func (s *Server) v1PoliciesPut(w http.ResponseWriter, r *http.Request) {
 
 	m.Timer("server_read_bytes").Start()
 
-	buf, err := ioutil.ReadAll(r.Body)
+	buf, err := io.ReadAll(r.Body)
 	if err != nil {
 		writer.ErrorString(w, http.StatusBadRequest, types.CodeInvalidParameter, err)
 		return
@@ -2103,7 +2194,7 @@ func (s *Server) v1QueryGet(w http.ResponseWriter, r *http.Request) {
 	m := metrics.New()
 
 	decisionID := s.generateDecisionID()
-	ctx := r.Context()
+	ctx := logging.WithDecisionID(r.Context(), decisionID)
 	annotateSpan(ctx, decisionID)
 
 	values := r.URL.Query()
@@ -2147,7 +2238,7 @@ func (s *Server) v1QueryGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results, err := s.execQuery(ctx, r, br, txn, decisionID, parsedQuery, nil, m, explainMode, includeMetrics, includeInstrumentation, pretty)
+	results, err := s.execQuery(ctx, r, br, txn, parsedQuery, nil, m, explainMode, includeMetrics, includeInstrumentation, pretty)
 	if err != nil {
 		switch err := err.(type) {
 		case ast.Errors:
@@ -2166,7 +2257,7 @@ func (s *Server) v1QueryPost(w http.ResponseWriter, r *http.Request) {
 	m.Timer(metrics.ServerHandler).Start()
 
 	decisionID := s.generateDecisionID()
-	ctx := r.Context()
+	ctx := logging.WithDecisionID(r.Context(), decisionID)
 	annotateSpan(ctx, decisionID)
 
 	var request types.QueryRequestV1
@@ -2218,7 +2309,7 @@ func (s *Server) v1QueryPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results, err := s.execQuery(ctx, r, br, txn, decisionID, parsedQuery, input, m, explainMode, includeMetrics, includeInstrumentation, pretty)
+	results, err := s.execQuery(ctx, r, br, txn, parsedQuery, input, m, explainMode, includeMetrics, includeInstrumentation, pretty)
 	if err != nil {
 		switch err := err.(type) {
 		case ast.Errors:
@@ -2369,7 +2460,13 @@ func (s *Server) getExplainResponse(explainMode types.ExplainModeV1, trace []*to
 		}
 	case types.ExplainFullV1:
 		var err error
-		explanation, err = types.NewTraceV1(trace, pretty)
+		explanation, err = types.NewTraceV1(lineage.Full(trace), pretty)
+		if err != nil {
+			break
+		}
+	case types.ExplainDebugV1:
+		var err error
+		explanation, err = types.NewTraceV1(lineage.Debug(trace), pretty)
 		if err != nil {
 			break
 		}
@@ -2571,6 +2668,12 @@ func (s *Server) updateCacheConfig(cacheConfig *iCache.Config) {
 	s.interQueryBuiltinCache.UpdateConfig(cacheConfig)
 }
 
+func (s *Server) updateNDCache(enabled bool) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	s.ndbCacheEnabled = enabled
+}
+
 func stringPathToDataRef(s string) (r ast.Ref) {
 	result := ast.Ref{ast.DefaultRootDocument}
 	result = append(result, stringPathToRef(s)...)
@@ -2600,13 +2703,7 @@ func stringPathToRef(s string) (r ast.Ref) {
 }
 
 func validateQuery(query string) (ast.Body, error) {
-
-	var body ast.Body
-	body, err := ast.ParseBody(query)
-	if err != nil {
-		return nil, err
-	}
-	return body, nil
+	return ast.ParseBody(query)
 }
 
 func getBoolParam(url *url.URL, name string, ifEmpty bool) bool {
@@ -2654,6 +2751,8 @@ func getExplain(p []string, zero types.ExplainModeV1) types.ExplainModeV1 {
 			return types.ExplainNotesV1
 		case string(types.ExplainFullV1):
 			return types.ExplainFullV1
+		case string(types.ExplainDebugV1):
+			return types.ExplainDebugV1
 		}
 	}
 	return zero
@@ -2666,24 +2765,29 @@ func readInputV0(r *http.Request) (ast.Value, error) {
 		return ast.InterfaceToValue(parsed)
 	}
 
-	bs, err := ioutil.ReadAll(r.Body)
+	// decompress the input if sent as zip
+	body, err := readPlainBody(r)
 	if err != nil {
-		return nil, err
-	}
-
-	bs = bytes.TrimSpace(bs)
-	if len(bs) == 0 {
-		return nil, nil
+		return nil, fmt.Errorf("could not decompress the body: %w", err)
 	}
 
 	var x interface{}
 
 	if strings.Contains(r.Header.Get("Content-Type"), "yaml") {
-		if err := util.Unmarshal(bs, &x); err != nil {
+		bs, err := io.ReadAll(body)
+		if err != nil {
 			return nil, err
 		}
-	} else if err := util.UnmarshalJSON(bs, &x); err != nil {
-		return nil, err
+		if len(bs) > 0 {
+			if err = util.Unmarshal(bs, &x); err != nil {
+				return nil, fmt.Errorf("body contains malformed input document: %w", err)
+			}
+		}
+	} else {
+		dec := util.NewJSONDecoder(body)
+		if err := dec.Decode(&x); err != nil && err != io.EOF {
+			return nil, fmt.Errorf("body contains malformed input document: %w", err)
+		}
 	}
 
 	return ast.InterfaceToValue(x)
@@ -2709,36 +2813,39 @@ func readInputPostV1(r *http.Request) (ast.Value, error) {
 		return nil, nil
 	}
 
-	bs, err := ioutil.ReadAll(r.Body)
+	var request types.DataRequestV1
 
+	// decompress the input if sent as zip
+	body, err := readPlainBody(r)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("could not decompress the body: %w", err)
 	}
 
-	if len(bs) > 0 {
-
-		ct := r.Header.Get("Content-Type")
-
-		var request types.DataRequestV1
-
-		// There is no standard for yaml mime-type so we just look for
-		// anything related
-		if strings.Contains(ct, "yaml") {
-			if err := util.Unmarshal(bs, &request); err != nil {
+	ct := r.Header.Get("Content-Type")
+	// There is no standard for yaml mime-type so we just look for
+	// anything related
+	if strings.Contains(ct, "yaml") {
+		bs, err := io.ReadAll(body)
+		if err != nil {
+			return nil, err
+		}
+		if len(bs) > 0 {
+			if err = util.Unmarshal(bs, &request); err != nil {
 				return nil, fmt.Errorf("body contains malformed input document: %w", err)
 			}
-		} else if err := util.UnmarshalJSON(bs, &request); err != nil {
+		}
+	} else {
+		dec := util.NewJSONDecoder(body)
+		if err := dec.Decode(&request); err != nil && err != io.EOF {
 			return nil, fmt.Errorf("body contains malformed input document: %w", err)
 		}
-
-		if request.Input == nil {
-			return nil, nil
-		}
-
-		return ast.InterfaceToValue(*request.Input)
 	}
 
-	return nil, nil
+	if request.Input == nil {
+		return nil, nil
+	}
+
+	return ast.InterfaceToValue(*request.Input)
 }
 
 type compileRequest struct {
@@ -2867,12 +2974,18 @@ type decisionLogger struct {
 	logger    func(context.Context, *Info) error
 }
 
-func (l decisionLogger) Log(ctx context.Context, txn storage.Transaction, decisionID, remoteAddr, path string, query string, goInput *interface{}, astInput ast.Value, goResults *interface{}, err error, m metrics.Metrics) error {
+func (l decisionLogger) Log(ctx context.Context, txn storage.Transaction, path string, query string, goInput *interface{}, astInput ast.Value, goResults *interface{}, ndbCache builtins.NDBCache, err error, m metrics.Metrics) error {
 
 	bundles := map[string]BundleInfo{}
 	for name, rev := range l.revisions {
 		bundles[name] = BundleInfo{Revision: rev}
 	}
+
+	rctx := logging.RequestContext{}
+	if r, ok := logging.FromContext(ctx); ok {
+		rctx = *r
+	}
+	decisionID, _ := logging.DecisionIDFromContext(ctx)
 
 	info := &Info{
 		Txn:        txn,
@@ -2880,7 +2993,7 @@ func (l decisionLogger) Log(ctx context.Context, txn storage.Transaction, decisi
 		Bundles:    bundles,
 		Timestamp:  time.Now().UTC(),
 		DecisionID: decisionID,
-		RemoteAddr: remoteAddr,
+		RemoteAddr: rctx.ClientAddr,
 		Path:       path,
 		Query:      query,
 		Input:      goInput,
@@ -2888,6 +3001,21 @@ func (l decisionLogger) Log(ctx context.Context, txn storage.Transaction, decisi
 		Results:    goResults,
 		Error:      err,
 		Metrics:    m,
+		RequestID:  rctx.ReqID,
+	}
+
+	if ndbCache != nil {
+		x, err := ast.JSON(ndbCache.AsValue())
+		if err != nil {
+			return err
+		}
+		info.NDBuiltinCache = &x
+	}
+
+	sctx := trace.SpanFromContext(ctx).SpanContext()
+	if sctx.IsValid() {
+		info.TraceID = sctx.TraceID().String()
+		info.SpanID = sctx.SpanID().String()
 	}
 
 	if l.logger != nil {
@@ -2922,4 +3050,20 @@ func annotateSpan(ctx context.Context, decisionID string) {
 	}
 	trace.SpanFromContext(ctx).
 		SetAttributes(attribute.String(otelDecisionIDAttr, decisionID))
+}
+
+func readPlainBody(r *http.Request) (io.ReadCloser, error) {
+	if strings.Contains(r.Header.Get("Content-Encoding"), "gzip") {
+		gzReader, err := gzip.NewReader(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		bytesBody, err := io.ReadAll(gzReader)
+		if err != nil {
+			return nil, err
+		}
+		defer gzReader.Close()
+		return io.NopCloser(bytes.NewReader(bytesBody)), err
+	}
+	return r.Body, nil
 }

@@ -7,7 +7,7 @@ package authorizer
 
 import (
 	"context"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -198,6 +198,11 @@ func makeInput(r *http.Request) (*http.Request, interface{}, error) {
 		input["identity"] = identity
 	}
 
+	clientCertificates, ok := identifier.ClientCertificates(r)
+	if ok {
+		input["client_certificates"] = clientCertificates
+	}
+
 	return r, input, nil
 }
 
@@ -229,7 +234,7 @@ func expectYAML(r *http.Request) bool {
 
 func readBody(r *http.Request) ([]byte, error) {
 
-	bs, err := ioutil.ReadAll(r.Body)
+	bs, err := io.ReadAll(r.Body)
 
 	if err != nil {
 		return nil, err

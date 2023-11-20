@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/sdk/trace"
 
 	"github.com/gorilla/mux"
 	"github.com/open-policy-agent/opa/ast"
@@ -38,11 +39,11 @@ import (
 // configuration blob. If your plugin has not been configured, your
 // factory will not be invoked.
 //
-//   plugins:
-//     my_plugin1:
-//       some_key: foo
-//     # my_plugin2:
-//     #   some_key2: bar
+//	plugins:
+//	  my_plugin1:
+//	    some_key: foo
+//	  # my_plugin2:
+//	  #   some_key2: bar
 //
 // If OPA was started with the configuration above and received two
 // calls to runtime.RegisterPlugins (one with NAME "my_plugin1" and
@@ -190,6 +191,9 @@ type Manager struct {
 	enablePrintStatements        bool
 	router                       *mux.Router
 	prometheusRegister           prometheus.Registerer
+	tracerProvider               *trace.TracerProvider
+	registeredNDCacheTriggers    []func(bool)
+	bootstrapConfigLabels        map[string]string
 }
 
 type managerContextKey string
@@ -354,6 +358,13 @@ func WithPrometheusRegister(prometheusRegister prometheus.Registerer) func(*Mana
 	}
 }
 
+// WithTracerProvider sets the passed *trace.TracerProvider to be used by plugins
+func WithTracerProvider(tracerProvider *trace.TracerProvider) func(*Manager) {
+	return func(m *Manager) {
+		m.tracerProvider = tracerProvider
+	}
+}
+
 // New creates a new Manager using config.
 func New(raw []byte, id string, store storage.Store, opts ...func(*Manager)) (*Manager, error) {
 
@@ -382,6 +393,7 @@ func New(raw []byte, id string, store storage.Store, opts ...func(*Manager)) (*M
 		maxErrors:                    -1,
 		interQueryBuiltinCacheConfig: interQueryBuiltinCacheConfig,
 		serverInitialized:            make(chan struct{}),
+		bootstrapConfigLabels:        parsedConfig.Labels,
 	}
 
 	for _, f := range opts {
@@ -658,7 +670,16 @@ func (m *Manager) Reconfigure(config *config.Config) error {
 
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
-	config.Labels = m.Config.Labels // don't overwrite labels
+
+	// don't overwrite existing labels, only allow additions - always based on the boostrap config
+	if config.Labels == nil {
+		config.Labels = m.bootstrapConfigLabels
+	} else {
+		for label, value := range m.bootstrapConfigLabels {
+			config.Labels[label] = value
+		}
+	}
+
 	m.Config = config
 	m.interQueryBuiltinCacheConfig = interQueryBuiltinCacheConfig
 	for name, client := range services {
@@ -671,6 +692,10 @@ func (m *Manager) Reconfigure(config *config.Config) error {
 
 	for _, trigger := range m.registeredCacheTriggers {
 		trigger(interQueryBuiltinCacheConfig)
+	}
+
+	for _, trigger := range m.registeredNDCacheTriggers {
+		trigger(config.NDBuiltinCache)
 	}
 
 	return nil
@@ -908,4 +933,15 @@ func (m *Manager) RegisterCacheTrigger(trigger func(*cache.Config)) {
 // PrometheusRegister gets the prometheus.Registerer for this plugin manager.
 func (m *Manager) PrometheusRegister() prometheus.Registerer {
 	return m.prometheusRegister
+}
+
+// TracerProvider gets the *trace.TracerProvider for this plugin manager.
+func (m *Manager) TracerProvider() *trace.TracerProvider {
+	return m.tracerProvider
+}
+
+func (m *Manager) RegisterNDCacheTrigger(trigger func(bool)) {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+	m.registeredNDCacheTriggers = append(m.registeredNDCacheTriggers, trigger)
 }

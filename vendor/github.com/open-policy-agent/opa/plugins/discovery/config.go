@@ -20,12 +20,13 @@ import (
 // Config represents the configuration for the discovery feature.
 type Config struct {
 	download.Config                            // bundle downloader configuration
-	Name            *string                    `json:"name"`               // name of the discovery bundle
+	Name            *string                    `json:"name"`               // Deprecated: name of the discovery bundle, use `Resource` instead.
 	Prefix          *string                    `json:"prefix,omitempty"`   // Deprecated: use `Resource` instead.
 	Decision        *string                    `json:"decision"`           // the name of the query to run on the bundle to get the config
 	Service         string                     `json:"service"`            // the name of the service used to download discovery bundle from
 	Resource        *string                    `json:"resource,omitempty"` // the resource path which will be downloaded from the service
 	Signing         *bundle.VerificationConfig `json:"signing,omitempty"`  // configuration used to verify a signed bundle
+	Persist         bool                       `json:"persist"`            // control whether to persist activated discovery bundle to disk
 
 	service string
 	path    string
@@ -97,7 +98,7 @@ func (c *Config) validateAndInjectDefaults(services []string, confKeys map[strin
 	if c.Signing != nil {
 		err := c.Signing.ValidateAndInjectDefaults(copy)
 		if err != nil {
-			return fmt.Errorf("invalid configuration for discovery service %q: %s", *c.Name, err.Error())
+			return fmt.Errorf("invalid configuration for discovery service: %s", err.Error())
 		}
 	} else {
 		if len(confKeys) > 0 {
