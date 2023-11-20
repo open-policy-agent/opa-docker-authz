@@ -1,14 +1,14 @@
 ---
-name: Post Merge
+name: Release
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - v*
 
 jobs:
   build:
-    name: Build edge
+    name: Build
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -17,6 +17,10 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v4
+
+      - name: Set TAG_NAME in Environment
+      # Subsequent jobs will be have the computed tag name
+        run: echo "TAG_NAME=${GITHUB_REF##*/}" >> $GITHUB_ENV
 
       - name: Log in to the Container registry
         uses: docker/login-action@v3
@@ -28,7 +32,7 @@ jobs:
       - name: Build and publish docker plugin
         env:
           REPO: ghcr.io/${{ github.repository }}
-          VERSION: edge
+          VERSION: ${{ env.TAG_NAME }}
         run: |-
           make plugin
           docker plugin push "$REPO:${TAG_NAME}"
