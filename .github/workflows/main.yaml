@@ -1,0 +1,34 @@
+---
+name: Post Merge
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Build edge
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish docker plugin
+        env:
+          REPO: ghcr.io/${{ github.repository }}
+          VERSION: edge
+        run: |-
+          make plugin
+          docker plugin push "$REPO:${TAG_NAME}"

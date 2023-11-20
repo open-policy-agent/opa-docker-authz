@@ -10,8 +10,8 @@ docker image build -t rootfsimage .
 id=`docker container create rootfsimage true`
 docker container export "$id" | tar -x -C ./rootfs
 
-echo "Creating plugin "${REPO}-v2:${VERSION}" ..."
-docker plugin create "${REPO}-v2:${VERSION}" .
+echo "Creating plugin "${REPO}:${VERSION}" ..."
+docker plugin create "${REPO}:${VERSION}" .
 
 echo "Cleanup..."
 docker container rm -f "$id" > /dev/null
