@@ -65,10 +65,8 @@ func (e *ErrorV1) WithASTErrors(errors []*ast.Error) *ErrorV1 {
 
 // Bytes marshals e with indentation for readability.
 func (e *ErrorV1) Bytes() []byte {
-	if bs, err := json.MarshalIndent(e, "", "  "); err == nil {
-		return bs
-	}
-	return nil
+	bs, _ := json.MarshalIndent(e, "", "  ")
+	return bs
 }
 
 // Messages included in error responses.
@@ -439,11 +437,6 @@ const (
 	// indicates the client wants to receive instrumentation data for
 	// diagnosing performance issues.
 	ParamInstrumentV1 = "instrument"
-
-	// ParamPartialV1 defines the name of the HTTP URL parameter that indicates
-	// the client wants the partial evaluation optimization to be used during
-	// query evaluation. This parameter is DEPRECATED.
-	ParamPartialV1 = "partial"
 
 	// ParamProvenanceV1 defines the name of the HTTP URL parameter that indicates
 	// the client wants build and version information in addition to the result.

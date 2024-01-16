@@ -20,6 +20,7 @@ import (
 	"github.com/open-policy-agent/opa/internal/version"
 	"github.com/open-policy-agent/opa/keys"
 	"github.com/open-policy-agent/opa/logging"
+	"github.com/open-policy-agent/opa/tracing"
 	"github.com/open-policy-agent/opa/util"
 )
 
@@ -30,6 +31,11 @@ const (
 	grantTypeClientCredentials = "client_credentials"
 	grantTypeJwtBearer         = "jwt_bearer"
 )
+
+var maskedHeaderKeys = map[string]struct{}{
+	"Authorization":        {},
+	"X-Amz-Security-Token": {},
+}
 
 // An HTTPAuthPlugin represents a mechanism to construct and configure HTTP authentication for a REST service
 type HTTPAuthPlugin interface {
@@ -125,13 +131,14 @@ func (c *Config) authPrepare(req *http.Request, lookup AuthPluginLookupFunc) err
 // Client implements an HTTP/REST client for communicating with remote
 // services.
 type Client struct {
-	bytes            *[]byte
-	json             *interface{}
-	config           Config
-	headers          map[string]string
-	authPluginLookup AuthPluginLookupFunc
-	logger           logging.Logger
-	loggerFields     map[string]interface{}
+	bytes                 *[]byte
+	json                  *interface{}
+	config                Config
+	headers               map[string]string
+	authPluginLookup      AuthPluginLookupFunc
+	logger                logging.Logger
+	loggerFields          map[string]interface{}
+	distributedTacingOpts tracing.Options
 }
 
 // Name returns an option that overrides the service name on the client.
@@ -155,6 +162,13 @@ func AuthPluginLookup(l AuthPluginLookupFunc) func(*Client) {
 func Logger(l logging.Logger) func(*Client) {
 	return func(c *Client) {
 		c.logger = l
+	}
+}
+
+// DistributedTracingOpts sets the options to be used by distributed tracing.
+func DistributedTracingOpts(tr tracing.Options) func(*Client) {
+	return func(c *Client) {
+		c.distributedTacingOpts = tr
 	}
 }
 
@@ -260,6 +274,10 @@ func (c Client) Do(ctx context.Context, method, path string) (*http.Response, er
 		return nil, err
 	}
 
+	if len(c.distributedTacingOpts) > 0 {
+		httpClient.Transport = tracing.NewTransport(httpClient.Transport, c.distributedTacingOpts)
+	}
+
 	path = strings.Trim(path, "/")
 
 	var body io.Reader
@@ -309,7 +327,7 @@ func (c Client) Do(ctx context.Context, method, path string) (*http.Response, er
 		c.loggerFields = map[string]interface{}{
 			"method":  method,
 			"url":     url,
-			"headers": withMaskedAuthorizationHeader(req.Header),
+			"headers": withMaskedHeaders(req.Header),
 		}
 
 		c.logger.WithFields(c.loggerFields).Debug("Sending request.")
@@ -341,15 +359,14 @@ func (c Client) Do(ctx context.Context, method, path string) (*http.Response, er
 	return resp, err
 }
 
-func withMaskedAuthorizationHeader(headers http.Header) http.Header {
-	authzHeader := headers.Get("Authorization")
-	if authzHeader != "" {
-		masked := make(http.Header)
-		for k, v := range headers {
+func withMaskedHeaders(headers http.Header) http.Header {
+	masked := make(http.Header)
+	for k, v := range headers {
+		if _, ok := maskedHeaderKeys[k]; ok {
+			masked.Set(k, "REDACTED")
+		} else {
 			masked[k] = v
 		}
-		masked.Set("Authorization", "REDACTED")
-		return masked
 	}
-	return headers
+	return masked
 }

@@ -12,8 +12,9 @@ import (
 	"net/http"
 	"reflect"
 
-	lstat "github.com/open-policy-agent/opa/plugins/logs/status"
 	prom "github.com/prometheus/client_golang/prometheus"
+
+	lstat "github.com/open-policy-agent/opa/plugins/logs/status"
 
 	"github.com/open-policy-agent/opa/logging"
 	"github.com/open-policy-agent/opa/metrics"
@@ -57,7 +58,7 @@ type Plugin struct {
 	lastPluginStatuses     map[string]*plugins.Status
 	queryCh                chan chan *UpdateRequestV1
 	stop                   chan chan struct{}
-	reconfig               chan interface{}
+	reconfig               chan reconfigure
 	metrics                metrics.Metrics
 	logger                 logging.Logger
 	trigger                chan trigger
@@ -71,6 +72,11 @@ type Config struct {
 	ConsoleLogs   bool                 `json:"console"`
 	Prometheus    bool                 `json:"prometheus"`
 	Trigger       *plugins.TriggerMode `json:"trigger,omitempty"` // trigger mode
+}
+
+type reconfigure struct {
+	config interface{}
+	done   chan struct{}
 }
 
 type trigger struct {
@@ -198,8 +204,10 @@ func New(parsedConfig *Config, manager *plugins.Manager) *Plugin {
 		discoCh:        make(chan bundle.Status),
 		decisionLogsCh: make(chan lstat.Status),
 		stop:           make(chan chan struct{}),
-		reconfig:       make(chan interface{}),
-		pluginStatusCh: make(chan map[string]*plugins.Status),
+		reconfig:       make(chan reconfigure),
+		// we use a buffered channel here to avoid blocking other plugins
+		// when updating statuses
+		pluginStatusCh: make(chan map[string]*plugins.Status, 1),
 		queryCh:        make(chan chan *UpdateRequestV1),
 		logger:         manager.Logger().WithFields(map[string]interface{}{"plugin": Name}),
 		trigger:        make(chan trigger),
@@ -231,16 +239,14 @@ func Lookup(manager *plugins.Manager) *Plugin {
 func (p *Plugin) Start(ctx context.Context) error {
 	p.logger.Info("Starting status reporter.")
 
-	go p.loop()
+	go p.loop(ctx)
 
 	// Setup a listener for plugin statuses, but only after starting the loop
 	// to prevent blocking threads pushing the plugin updates.
 	p.manager.RegisterPluginStatusListener(Name, p.UpdatePluginStatus)
 
-	if p.config.Prometheus && p.manager.PrometheusRegister() != nil {
-		p.register(p.manager.PrometheusRegister(), pluginStatus, loaded, failLoad,
-			lastRequest, lastSuccessfulActivation, lastSuccessfulDownload,
-			lastSuccessfulRequest, bundleLoadDuration)
+	if p.config.Prometheus {
+		p.registerAll()
 	}
 
 	// Set the status plugin's status to OK now that everything is registered and
@@ -255,6 +261,24 @@ func (p *Plugin) register(r prom.Registerer, cs ...prom.Collector) {
 		if err := r.Register(c); err != nil {
 			p.logger.Error("Status metric failed to register on prometheus :%v.", err)
 		}
+	}
+}
+
+func (p *Plugin) registerAll() {
+	if p.manager.PrometheusRegister() != nil {
+		p.register(p.manager.PrometheusRegister(), allCollectors...)
+	}
+}
+
+func (p *Plugin) unregister(r prom.Registerer, cs ...prom.Collector) {
+	for _, c := range cs {
+		r.Unregister(c)
+	}
+}
+
+func (p *Plugin) unregisterAll() {
+	if p.manager.PrometheusRegister() != nil {
+		p.unregister(p.manager.PrometheusRegister(), allCollectors...)
 	}
 }
 
@@ -296,7 +320,9 @@ func (p *Plugin) UpdatePluginStatus(status map[string]*plugins.Status) {
 
 // Reconfigure notifies the plugin with a new configuration.
 func (p *Plugin) Reconfigure(_ context.Context, config interface{}) {
-	p.reconfig <- config
+	done := make(chan struct{})
+	p.reconfig <- reconfigure{config: config, done: done}
+	<-done
 }
 
 // Snapshot returns the current status.
@@ -321,9 +347,9 @@ func (p *Plugin) Trigger(ctx context.Context) error {
 	}
 }
 
-func (p *Plugin) loop() {
+func (p *Plugin) loop(ctx context.Context) {
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 
 	for {
 
@@ -375,11 +401,12 @@ func (p *Plugin) loop() {
 				if err != nil {
 					p.logger.Error("%v.", err)
 				} else {
-					p.logger.Info("Status update sent successfully in response to discovery update.")
+					p.logger.Info("Status update sent successfully in response to decision log update.")
 				}
 			}
-		case newConfig := <-p.reconfig:
-			p.reconfigure(newConfig)
+		case update := <-p.reconfig:
+			p.reconfigure(update.config)
+			update.done <- struct{}{}
 		case respCh := <-p.queryCh:
 			respCh <- p.snapshot()
 		case update := <-p.trigger:
@@ -451,6 +478,13 @@ func (p *Plugin) reconfigure(config interface{}) {
 	}
 
 	p.logger.Info("Status reporter configuration changed.")
+
+	if newConfig.Prometheus && !p.config.Prometheus {
+		p.registerAll()
+	} else if !newConfig.Prometheus && p.config.Prometheus {
+		p.unregisterAll()
+	}
+
 	p.config = *newConfig
 }
 
