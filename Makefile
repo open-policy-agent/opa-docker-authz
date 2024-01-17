@@ -1,6 +1,6 @@
 .PHONY: all build
 
-VERSION ?= 0.8
+VERSION ?= 0.9
 GO_VERSION := 1.21.4
 GOLANGCI_LINT_VERSION := v1.55.2
 REPO ?= openpolicyagent/opa-docker-authz-v2
@@ -34,13 +34,13 @@ plugin: build
 
 plugin-push:
 	@for plugin in `docker plugin ls --format '{{.Name}}'`; do \
-		if [ "$$plugin" = "$(REPO)-v2:$(VERSION)" ]; then \
-		    echo "\nPushing plugin $(REPO)-v2:$(VERSION) ..."; \
-            docker plugin push $(REPO)-v2:$(VERSION); \
+		if [ "$$plugin" = "$(REPO):$(VERSION)" ]; then \
+		    echo "\nPushing plugin $(REPO):$(VERSION) ..."; \
+            docker plugin push $(REPO):$(VERSION); \
 			exit; \
 		fi \
 	done; \
-	echo "\nNo local copy of $(REPO)-v2:$(VERSION) exists, create it before attempting push"
+	echo "\nNo local copy of $(REPO):$(VERSION) exists, create it before attempting push"
 
 clean:
 	@if [ -f ./opa-docker-authz ]; then \
