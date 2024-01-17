@@ -34,8 +34,9 @@ const (
 	ecsRelativePathEnvVar     = "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
 
 	// ref. https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_temp_enable-regions.html
-	stsDefaultPath = "https://sts.amazonaws.com"
-	stsRegionPath  = "https://sts.%s.amazonaws.com"
+	stsDefaultDomain = "amazonaws.com"
+	stsDefaultPath   = "https://sts.%s"
+	stsRegionPath    = "https://sts.%s.%s"
 
 	// ref. https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html
 	accessKeyEnvVar               = "AWS_ACCESS_KEY_ID"
@@ -43,6 +44,7 @@ const (
 	securityTokenEnvVar           = "AWS_SECURITY_TOKEN"
 	sessionTokenEnvVar            = "AWS_SESSION_TOKEN"
 	awsRegionEnvVar               = "AWS_REGION"
+	awsDomainEnvVar               = "AWS_DOMAIN"
 	awsRoleArnEnvVar              = "AWS_ROLE_ARN"
 	awsWebIdentityTokenFileEnvVar = "AWS_WEB_IDENTITY_TOKEN_FILE"
 	awsCredentialsFileEnvVar      = "AWS_SHARED_CREDENTIALS_FILE"
@@ -322,6 +324,7 @@ type awsWebIdentityCredentialService struct {
 	WebIdentityTokenFile string
 	RegionName           string `json:"aws_region"`
 	SessionName          string `json:"session_name"`
+	Domain               string `json:"aws_domain"`
 	stsURL               string
 	creds                aws.Credentials
 	expiration           time.Time
@@ -338,6 +341,10 @@ func (cs *awsWebIdentityCredentialService) populateFromEnv() error {
 		return errors.New("no " + awsWebIdentityTokenFileEnvVar + " set in environment")
 	}
 
+	if cs.Domain == "" {
+		cs.Domain = os.Getenv(awsDomainEnvVar)
+	}
+
 	if cs.RegionName == "" {
 		if cs.RegionName = os.Getenv(awsRegionEnvVar); cs.RegionName == "" {
 			return errors.New("no " + awsRegionEnvVar + " set in environment or configuration")
@@ -347,14 +354,21 @@ func (cs *awsWebIdentityCredentialService) populateFromEnv() error {
 }
 
 func (cs *awsWebIdentityCredentialService) stsPath() string {
+	var domain string
+	if cs.Domain != "" {
+		domain = strings.ToLower(cs.Domain)
+	} else {
+		domain = stsDefaultDomain
+	}
+
 	var stsPath string
 	switch {
 	case cs.stsURL != "":
 		stsPath = cs.stsURL
 	case cs.RegionName != "":
-		stsPath = fmt.Sprintf(stsRegionPath, strings.ToLower(cs.RegionName))
+		stsPath = fmt.Sprintf(stsRegionPath, strings.ToLower(cs.RegionName), domain)
 	default:
-		stsPath = stsDefaultPath
+		stsPath = fmt.Sprintf(stsDefaultPath, domain)
 	}
 	return stsPath
 }
@@ -502,4 +516,42 @@ func (ap *ecrAuthPlugin) refreshAuthorizationToken(ctx context.Context) error {
 
 	ap.token = token
 	return nil
+}
+
+// awsKMSSignPlugin signs digests using AWS KMS.
+type awsKMSSignPlugin struct {
+
+	// awsAuthPlugin is used to sign kms sign requests.
+	awsAuthPlugin *awsSigningAuthPlugin
+
+	// kms represents the service for signing digests.
+	kms awskms
+
+	logger logging.Logger
+}
+
+type awskms interface {
+	SignDigest(ctx context.Context, digest []byte, keyID string, signingAlgorithm string, creds aws.Credentials, signatureVersion string) (string, error)
+}
+
+func newKMSSignPlugin(ap *awsSigningAuthPlugin) *awsKMSSignPlugin {
+	return &awsKMSSignPlugin{
+		awsAuthPlugin: ap,
+		kms:           aws.NewKMS(ap.logger),
+		logger:        ap.logger,
+	}
+}
+
+func (ap *awsKMSSignPlugin) SignDigest(ctx context.Context, digest []byte, keyID string, signingAlgorithm string) (string, error) {
+	creds, err := ap.awsAuthPlugin.awsCredentialService().credentials(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to get aws credentials: %w", err)
+	}
+
+	signature, err := ap.kms.SignDigest(ctx, digest, keyID, signingAlgorithm, creds, ap.awsAuthPlugin.AWSSignatureVersion)
+	if err != nil {
+		return "", fmt.Errorf("kms: failed to sign digest: %w", err)
+	}
+
+	return signature, nil
 }

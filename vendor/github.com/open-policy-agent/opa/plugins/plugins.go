@@ -8,18 +8,23 @@ package plugins
 import (
 	"context"
 	"fmt"
+	mr "math/rand"
 	"sync"
 	"time"
 
+	"github.com/open-policy-agent/opa/internal/report"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/otel/sdk/trace"
 
 	"github.com/gorilla/mux"
+
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/bundle"
 	"github.com/open-policy-agent/opa/config"
+	"github.com/open-policy-agent/opa/hooks"
 	bundleUtils "github.com/open-policy-agent/opa/internal/bundle"
 	cfg "github.com/open-policy-agent/opa/internal/config"
+	"github.com/open-policy-agent/opa/internal/errors"
 	initload "github.com/open-policy-agent/opa/internal/runtime/init"
 	"github.com/open-policy-agent/opa/keys"
 	"github.com/open-policy-agent/opa/loader"
@@ -29,6 +34,7 @@ import (
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/topdown/cache"
 	"github.com/open-policy-agent/opa/topdown/print"
+	"github.com/open-policy-agent/opa/tracing"
 )
 
 // Factory defines the interface OPA uses to instantiate your plugin.
@@ -144,6 +150,9 @@ const (
 	DefaultTriggerMode TriggerMode = "periodic"
 )
 
+// default interval between OPA report uploads
+var defaultUploadIntervalSec = int64(3600)
+
 // Status has a Plugin's current status plus an optional Message.
 type Status struct {
 	State   State  `json:"state"`
@@ -192,8 +201,15 @@ type Manager struct {
 	router                       *mux.Router
 	prometheusRegister           prometheus.Registerer
 	tracerProvider               *trace.TracerProvider
+	distributedTacingOpts        tracing.Options
 	registeredNDCacheTriggers    []func(bool)
+	registeredTelemetryGatherers map[string]report.Gatherer
 	bootstrapConfigLabels        map[string]string
+	hooks                        hooks.Hooks
+	enableTelemetry              bool
+	reporter                     *report.Reporter
+	opaReportNotifyCh            chan struct{}
+	stop                         chan chan struct{}
 }
 
 type managerContextKey string
@@ -365,6 +381,35 @@ func WithTracerProvider(tracerProvider *trace.TracerProvider) func(*Manager) {
 	}
 }
 
+// WithDistributedTracingOpts sets the options to be used by distributed tracing.
+func WithDistributedTracingOpts(tr tracing.Options) func(*Manager) {
+	return func(m *Manager) {
+		m.distributedTacingOpts = tr
+	}
+}
+
+// WithHooks allows passing hooks to the plugin manager.
+func WithHooks(hs hooks.Hooks) func(*Manager) {
+	return func(m *Manager) {
+		m.hooks = hs
+	}
+}
+
+// WithEnableTelemetry controls whether OPA will send telemetry reports to an external service.
+func WithEnableTelemetry(enableTelemetry bool) func(*Manager) {
+	return func(m *Manager) {
+		m.enableTelemetry = enableTelemetry
+	}
+}
+
+// WithTelemetryGatherers allows registration of telemetry gatherers which enable injection of additional data in the
+// telemetry report
+func WithTelemetryGatherers(gs map[string]report.Gatherer) func(*Manager) {
+	return func(m *Manager) {
+		m.registeredTelemetryGatherers = gs
+	}
+}
+
 // New creates a new Manager using config.
 func New(raw []byte, id string, store storage.Store, opts ...func(*Manager)) (*Manager, error) {
 
@@ -373,27 +418,15 @@ func New(raw []byte, id string, store storage.Store, opts ...func(*Manager)) (*M
 		return nil, err
 	}
 
-	keys, err := keys.ParseKeysConfig(parsedConfig.Keys)
-	if err != nil {
-		return nil, err
-	}
-
-	interQueryBuiltinCacheConfig, err := cache.ParseCachingConfig(parsedConfig.Caching)
-	if err != nil {
-		return nil, err
-	}
-
 	m := &Manager{
-		Store:                        store,
-		Config:                       parsedConfig,
-		ID:                           id,
-		keys:                         keys,
-		pluginStatus:                 map[string]*Status{},
-		pluginStatusListeners:        map[string]StatusListener{},
-		maxErrors:                    -1,
-		interQueryBuiltinCacheConfig: interQueryBuiltinCacheConfig,
-		serverInitialized:            make(chan struct{}),
-		bootstrapConfigLabels:        parsedConfig.Labels,
+		Store:                 store,
+		Config:                parsedConfig,
+		ID:                    id,
+		pluginStatus:          map[string]*Status{},
+		pluginStatusListeners: map[string]StatusListener{},
+		maxErrors:             -1,
+		serverInitialized:     make(chan struct{}),
+		bootstrapConfigLabels: parsedConfig.Labels,
 	}
 
 	for _, f := range opts {
@@ -408,19 +441,63 @@ func New(raw []byte, id string, store storage.Store, opts ...func(*Manager)) (*M
 		m.consoleLogger = logging.New()
 	}
 
-	serviceOpts := cfg.ServiceOptions{
-		Raw:        parsedConfig.Services,
-		AuthPlugin: m.AuthPlugin,
-		Keys:       keys,
-		Logger:     m.logger,
-	}
-
-	services, err := cfg.ParseServicesConfig(serviceOpts)
+	m.hooks.Each(func(h hooks.Hook) {
+		if f, ok := h.(hooks.ConfigHook); ok {
+			if c, e := f.OnConfig(context.Background(), parsedConfig); e != nil {
+				err = errors.Join(err, e)
+			} else {
+				parsedConfig = c
+			}
+		}
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	m.services = services
+	// do after options and overrides
+	m.keys, err = keys.ParseKeysConfig(parsedConfig.Keys)
+	if err != nil {
+		return nil, err
+	}
+
+	m.interQueryBuiltinCacheConfig, err = cache.ParseCachingConfig(parsedConfig.Caching)
+	if err != nil {
+		return nil, err
+	}
+
+	serviceOpts := cfg.ServiceOptions{
+		Raw:                   parsedConfig.Services,
+		AuthPlugin:            m.AuthPlugin,
+		Keys:                  m.keys,
+		Logger:                m.logger,
+		DistributedTacingOpts: m.distributedTacingOpts,
+	}
+
+	m.services, err = cfg.ParseServicesConfig(serviceOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	if m.enableTelemetry {
+		reporter, err := report.New(id, report.Options{Logger: m.logger})
+		if err != nil {
+			return nil, err
+		}
+		m.reporter = reporter
+
+		m.reporter.RegisterGatherer("min_compatible_version", func(_ context.Context) (any, error) {
+			var minimumCompatibleVersion string
+			if m.compiler != nil && m.compiler.Required != nil {
+				minimumCompatibleVersion, _ = m.compiler.Required.MinimumCompatibleVersion()
+			}
+			return minimumCompatibleVersion, nil
+		})
+
+		// register any additional gatherers
+		for k, g := range m.registeredTelemetryGatherers {
+			m.reporter.RegisterGatherer(k, g)
+		}
+	}
 
 	return m, nil
 }
@@ -436,6 +513,12 @@ func (m *Manager) Init(ctx context.Context) error {
 	params := storage.TransactionParams{
 		Write:   true,
 		Context: storage.NewContext(),
+	}
+
+	if m.enableTelemetry {
+		m.opaReportNotifyCh = make(chan struct{})
+		m.stop = make(chan chan struct{})
+		go m.sendOPAUpdateLoop(ctx)
 	}
 
 	err := storage.Txn(ctx, m.Store, params, func(txn storage.Transaction) error {
@@ -466,6 +549,12 @@ func (m *Manager) Init(ctx context.Context) error {
 	})
 
 	if err != nil {
+		if m.stop != nil {
+			done := make(chan struct{})
+			m.stop <- done
+			<-done
+		}
+
 		return err
 	}
 
@@ -642,14 +731,21 @@ func (m *Manager) Stop(ctx context.Context) {
 			m.logger.Error("Error closing store: %v", err)
 		}
 	}
+
+	if m.stop != nil {
+		done := make(chan struct{})
+		m.stop <- done
+		<-done
+	}
 }
 
 // Reconfigure updates the configuration on the manager.
 func (m *Manager) Reconfigure(config *config.Config) error {
 	opts := cfg.ServiceOptions{
-		Raw:        config.Services,
-		AuthPlugin: m.AuthPlugin,
-		Logger:     m.logger,
+		Raw:                   config.Services,
+		AuthPlugin:            m.AuthPlugin,
+		Logger:                m.logger,
+		DistributedTacingOpts: m.distributedTacingOpts,
 	}
 
 	keys, err := keys.ParseKeysConfig(config.Keys)
@@ -678,6 +774,11 @@ func (m *Manager) Reconfigure(config *config.Config) error {
 		for label, value := range m.bootstrapConfigLabels {
 			config.Labels[label] = value
 		}
+	}
+
+	// don't erase persistence directory
+	if config.PersistenceDirectory == nil {
+		config.PersistenceDirectory = m.Config.PersistenceDirectory
 	}
 
 	m.Config = config
@@ -780,6 +881,11 @@ func (m *Manager) onCommit(ctx context.Context, txn storage.Transaction, event s
 
 	if compiler != nil {
 		m.setCompiler(compiler)
+
+		if m.enableTelemetry && event.PolicyChanged() {
+			m.opaReportNotifyCh <- struct{}{}
+		}
+
 		for _, f := range m.registeredTriggers {
 			f(txn)
 		}
@@ -944,4 +1050,38 @@ func (m *Manager) RegisterNDCacheTrigger(trigger func(bool)) {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 	m.registeredNDCacheTriggers = append(m.registeredNDCacheTriggers, trigger)
+}
+
+func (m *Manager) sendOPAUpdateLoop(ctx context.Context) {
+	ticker := time.NewTicker(time.Duration(int64(time.Second) * defaultUploadIntervalSec))
+	mr.New(mr.NewSource(time.Now().UnixNano()))
+
+	ctx, cancel := context.WithCancel(ctx)
+
+	var opaReportNotify bool
+
+	for {
+		select {
+		case <-m.opaReportNotifyCh:
+			opaReportNotify = true
+		case <-ticker.C:
+			ticker.Stop()
+
+			if opaReportNotify {
+				opaReportNotify = false
+				_, err := m.reporter.SendReport(ctx)
+				if err != nil {
+					m.logger.WithFields(map[string]interface{}{"err": err}).Debug("Unable to send OPA telemetry report.")
+				}
+			}
+
+			newInterval := mr.Int63n(defaultUploadIntervalSec) + defaultUploadIntervalSec
+			ticker = time.NewTicker(time.Duration(int64(time.Second) * newInterval))
+		case done := <-m.stop:
+			cancel()
+			ticker.Stop()
+			done <- struct{}{}
+			return
+		}
+	}
 }

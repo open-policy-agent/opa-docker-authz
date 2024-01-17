@@ -118,13 +118,15 @@ type Server struct {
 	authentication         AuthenticationScheme
 	authorization          AuthorizationScheme
 	cert                   *tls.Certificate
-	certMtx                sync.RWMutex
+	tlsConfigMtx           sync.RWMutex
 	certFile               string
 	certFileHash           []byte
 	certKeyFile            string
 	certKeyFileHash        []byte
 	certRefresh            time.Duration
 	certPool               *x509.CertPool
+	certPoolFile           string
+	certPoolFileHash       []byte
 	minTLSVersion          uint16
 	mtx                    sync.RWMutex
 	partials               map[string]rego.PartialResult
@@ -143,6 +145,7 @@ type Server struct {
 	allPluginsOkOnce       bool
 	distributedTracingOpts tracing.Options
 	ndbCacheEnabled        bool
+	unixSocketPerm         *string
 }
 
 // Metrics defines the interface that the server requires for recording HTTP
@@ -150,6 +153,23 @@ type Server struct {
 type Metrics interface {
 	RegisterEndpoints(registrar func(path, method string, handler http.Handler))
 	InstrumentHandler(handler http.Handler, label string) http.Handler
+}
+
+// TLSConfig represents the TLS configuration for the server.
+// This configuration is used to configure file watchers to reload each file as it
+// changes on disk.
+type TLSConfig struct {
+	// CertFile is the path to the server's serving certificate file.
+	CertFile string
+
+	// KeyFile is the path to the server's key file, completing the key pair for the
+	// CertFile certificate.
+	KeyFile string
+
+	// CertPoolFile is the path to the CA cert pool file. The contents of this file will be
+	// reloaded when the file changes on disk and used in as trusted client CAs in the TLS config
+	// for new connections to the server.
+	CertPoolFile string
 }
 
 // Loop will contain all the calls from the server that we'll be listening on.
@@ -273,6 +293,20 @@ func (s *Server) WithCertPool(pool *x509.CertPool) *Server {
 	return s
 }
 
+// WithTLSConfig sets the TLS configuration used by the server.
+func (s *Server) WithTLSConfig(tlsConfig *TLSConfig) *Server {
+	s.certFile = tlsConfig.CertFile
+	s.certKeyFile = tlsConfig.KeyFile
+	s.certPoolFile = tlsConfig.CertPoolFile
+	return s
+}
+
+// WithCertRefresh sets the period on which certs, keys and cert pools are reloaded from disk.
+func (s *Server) WithCertRefresh(refresh time.Duration) *Server {
+	s.certRefresh = refresh
+	return s
+}
+
 // WithStore sets the storage used by the server.
 func (s *Server) WithStore(store storage.Store) *Server {
 	s.store = store
@@ -363,6 +397,13 @@ func (s *Server) WithDistributedTracingOpts(opts tracing.Options) *Server {
 // WithNDBCacheEnabled sets whether the ND builtins cache is to be used.
 func (s *Server) WithNDBCacheEnabled(ndbCacheEnabled bool) *Server {
 	s.ndbCacheEnabled = ndbCacheEnabled
+	return s
+}
+
+// WithUnixSocketPermission sets the permission for the Unix domain socket if used to listen for
+// incoming connections. Applies to the sockets the server is listening on including diagnostic API's.
+func (s *Server) WithUnixSocketPermission(unixSocketPerm *string) *Server {
+	s.unixSocketPerm = unixSocketPerm
 	return s
 }
 
@@ -558,11 +599,13 @@ func (s *Server) getListener(addr string, h http.Handler, t httpListenerType) ([
 			"cert-file":     s.certFile,
 			"cert-key-file": s.certKeyFile,
 		})
+
+		// if a manual cert refresh period has been set, then use the polling behavior,
+		// otherwise use the fsnotify default behavior
 		if s.certRefresh > 0 {
-			certLoop := s.certLoop(logger)
-			loops = []Loop{loop, certLoop}
-		} else {
-			loops = []Loop{loop}
+			loops = []Loop{loop, s.certLoopPolling(logger)}
+		} else if s.certFile != "" || s.certPoolFile != "" {
+			loops = []Loop{loop, s.certLoopNotify(logger)}
 		}
 	default:
 		err = fmt.Errorf("invalid url scheme %q", parsedURL.Scheme)
@@ -597,17 +640,31 @@ func (s *Server) getListenerForHTTPSServer(u *url.URL, h http.Handler, t httpLis
 		Handler: h,
 		TLSConfig: &tls.Config{
 			GetCertificate: s.getCertificate,
-			ClientCAs:      s.certPool,
-		},
-	}
-	if s.authentication == AuthenticationTLS {
-		httpsServer.TLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
-	}
+			// GetConfigForClient is used to ensure that a fresh config is provided containing the latest cert pool.
+			// This is not required, but appears to be how connect time updates config should be done:
+			// https://github.com/golang/go/issues/16066#issuecomment-250606132
+			GetConfigForClient: func(info *tls.ClientHelloInfo) (*tls.Config, error) {
+				s.tlsConfigMtx.Lock()
+				defer s.tlsConfigMtx.Unlock()
 
-	if s.minTLSVersion != 0 {
-		httpsServer.TLSConfig.MinVersion = s.minTLSVersion
-	} else {
-		httpsServer.TLSConfig.MinVersion = defaultMinTLSVersion
+				cfg := &tls.Config{
+					GetCertificate: s.getCertificate,
+					ClientCAs:      s.certPool,
+				}
+
+				if s.authentication == AuthenticationTLS {
+					cfg.ClientAuth = tls.RequireAndVerifyClientCert
+				}
+
+				if s.minTLSVersion != 0 {
+					cfg.MinVersion = s.minTLSVersion
+				} else {
+					cfg.MinVersion = defaultMinTLSVersion
+				}
+
+				return cfg, nil
+			},
+		},
 	}
 
 	l := newHTTPListener(&httpsServer, t)
@@ -632,6 +689,17 @@ func (s *Server) getListenerForUNIXSocket(u *url.URL, h http.Handler, t httpList
 	unixListener, err := net.Listen("unix", socketPath)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	if s.unixSocketPerm != nil {
+		modeVal, err := strconv.ParseUint(*s.unixSocketPerm, 8, 32)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if err := os.Chmod(socketPath, os.FileMode(modeVal)); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	l := newHTTPUnixSocketListener(&domainSocketServer, unixListener, t)
@@ -737,26 +805,26 @@ func (s *Server) initRouters() {
 	}
 
 	// Only the main mainRouter gets the OPA API's (data, policies, query, etc)
-	s.registerHandler(mainRouter, 0, "/data/{path:.+}", http.MethodPost, s.instrumentHandler(s.v0DataPost, PromHandlerV0Data))
-	s.registerHandler(mainRouter, 0, "/data", http.MethodPost, s.instrumentHandler(s.v0DataPost, PromHandlerV0Data))
-	s.registerHandler(mainRouter, 1, "/data/{path:.+}", http.MethodDelete, s.instrumentHandler(s.v1DataDelete, PromHandlerV1Data))
-	s.registerHandler(mainRouter, 1, "/data/{path:.+}", http.MethodPut, s.instrumentHandler(s.v1DataPut, PromHandlerV1Data))
-	s.registerHandler(mainRouter, 1, "/data", http.MethodPut, s.instrumentHandler(s.v1DataPut, PromHandlerV1Data))
-	s.registerHandler(mainRouter, 1, "/data/{path:.+}", http.MethodGet, s.instrumentHandler(s.v1DataGet, PromHandlerV1Data))
-	s.registerHandler(mainRouter, 1, "/data", http.MethodGet, s.instrumentHandler(s.v1DataGet, PromHandlerV1Data))
-	s.registerHandler(mainRouter, 1, "/data/{path:.+}", http.MethodPatch, s.instrumentHandler(s.v1DataPatch, PromHandlerV1Data))
-	s.registerHandler(mainRouter, 1, "/data", http.MethodPatch, s.instrumentHandler(s.v1DataPatch, PromHandlerV1Data))
-	s.registerHandler(mainRouter, 1, "/data/{path:.+}", http.MethodPost, s.instrumentHandler(s.v1DataPost, PromHandlerV1Data))
-	s.registerHandler(mainRouter, 1, "/data", http.MethodPost, s.instrumentHandler(s.v1DataPost, PromHandlerV1Data))
-	s.registerHandler(mainRouter, 1, "/policies", http.MethodGet, s.instrumentHandler(s.v1PoliciesList, PromHandlerV1Policies))
-	s.registerHandler(mainRouter, 1, "/policies/{path:.+}", http.MethodDelete, s.instrumentHandler(s.v1PoliciesDelete, PromHandlerV1Policies))
-	s.registerHandler(mainRouter, 1, "/policies/{path:.+}", http.MethodGet, s.instrumentHandler(s.v1PoliciesGet, PromHandlerV1Policies))
-	s.registerHandler(mainRouter, 1, "/policies/{path:.+}", http.MethodPut, s.instrumentHandler(s.v1PoliciesPut, PromHandlerV1Policies))
-	s.registerHandler(mainRouter, 1, "/query", http.MethodGet, s.instrumentHandler(s.v1QueryGet, PromHandlerV1Query))
-	s.registerHandler(mainRouter, 1, "/query", http.MethodPost, s.instrumentHandler(s.v1QueryPost, PromHandlerV1Query))
-	s.registerHandler(mainRouter, 1, "/compile", http.MethodPost, s.instrumentHandler(s.v1CompilePost, PromHandlerV1Compile))
-	s.registerHandler(mainRouter, 1, "/config", http.MethodGet, s.instrumentHandler(s.v1ConfigGet, PromHandlerV1Config))
-	s.registerHandler(mainRouter, 1, "/status", http.MethodGet, s.instrumentHandler(s.v1StatusGet, PromHandlerV1Status))
+	mainRouter.Handle("/v0/data/{path:.+}", s.instrumentHandler(s.v0DataPost, PromHandlerV0Data)).Methods(http.MethodPost)
+	mainRouter.Handle("/v0/data", s.instrumentHandler(s.v0DataPost, PromHandlerV0Data)).Methods(http.MethodPost)
+	mainRouter.Handle("/v1/data/{path:.+}", s.instrumentHandler(s.v1DataDelete, PromHandlerV1Data)).Methods(http.MethodDelete)
+	mainRouter.Handle("/v1/data/{path:.+}", s.instrumentHandler(s.v1DataPut, PromHandlerV1Data)).Methods(http.MethodPut)
+	mainRouter.Handle("/v1/data", s.instrumentHandler(s.v1DataPut, PromHandlerV1Data)).Methods(http.MethodPut)
+	mainRouter.Handle("/v1/data/{path:.+}", s.instrumentHandler(s.v1DataGet, PromHandlerV1Data)).Methods(http.MethodGet)
+	mainRouter.Handle("/v1/data", s.instrumentHandler(s.v1DataGet, PromHandlerV1Data)).Methods(http.MethodGet)
+	mainRouter.Handle("/v1/data/{path:.+}", s.instrumentHandler(s.v1DataPatch, PromHandlerV1Data)).Methods(http.MethodPatch)
+	mainRouter.Handle("/v1/data", s.instrumentHandler(s.v1DataPatch, PromHandlerV1Data)).Methods(http.MethodPatch)
+	mainRouter.Handle("/v1/data/{path:.+}", s.instrumentHandler(s.v1DataPost, PromHandlerV1Data)).Methods(http.MethodPost)
+	mainRouter.Handle("/v1/data", s.instrumentHandler(s.v1DataPost, PromHandlerV1Data)).Methods(http.MethodPost)
+	mainRouter.Handle("/v1/policies", s.instrumentHandler(s.v1PoliciesList, PromHandlerV1Policies)).Methods(http.MethodGet)
+	mainRouter.Handle("/v1/policies/{path:.+}", s.instrumentHandler(s.v1PoliciesDelete, PromHandlerV1Policies)).Methods(http.MethodDelete)
+	mainRouter.Handle("/v1/policies/{path:.+}", s.instrumentHandler(s.v1PoliciesGet, PromHandlerV1Policies)).Methods(http.MethodGet)
+	mainRouter.Handle("/v1/policies/{path:.+}", s.instrumentHandler(s.v1PoliciesPut, PromHandlerV1Policies)).Methods(http.MethodPut)
+	mainRouter.Handle("/v1/query", s.instrumentHandler(s.v1QueryGet, PromHandlerV1Query)).Methods(http.MethodGet)
+	mainRouter.Handle("/v1/query", s.instrumentHandler(s.v1QueryPost, PromHandlerV1Query)).Methods(http.MethodPost)
+	mainRouter.Handle("/v1/compile", s.instrumentHandler(s.v1CompilePost, PromHandlerV1Compile)).Methods(http.MethodPost)
+	mainRouter.Handle("/v1/config", s.instrumentHandler(s.v1ConfigGet, PromHandlerV1Config)).Methods(http.MethodGet)
+	mainRouter.Handle("/v1/status", s.instrumentHandler(s.v1StatusGet, PromHandlerV1Status)).Methods(http.MethodGet)
 	mainRouter.Handle("/", s.instrumentHandler(s.unversionedPost, PromHandlerIndex)).Methods(http.MethodPost)
 	mainRouter.Handle("/", s.instrumentHandler(s.indexGet, PromHandlerIndex)).Methods(http.MethodGet)
 
@@ -803,8 +871,8 @@ func (s *Server) instrumentHandler(handler func(http.ResponseWriter, *http.Reque
 	return httpHandler
 }
 
-func (s *Server) execQuery(ctx context.Context, r *http.Request, br bundleRevisions, txn storage.Transaction, parsedQuery ast.Body, input ast.Value, m metrics.Metrics, explainMode types.ExplainModeV1, includeMetrics, includeInstrumentation, pretty bool) (results types.QueryResponseV1, err error) {
-
+func (s *Server) execQuery(ctx context.Context, br bundleRevisions, txn storage.Transaction, parsedQuery ast.Body, input ast.Value, m metrics.Metrics, explainMode types.ExplainModeV1, includeMetrics, includeInstrumentation, pretty bool) (*types.QueryResponseV1, error) {
+	results := types.QueryResponseV1{}
 	logger := s.getDecisionLogger(br)
 
 	var buf *topdown.BufferTracer
@@ -816,7 +884,7 @@ func (s *Server) execQuery(ctx context.Context, r *http.Request, br bundleRevisi
 	if input != nil {
 		x, err := ast.JSON(input)
 		if err != nil {
-			return results, err
+			return nil, err
 		}
 		rawInput = &x
 	}
@@ -855,7 +923,7 @@ func (s *Server) execQuery(ctx context.Context, r *http.Request, br bundleRevisi
 	output, err := rego.Eval(ctx)
 	if err != nil {
 		_ = logger.Log(ctx, txn, "", parsedQuery.String(), rawInput, input, nil, ndbCache, err, m)
-		return results, err
+		return nil, err
 	}
 
 	for _, result := range output {
@@ -871,11 +939,13 @@ func (s *Server) execQuery(ctx context.Context, r *http.Request, br bundleRevisi
 	}
 
 	var x interface{} = results.Result
-	err = logger.Log(ctx, txn, "", parsedQuery.String(), rawInput, input, &x, ndbCache, nil, m)
-	return results, err
+	if err := logger.Log(ctx, txn, "", parsedQuery.String(), rawInput, input, &x, ndbCache, nil, m); err != nil {
+		return nil, err
+	}
+	return &results, nil
 }
 
-func (s *Server) indexGet(w http.ResponseWriter, r *http.Request) {
+func (s *Server) indexGet(w http.ResponseWriter, _ *http.Request) {
 	_ = indexHTML.Execute(w, struct {
 		Version        string
 		BuildCommit    string
@@ -887,11 +957,6 @@ func (s *Server) indexGet(w http.ResponseWriter, r *http.Request) {
 		BuildTimestamp: version.Timestamp,
 		BuildHostname:  version.Hostname,
 	})
-}
-
-func (s *Server) registerHandler(router *mux.Router, version int, path string, method string, h http.Handler) {
-	prefix := fmt.Sprintf("/v%d", version)
-	router.Handle(prefix+path, h).Methods(method)
 }
 
 type bundleRevisions struct {
@@ -1017,8 +1082,7 @@ func (s *Server) v0QueryPath(w http.ResponseWriter, r *http.Request, urlPath str
 			}
 		}
 
-		partial, strictBuiltinErrors, instrument := false, false, false
-		rego, err := s.makeRego(ctx, partial, strictBuiltinErrors, txn, input, urlPath, m, instrument, nil, opts)
+		rego, err := s.makeRego(ctx, false, txn, input, urlPath, m, false, nil, opts)
 		if err != nil {
 			_ = logger.Log(ctx, txn, urlPath, "", goInput, input, nil, ndbCache, err, m)
 			writer.ErrorAuto(w, err)
@@ -1065,8 +1129,8 @@ func (s *Server) v0QueryPath(w http.ResponseWriter, r *http.Request, urlPath str
 			messageType = types.MsgFoundUndefinedError
 		}
 		err := types.NewErrorV1(types.CodeUndefinedDocument, fmt.Sprintf("%v: %v", messageType, ref))
-		if logErr := logger.Log(ctx, txn, urlPath, "", goInput, input, nil, ndbCache, err, m); logErr != nil {
-			writer.ErrorAuto(w, logErr)
+		if err := logger.Log(ctx, txn, urlPath, "", goInput, input, nil, ndbCache, err, m); err != nil {
+			writer.ErrorAuto(w, err)
 			return
 		}
 
@@ -1079,8 +1143,7 @@ func (s *Server) v0QueryPath(w http.ResponseWriter, r *http.Request, urlPath str
 		return
 	}
 
-	pretty := getBoolParam(r.URL, types.ParamPrettyV1, true)
-	writer.JSON(w, http.StatusOK, rs[0].Expressions[0].Value, pretty)
+	writer.JSONOK(w, rs[0].Expressions[0].Value, pretty(r))
 }
 
 func (s *Server) getCachedPreparedEvalQuery(key string, m metrics.Metrics) (*rego.PreparedEvalQuery, bool) {
@@ -1242,7 +1305,6 @@ func (s *Server) unversionedGetHealthWithPolicy(w http.ResponseWriter, r *http.R
 	)
 
 	rs, err := rego.Eval(r.Context())
-
 	if err != nil {
 		writeHealthResponse(w, err)
 		return
@@ -1254,7 +1316,6 @@ func (s *Server) unversionedGetHealthWithPolicy(w http.ResponseWriter, r *http.R
 	}
 
 	result, ok := rs[0].Expressions[0].Value.(bool)
-
 	if ok && result {
 		writeHealthResponse(w, nil)
 		return
@@ -1264,22 +1325,17 @@ func (s *Server) unversionedGetHealthWithPolicy(w http.ResponseWriter, r *http.R
 }
 
 func writeHealthResponse(w http.ResponseWriter, err error) {
-	status := http.StatusOK
-	var response types.HealthResponseV1
-
 	if err != nil {
-		status = http.StatusInternalServerError
-		response.Error = err.Error()
+		writer.JSON(w, http.StatusInternalServerError, types.HealthResponseV1{Error: err.Error()}, false)
+		return
 	}
 
-	writer.JSON(w, status, response, false)
+	writer.JSONOK(w, types.HealthResponseV1{}, false)
 }
 
 func (s *Server) v1CompilePost(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	pretty := getBoolParam(r.URL, types.ParamPrettyV1, true)
 	explainMode := getExplain(r.URL.Query()[types.ParamExplainV1], types.ExplainOffV1)
-	includeMetrics := getBoolParam(r.URL, types.ParamMetricsV1, true)
 	includeInstrumentation := getBoolParam(r.URL, types.ParamInstrumentV1, true)
 
 	m := metrics.New()
@@ -1289,8 +1345,7 @@ func (s *Server) v1CompilePost(w http.ResponseWriter, r *http.Request) {
 	// decompress the input if sent as zip
 	body, err := readPlainBody(r)
 	if err != nil {
-		reqErr := types.NewErrorV1(types.CodeInvalidParameter, "could not decompress the body")
-		writer.Error(w, http.StatusBadRequest, reqErr)
+		writer.Error(w, http.StatusBadRequest, types.NewErrorV1(types.CodeInvalidParameter, "could not decompress the body"))
 		return
 	}
 
@@ -1348,12 +1403,12 @@ func (s *Server) v1CompilePost(w http.ResponseWriter, r *http.Request) {
 
 	result := types.CompileResponseV1{}
 
-	if includeMetrics || includeInstrumentation {
+	if includeMetrics(r) || includeInstrumentation {
 		result.Metrics = m.All()
 	}
 
 	if explainMode != types.ExplainOffV1 {
-		result.Explanation = s.getExplainResponse(explainMode, *buf, pretty)
+		result.Explanation = s.getExplainResponse(explainMode, *buf, pretty(r))
 	}
 
 	var i interface{} = types.PartialEvaluationResultV1{
@@ -1363,7 +1418,7 @@ func (s *Server) v1CompilePost(w http.ResponseWriter, r *http.Request) {
 
 	result.Result = &i
 
-	writer.JSON(w, http.StatusOK, result, pretty)
+	writer.JSONOK(w, result, pretty(r))
 }
 
 func (s *Server) v1DataGet(w http.ResponseWriter, r *http.Request) {
@@ -1377,9 +1432,7 @@ func (s *Server) v1DataGet(w http.ResponseWriter, r *http.Request) {
 
 	vars := mux.Vars(r)
 	urlPath := vars["path"]
-	pretty := getBoolParam(r.URL, types.ParamPrettyV1, true)
 	explainMode := getExplain(r.URL.Query()["explain"], types.ExplainOffV1)
-	includeMetrics := getBoolParam(r.URL, types.ParamMetricsV1, true)
 	includeInstrumentation := getBoolParam(r.URL, types.ParamInstrumentV1, true)
 	provenance := getBoolParam(r.URL, types.ParamProvenanceV1, true)
 	strictBuiltinErrors := getBoolParam(r.URL, types.ParamStrictBuiltinErrors, true)
@@ -1457,8 +1510,7 @@ func (s *Server) v1DataGet(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		partial := false
-		rego, err := s.makeRego(ctx, partial, strictBuiltinErrors, txn, input, urlPath, m, includeInstrumentation, buf, opts)
+		rego, err := s.makeRego(ctx, strictBuiltinErrors, txn, input, urlPath, m, includeInstrumentation, buf, opts)
 		if err != nil {
 			_ = logger.Log(ctx, txn, urlPath, "", goInput, input, nil, ndbCache, err, m)
 			writer.ErrorAuto(w, err)
@@ -1503,7 +1555,7 @@ func (s *Server) v1DataGet(w http.ResponseWriter, r *http.Request) {
 		DecisionID: decisionID,
 	}
 
-	if includeMetrics || includeInstrumentation {
+	if includeMetrics(r) || includeInstrumentation {
 		result.Metrics = m.All()
 	}
 
@@ -1513,34 +1565,32 @@ func (s *Server) v1DataGet(w http.ResponseWriter, r *http.Request) {
 
 	if len(rs) == 0 {
 		if explainMode == types.ExplainFullV1 {
-			result.Explanation, err = types.NewTraceV1(lineage.Full(*buf), pretty)
+			result.Explanation, err = types.NewTraceV1(lineage.Full(*buf), pretty(r))
 			if err != nil {
 				writer.ErrorAuto(w, err)
 				return
 			}
 		}
 
-		err = logger.Log(ctx, txn, urlPath, "", goInput, input, nil, ndbCache, nil, m)
-		if err != nil {
+		if err := logger.Log(ctx, txn, urlPath, "", goInput, input, nil, ndbCache, nil, m); err != nil {
 			writer.ErrorAuto(w, err)
 			return
 		}
-		writer.JSON(w, http.StatusOK, result, pretty)
+		writer.JSONOK(w, result, pretty(r))
 		return
 	}
 
 	result.Result = &rs[0].Expressions[0].Value
 
 	if explainMode != types.ExplainOffV1 {
-		result.Explanation = s.getExplainResponse(explainMode, *buf, pretty)
+		result.Explanation = s.getExplainResponse(explainMode, *buf, pretty(r))
 	}
 
-	err = logger.Log(ctx, txn, urlPath, "", goInput, input, result.Result, ndbCache, nil, m)
-	if err != nil {
+	if err := logger.Log(ctx, txn, urlPath, "", goInput, input, result.Result, ndbCache, nil, m); err != nil {
 		writer.ErrorAuto(w, err)
 		return
 	}
-	writer.JSON(w, http.StatusOK, result, pretty)
+	writer.JSONOK(w, result, pretty(r))
 }
 
 func (s *Server) v1DataPatch(w http.ResponseWriter, r *http.Request) {
@@ -1550,8 +1600,7 @@ func (s *Server) v1DataPatch(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	vars := mux.Vars(r)
-	includeMetrics := getBoolParam(r.URL, types.ParamMetricsV1, true)
-	ops := []types.PatchV1{}
+	var ops []types.PatchV1
 
 	m.Timer(metrics.RegoInputParse).Start()
 	if err := util.NewJSONDecoder(r.Body).Decode(&ops); err != nil {
@@ -1597,15 +1646,15 @@ func (s *Server) v1DataPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if includeMetrics {
+	if includeMetrics(r) {
 		result := types.DataResponseV1{
 			Metrics: m.All(),
 		}
-		writer.JSON(w, http.StatusOK, result, false)
+		writer.JSONOK(w, result, false)
 		return
 	}
 
-	writer.Bytes(w, http.StatusNoContent, nil)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
@@ -1618,11 +1667,8 @@ func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
 
 	vars := mux.Vars(r)
 	urlPath := vars["path"]
-	pretty := getBoolParam(r.URL, types.ParamPrettyV1, true)
 	explainMode := getExplain(r.URL.Query()[types.ParamExplainV1], types.ExplainOffV1)
-	includeMetrics := getBoolParam(r.URL, types.ParamMetricsV1, true)
 	includeInstrumentation := getBoolParam(r.URL, types.ParamInstrumentV1, true)
-	partial := getBoolParam(r.URL, types.ParamPartialV1, true)
 	provenance := getBoolParam(r.URL, types.ParamProvenanceV1, true)
 	strictBuiltinErrors := getBoolParam(r.URL, types.ParamStrictBuiltinErrors, true)
 
@@ -1674,9 +1720,6 @@ func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pqID := "v1DataPost::"
-	if partial {
-		pqID += "partial::"
-	}
 	if strictBuiltinErrors {
 		pqID += "strict-builtin-errors::"
 	}
@@ -1696,7 +1739,7 @@ func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		rego, err := s.makeRego(ctx, partial, strictBuiltinErrors, txn, input, urlPath, m, includeInstrumentation, buf, opts)
+		rego, err := s.makeRego(ctx, strictBuiltinErrors, txn, input, urlPath, m, includeInstrumentation, buf, opts)
 		if err != nil {
 			_ = logger.Log(ctx, txn, urlPath, "", goInput, input, nil, ndbCache, err, m)
 			writer.ErrorAuto(w, err)
@@ -1745,7 +1788,7 @@ func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
 		result.Warning = types.NewWarning(types.CodeAPIUsageWarn, types.MsgInputKeyMissing)
 	}
 
-	if includeMetrics || includeInstrumentation {
+	if includeMetrics(r) || includeInstrumentation {
 		result.Metrics = m.All()
 	}
 
@@ -1755,7 +1798,7 @@ func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
 
 	if len(rs) == 0 {
 		if explainMode == types.ExplainFullV1 {
-			result.Explanation, err = types.NewTraceV1(lineage.Full(*buf), pretty)
+			result.Explanation, err = types.NewTraceV1(lineage.Full(*buf), pretty(r))
 			if err != nil {
 				writer.ErrorAuto(w, err)
 				return
@@ -1766,22 +1809,21 @@ func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
 			writer.ErrorAuto(w, err)
 			return
 		}
-		writer.JSON(w, http.StatusOK, result, pretty)
+		writer.JSONOK(w, result, pretty(r))
 		return
 	}
 
 	result.Result = &rs[0].Expressions[0].Value
 
 	if explainMode != types.ExplainOffV1 {
-		result.Explanation = s.getExplainResponse(explainMode, *buf, pretty)
+		result.Explanation = s.getExplainResponse(explainMode, *buf, pretty(r))
 	}
 
-	err = logger.Log(ctx, txn, urlPath, "", goInput, input, result.Result, ndbCache, nil, m)
-	if err != nil {
+	if err := logger.Log(ctx, txn, urlPath, "", goInput, input, result.Result, ndbCache, nil, m); err != nil {
 		writer.ErrorAuto(w, err)
 		return
 	}
-	writer.JSON(w, http.StatusOK, result, pretty)
+	writer.JSONOK(w, result, pretty(r))
 }
 
 func (s *Server) v1DataPut(w http.ResponseWriter, r *http.Request) {
@@ -1791,7 +1833,6 @@ func (s *Server) v1DataPut(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	vars := mux.Vars(r)
-	includeMetrics := getBoolParam(r.URL, types.ParamMetricsV1, true)
 
 	m.Timer(metrics.RegoInputParse).Start()
 	var value interface{}
@@ -1834,7 +1875,7 @@ func (s *Server) v1DataPut(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if r.Header.Get("If-None-Match") == "*" {
 		s.store.Abort(ctx, txn)
-		writer.Bytes(w, http.StatusNotModified, nil)
+		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 
@@ -1854,15 +1895,15 @@ func (s *Server) v1DataPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if includeMetrics {
+	if includeMetrics(r) {
 		result := types.DataResponseV1{
 			Metrics: m.All(),
 		}
-		writer.JSON(w, http.StatusOK, result, false)
+		writer.JSONOK(w, result, false)
 		return
 	}
 
-	writer.Bytes(w, http.StatusNoContent, nil)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) v1DataDelete(w http.ResponseWriter, r *http.Request) {
@@ -1872,7 +1913,6 @@ func (s *Server) v1DataDelete(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	vars := mux.Vars(r)
-	includeMetrics := getBoolParam(r.URL, types.ParamMetricsV1, true)
 
 	path, ok := storage.ParsePathEscaped("/" + strings.Trim(vars["path"], "/"))
 	if !ok {
@@ -1909,22 +1949,20 @@ func (s *Server) v1DataDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if includeMetrics {
+	if includeMetrics(r) {
 		result := types.DataResponseV1{
 			Metrics: m.All(),
 		}
-		writer.JSON(w, http.StatusOK, result, false)
+		writer.JSONOK(w, result, false)
 		return
 	}
 
-	writer.Bytes(w, http.StatusNoContent, nil)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) v1PoliciesDelete(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	vars := mux.Vars(r)
-	pretty := getBoolParam(r.URL, types.ParamPrettyV1, true)
-	includeMetrics := getBoolParam(r.URL, types.ParamMetricsV1, true)
 
 	id, err := url.PathUnescape(vars["path"])
 	if err != nil {
@@ -1947,7 +1985,6 @@ func (s *Server) v1PoliciesDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	modules, err := s.loadModules(ctx, txn)
-
 	if err != nil {
 		s.abortAuto(ctx, txn, w, err)
 		return
@@ -1978,12 +2015,12 @@ func (s *Server) v1PoliciesDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := types.PolicyDeleteResponseV1{}
-	if includeMetrics {
-		response.Metrics = m.All()
+	resp := types.PolicyDeleteResponseV1{}
+	if includeMetrics(r) {
+		resp.Metrics = m.All()
 	}
 
-	writer.JSON(w, http.StatusOK, response, pretty)
+	writer.JSONOK(w, resp, pretty(r))
 }
 
 func (s *Server) v1PoliciesGet(w http.ResponseWriter, r *http.Request) {
@@ -1995,8 +2032,6 @@ func (s *Server) v1PoliciesGet(w http.ResponseWriter, r *http.Request) {
 		writer.ErrorString(w, http.StatusBadRequest, types.CodeInvalidParameter, err)
 		return
 	}
-
-	pretty := getBoolParam(r.URL, types.ParamPrettyV1, true)
 
 	txn, err := s.store.NewTransaction(ctx)
 	if err != nil {
@@ -2014,7 +2049,7 @@ func (s *Server) v1PoliciesGet(w http.ResponseWriter, r *http.Request) {
 
 	c := s.getCompiler()
 
-	response := types.PolicyGetResponseV1{
+	resp := types.PolicyGetResponseV1{
 		Result: types.PolicyV1{
 			ID:  path,
 			Raw: string(bs),
@@ -2022,13 +2057,12 @@ func (s *Server) v1PoliciesGet(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	writer.JSON(w, http.StatusOK, response, pretty)
+	writer.JSONOK(w, resp, pretty(r))
 }
 
 func (s *Server) v1PoliciesList(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
-	pretty := getBoolParam(r.URL, types.ParamPrettyV1, true)
 
 	txn, err := s.store.NewTransaction(ctx)
 	if err != nil {
@@ -2062,11 +2096,7 @@ func (s *Server) v1PoliciesList(w http.ResponseWriter, r *http.Request) {
 		policies = append(policies, policy)
 	}
 
-	response := types.PolicyListResponseV1{
-		Result: policies,
-	}
-
-	writer.JSON(w, http.StatusOK, response, pretty)
+	writer.JSONOK(w, types.PolicyListResponseV1{Result: policies}, pretty(r))
 }
 
 func (s *Server) v1PoliciesPut(w http.ResponseWriter, r *http.Request) {
@@ -2079,8 +2109,7 @@ func (s *Server) v1PoliciesPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	includeMetrics := getBoolParam(r.URL, types.ParamMetricsV1, true)
-	pretty := getBoolParam(r.URL, types.ParamPrettyV1, true)
+	includeMetrics := includeMetrics(r)
 	m := metrics.New()
 
 	m.Timer("server_read_bytes").Start()
@@ -2113,11 +2142,11 @@ func (s *Server) v1PoliciesPut(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if bytes.Equal(buf, bs) {
 		s.store.Abort(ctx, txn)
-		response := types.PolicyPutResponseV1{}
+		resp := types.PolicyPutResponseV1{}
 		if includeMetrics {
-			response.Metrics = m.All()
+			resp.Metrics = m.All()
 		}
-		writer.JSON(w, http.StatusOK, response, pretty)
+		writer.JSONOK(w, resp, pretty(r))
 		return
 	}
 
@@ -2181,13 +2210,13 @@ func (s *Server) v1PoliciesPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := types.PolicyPutResponseV1{}
+	resp := types.PolicyPutResponseV1{}
 
 	if includeMetrics {
-		response.Metrics = m.All()
+		resp.Metrics = m.All()
 	}
 
-	writer.JSON(w, http.StatusOK, response, pretty)
+	writer.JSONOK(w, resp, pretty(r))
 }
 
 func (s *Server) v1QueryGet(w http.ResponseWriter, r *http.Request) {
@@ -2211,16 +2240,13 @@ func (s *Server) v1QueryGet(w http.ResponseWriter, r *http.Request) {
 		switch err := err.(type) {
 		case ast.Errors:
 			writer.Error(w, http.StatusBadRequest, types.NewErrorV1(types.CodeInvalidParameter, types.MsgParseQueryError).WithASTErrors(err))
-			return
 		default:
 			writer.ErrorAuto(w, err)
-			return
 		}
+		return
 	}
 
-	pretty := getBoolParam(r.URL, types.ParamPrettyV1, true)
 	explainMode := getExplain(r.URL.Query()["explain"], types.ExplainOffV1)
-	includeMetrics := getBoolParam(r.URL, types.ParamMetricsV1, true)
 	includeInstrumentation := getBoolParam(r.URL, types.ParamInstrumentV1, true)
 
 	params := storage.TransactionParams{Context: storage.NewContext().WithMetrics(m)}
@@ -2237,8 +2263,8 @@ func (s *Server) v1QueryGet(w http.ResponseWriter, r *http.Request) {
 		writer.ErrorAuto(w, err)
 		return
 	}
-
-	results, err := s.execQuery(ctx, r, br, txn, parsedQuery, nil, m, explainMode, includeMetrics, includeInstrumentation, pretty)
+	pretty := pretty(r)
+	results, err := s.execQuery(ctx, br, txn, parsedQuery, nil, m, explainMode, includeMetrics(r), includeInstrumentation, pretty)
 	if err != nil {
 		switch err := err.(type) {
 		case ast.Errors:
@@ -2249,7 +2275,7 @@ func (s *Server) v1QueryGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writer.JSON(w, http.StatusOK, results, pretty)
+	writer.JSONOK(w, results, pretty)
 }
 
 func (s *Server) v1QueryPost(w http.ResponseWriter, r *http.Request) {
@@ -2272,16 +2298,15 @@ func (s *Server) v1QueryPost(w http.ResponseWriter, r *http.Request) {
 		switch err := err.(type) {
 		case ast.Errors:
 			writer.Error(w, http.StatusBadRequest, types.NewErrorV1(types.CodeInvalidParameter, types.MsgParseQueryError).WithASTErrors(err))
-			return
 		default:
 			writer.ErrorAuto(w, err)
-			return
 		}
+		return
 	}
 
-	pretty := getBoolParam(r.URL, types.ParamPrettyV1, true)
+	pretty := pretty(r)
 	explainMode := getExplain(r.URL.Query()["explain"], types.ExplainOffV1)
-	includeMetrics := getBoolParam(r.URL, types.ParamMetricsV1, true)
+	includeMetrics := includeMetrics(r)
 	includeInstrumentation := getBoolParam(r.URL, types.ParamInstrumentV1, true)
 
 	var input ast.Value
@@ -2309,7 +2334,7 @@ func (s *Server) v1QueryPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results, err := s.execQuery(ctx, r, br, txn, parsedQuery, input, m, explainMode, includeMetrics, includeInstrumentation, pretty)
+	results, err := s.execQuery(ctx, br, txn, parsedQuery, input, m, explainMode, includeMetrics, includeInstrumentation, pretty)
 	if err != nil {
 		switch err := err.(type) {
 		case ast.Errors:
@@ -2326,26 +2351,19 @@ func (s *Server) v1QueryPost(w http.ResponseWriter, r *http.Request) {
 		results.Metrics = m.All()
 	}
 
-	writer.JSON(w, http.StatusOK, results, pretty)
+	writer.JSONOK(w, results, pretty)
 }
 
 func (s *Server) v1ConfigGet(w http.ResponseWriter, r *http.Request) {
-	pretty := getBoolParam(r.URL, types.ParamPrettyV1, true)
 	result, err := s.manager.Config.ActiveConfig()
 	if err != nil {
 		writer.ErrorAuto(w, err)
 		return
 	}
-
-	var resp types.ConfigResponseV1
-	resp.Result = &result
-
-	writer.JSON(w, http.StatusOK, resp, pretty)
+	writer.JSONOK(w, types.ConfigResponseV1{Result: &result}, pretty(r))
 }
 
 func (s *Server) v1StatusGet(w http.ResponseWriter, r *http.Request) {
-	pretty := getBoolParam(r.URL, types.ParamPrettyV1, true)
-
 	p := status.Lookup(s.manager)
 	if p == nil {
 		writer.ErrorString(w, http.StatusInternalServerError, types.CodeInternal, errors.New("status plugin not enabled"))
@@ -2353,10 +2371,7 @@ func (s *Server) v1StatusGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var st interface{} = p.Snapshot()
-	var resp types.StatusResponseV1
-	resp.Result = &st
-
-	writer.JSON(w, http.StatusOK, resp, pretty)
+	writer.JSONOK(w, types.StatusResponseV1{Result: &st}, pretty(r))
 }
 
 func (s *Server) checkPolicyIDScope(ctx context.Context, txn storage.Transaction, id string) error {
@@ -2514,7 +2529,6 @@ func (s *Server) getCompiler() *ast.Compiler {
 }
 
 func (s *Server) makeRego(ctx context.Context,
-	partial bool,
 	strictBuiltinErrors bool,
 	txn storage.Transaction,
 	input ast.Value,
@@ -2540,29 +2554,6 @@ func (s *Server) makeRego(ctx context.Context,
 		rego.PrintHook(s.manager.PrintHook()),
 		rego.DistributedTracingOpts(s.distributedTracingOpts),
 	)
-
-	if partial {
-		// pick a namespace for the query (path), doesn't really matter what it is
-		// as long as it is unique for each path.
-		namespace := fmt.Sprintf("partial[`%s`]", urlPath)
-		s.mtx.Lock()
-		defer s.mtx.Unlock()
-		pr, ok := s.partials[queryPath]
-		if !ok {
-			peopts := append(opts, rego.PartialNamespace(namespace))
-			r := rego.New(peopts...)
-			var err error
-			pr, err = r.PartialResult(ctx)
-			if err != nil {
-				if !rego.IsPartialEvaluationNotEffectiveErr(err) {
-					return nil, err
-				}
-				return rego.New(opts...), nil
-			}
-			s.partials[queryPath] = pr
-		}
-		return pr.Rego(opts...), nil
-	}
 
 	return rego.New(opts...), nil
 }
@@ -2676,8 +2667,7 @@ func (s *Server) updateNDCache(enabled bool) {
 
 func stringPathToDataRef(s string) (r ast.Ref) {
 	result := ast.Ref{ast.DefaultRootDocument}
-	result = append(result, stringPathToRef(s)...)
-	return result
+	return append(result, stringPathToRef(s)...)
 }
 
 func stringPathToRef(s string) (r ast.Ref) {
@@ -3066,4 +3056,12 @@ func readPlainBody(r *http.Request) (io.ReadCloser, error) {
 		return io.NopCloser(bytes.NewReader(bytesBody)), err
 	}
 	return r.Body, nil
+}
+
+func pretty(r *http.Request) bool {
+	return getBoolParam(r.URL, types.ParamPrettyV1, true)
+}
+
+func includeMetrics(r *http.Request) bool {
+	return getBoolParam(r.URL, types.ParamMetricsV1, true)
 }

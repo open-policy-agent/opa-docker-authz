@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/open-policy-agent/opa/ast"
+	astJSON "github.com/open-policy-agent/opa/ast/json"
 	"github.com/open-policy-agent/opa/format"
 	"github.com/open-policy-agent/opa/internal/file/archive"
 	"github.com/open-policy-agent/opa/internal/merge"
@@ -391,13 +392,15 @@ type Reader struct {
 	verificationConfig    *VerificationConfig
 	skipVerify            bool
 	processAnnotations    bool
-	jsonOptions           *ast.JSONOptions
+	jsonOptions           *astJSON.Options
 	capabilities          *ast.Capabilities
 	files                 map[string]FileInfo // files in the bundle signature payload
 	sizeLimitBytes        int64
 	etag                  string
 	lazyLoadingMode       bool
 	name                  string
+	persist               bool
+	regoVersion           ast.RegoVersion
 }
 
 // NewReader is deprecated. Use NewCustomReader instead.
@@ -462,7 +465,7 @@ func (r *Reader) WithCapabilities(caps *ast.Capabilities) *Reader {
 }
 
 // WithJSONOptions sets the JSONOptions to use when parsing policy files
-func (r *Reader) WithJSONOptions(opts *ast.JSONOptions) *Reader {
+func (r *Reader) WithJSONOptions(opts *astJSON.Options) *Reader {
 	r.jsonOptions = opts
 	return r
 }
@@ -495,11 +498,23 @@ func (r *Reader) WithLazyLoadingMode(yes bool) *Reader {
 	return r
 }
 
+// WithBundlePersistence specifies if the downloaded bundle will eventually be persisted to disk.
+func (r *Reader) WithBundlePersistence(persist bool) *Reader {
+	r.persist = persist
+	return r
+}
+
+func (r *Reader) WithRegoVersion(version ast.RegoVersion) *Reader {
+	r.regoVersion = version
+	return r
+}
+
 func (r *Reader) ParserOptions() ast.ParserOptions {
 	return ast.ParserOptions{
 		ProcessAnnotation: r.processAnnotations,
 		Capabilities:      r.capabilities,
 		JSONOptions:       r.jsonOptions,
+		RegoVersion:       r.regoVersion,
 	}
 }
 
@@ -603,7 +618,7 @@ func (r *Reader) Read() (Bundle, error) {
 			var value interface{}
 
 			r.metrics.Timer(metrics.RegoDataParse).Start()
-			err := util.NewJSONDecoder(&buf).Decode(&value)
+			err := util.UnmarshalJSON(buf.Bytes(), &value)
 			r.metrics.Timer(metrics.RegoDataParse).Stop()
 
 			if err != nil {
@@ -652,6 +667,10 @@ func (r *Reader) Read() (Bundle, error) {
 
 		if len(bundle.WasmModules) != 0 {
 			return bundle, fmt.Errorf("delta bundle expected to contain only patch file but wasm files found")
+		}
+
+		if r.persist {
+			return bundle, fmt.Errorf("'persist' property is true in config. persisting delta bundle to disk is not supported")
 		}
 	}
 
@@ -993,12 +1012,18 @@ func hashBundleFiles(hash SignatureHasher, b *Bundle) ([]FileInfo, error) {
 }
 
 // FormatModules formats Rego modules
+// Modules will be formatted to comply with rego-v1, but Rego compatibility of individual parsed modules will be respected (e.g. if 'rego.v1' is imported).
 func (b *Bundle) FormatModules(useModulePath bool) error {
+	return b.FormatModulesForRegoVersion(ast.RegoV0, true, useModulePath)
+}
+
+// FormatModulesForRegoVersion formats Rego modules to comply with a given Rego version
+func (b *Bundle) FormatModulesForRegoVersion(version ast.RegoVersion, preserveModuleRegoVersion bool, useModulePath bool) error {
 	var err error
 
 	for i, module := range b.Modules {
 		if module.Raw == nil {
-			module.Raw, err = format.Ast(module.Parsed)
+			module.Raw, err = format.AstWithOpts(module.Parsed, format.Opts{RegoVersion: version})
 			if err != nil {
 				return err
 			}
@@ -1008,7 +1033,14 @@ func (b *Bundle) FormatModules(useModulePath bool) error {
 				path = module.Path
 			}
 
-			module.Raw, err = format.Source(path, module.Raw)
+			opts := format.Opts{}
+			if preserveModuleRegoVersion {
+				opts.RegoVersion = module.Parsed.RegoVersion()
+			} else {
+				opts.RegoVersion = version
+			}
+
+			module.Raw, err = format.SourceWithOpts(path, module.Raw, opts)
 			if err != nil {
 				return err
 			}

@@ -33,7 +33,7 @@ github.com/bytecodealliance/wasmtime-go/v3/build/windows-x86_64
 # github.com/cespare/xxhash/v2 v2.2.0
 ## explicit; go 1.11
 github.com/cespare/xxhash/v2
-# github.com/containerd/containerd v1.7.9
+# github.com/containerd/containerd v1.7.12
 ## explicit; go 1.19
 github.com/containerd/containerd/archive/compression
 github.com/containerd/containerd/content
@@ -60,8 +60,8 @@ github.com/containerd/log
 # github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf
 ## explicit
 github.com/coreos/go-systemd/activation
-# github.com/docker/go-connections v0.4.1-0.20190612165340-fd1b1942c4d5
-## explicit
+# github.com/docker/go-connections v0.5.0
+## explicit; go 1.18
 github.com/docker/go-connections/sockets
 # github.com/docker/go-plugins-helpers v0.0.0-20211224144127-6eecb7beb651
 ## explicit
@@ -69,13 +69,16 @@ github.com/docker/go-plugins-helpers/authorization
 github.com/docker/go-plugins-helpers/sdk
 # github.com/dustin/go-humanize v1.0.1
 ## explicit; go 1.16
-# github.com/ghodss/yaml v1.0.1-0.20190212211648-25d852aebe32
-## explicit
-github.com/ghodss/yaml
+# github.com/felixge/httpsnoop v1.0.4
+## explicit; go 1.13
+github.com/felixge/httpsnoop
+# github.com/fsnotify/fsnotify v1.7.0
+## explicit; go 1.17
+github.com/fsnotify/fsnotify
 # github.com/go-ini/ini v1.67.0
 ## explicit
 github.com/go-ini/ini
-# github.com/go-logr/logr v1.3.0
+# github.com/go-logr/logr v1.4.1
 ## explicit; go 1.18
 github.com/go-logr/logr
 github.com/go-logr/logr/funcr
@@ -101,12 +104,15 @@ github.com/golang/protobuf/ptypes/duration
 github.com/golang/protobuf/ptypes/timestamp
 # github.com/google/flatbuffers v23.5.26+incompatible
 ## explicit
+# github.com/google/uuid v1.5.0
+## explicit
+github.com/google/uuid
 # github.com/gorilla/mux v1.8.1
 ## explicit; go 1.20
 github.com/gorilla/mux
 # github.com/grpc-ecosystem/grpc-gateway/v2 v2.18.1
 ## explicit; go 1.19
-# github.com/klauspost/compress v1.17.3
+# github.com/klauspost/compress v1.17.4
 ## explicit; go 1.19
 github.com/klauspost/compress
 github.com/klauspost/compress/fse
@@ -115,17 +121,15 @@ github.com/klauspost/compress/internal/cpuinfo
 github.com/klauspost/compress/internal/snapref
 github.com/klauspost/compress/zstd
 github.com/klauspost/compress/zstd/internal/xxhash
-# github.com/matttproud/golang_protobuf_extensions/v2 v2.0.0
-## explicit; go 1.19
-github.com/matttproud/golang_protobuf_extensions/v2/pbutil
 # github.com/moby/locker v1.0.1
 ## explicit; go 1.13
 github.com/moby/locker
-# github.com/open-policy-agent/opa v0.52.0
-## explicit; go 1.18
+# github.com/open-policy-agent/opa v0.60.0
+## explicit; go 1.19
 github.com/open-policy-agent/opa/ast
 github.com/open-policy-agent/opa/ast/internal/scanner
 github.com/open-policy-agent/opa/ast/internal/tokens
+github.com/open-policy-agent/opa/ast/json
 github.com/open-policy-agent/opa/ast/location
 github.com/open-policy-agent/opa/bundle
 github.com/open-policy-agent/opa/capabilities
@@ -133,8 +137,10 @@ github.com/open-policy-agent/opa/config
 github.com/open-policy-agent/opa/download
 github.com/open-policy-agent/opa/features/wasm
 github.com/open-policy-agent/opa/format
+github.com/open-policy-agent/opa/hooks
 github.com/open-policy-agent/opa/internal/bundle
 github.com/open-policy-agent/opa/internal/cidr/merge
+github.com/open-policy-agent/opa/internal/compiler
 github.com/open-policy-agent/opa/internal/compiler/wasm
 github.com/open-policy-agent/opa/internal/compiler/wasm/opa
 github.com/open-policy-agent/opa/internal/config
@@ -142,6 +148,7 @@ github.com/open-policy-agent/opa/internal/debug
 github.com/open-policy-agent/opa/internal/deepcopy
 github.com/open-policy-agent/opa/internal/edittree
 github.com/open-policy-agent/opa/internal/edittree/bitvector
+github.com/open-policy-agent/opa/internal/errors
 github.com/open-policy-agent/opa/internal/file/archive
 github.com/open-policy-agent/opa/internal/file/url
 github.com/open-policy-agent/opa/internal/future
@@ -162,12 +169,14 @@ github.com/open-policy-agent/opa/internal/jwx/jws/verify
 github.com/open-policy-agent/opa/internal/lcss
 github.com/open-policy-agent/opa/internal/leb128
 github.com/open-policy-agent/opa/internal/merge
+github.com/open-policy-agent/opa/internal/pathwatcher
 github.com/open-policy-agent/opa/internal/planner
 github.com/open-policy-agent/opa/internal/providers/aws
 github.com/open-policy-agent/opa/internal/providers/aws/crypto
 github.com/open-policy-agent/opa/internal/providers/aws/v4
 github.com/open-policy-agent/opa/internal/ref
 github.com/open-policy-agent/opa/internal/rego/opa
+github.com/open-policy-agent/opa/internal/report
 github.com/open-policy-agent/opa/internal/runtime
 github.com/open-policy-agent/opa/internal/runtime/init
 github.com/open-policy-agent/opa/internal/semver
@@ -189,6 +198,7 @@ github.com/open-policy-agent/opa/internal/wasm/util
 github.com/open-policy-agent/opa/ir
 github.com/open-policy-agent/opa/keys
 github.com/open-policy-agent/opa/loader
+github.com/open-policy-agent/opa/loader/extension
 github.com/open-policy-agent/opa/loader/filter
 github.com/open-policy-agent/opa/logging
 github.com/open-policy-agent/opa/metrics
@@ -203,6 +213,7 @@ github.com/open-policy-agent/opa/plugins/status
 github.com/open-policy-agent/opa/rego
 github.com/open-policy-agent/opa/resolver
 github.com/open-policy-agent/opa/resolver/wasm
+github.com/open-policy-agent/opa/schemas
 github.com/open-policy-agent/opa/sdk
 github.com/open-policy-agent/opa/server
 github.com/open-policy-agent/opa/server/authorizer
@@ -231,14 +242,14 @@ github.com/opencontainers/go-digest
 ## explicit; go 1.18
 github.com/opencontainers/image-spec/specs-go
 github.com/opencontainers/image-spec/specs-go/v1
-# github.com/prometheus/client_golang v1.17.0
+# github.com/prometheus/client_golang v1.18.0
 ## explicit; go 1.19
 github.com/prometheus/client_golang/prometheus
 github.com/prometheus/client_golang/prometheus/internal
 # github.com/prometheus/client_model v0.5.0
 ## explicit; go 1.19
 github.com/prometheus/client_model/go
-# github.com/prometheus/common v0.45.0
+# github.com/prometheus/common v0.46.0
 ## explicit; go 1.20
 github.com/prometheus/common/expfmt
 github.com/prometheus/common/internal/bitbucket.org/ww/goautoneg
@@ -268,6 +279,8 @@ github.com/xeipuuv/gojsonreference
 github.com/yashtewari/glob-intersection
 # go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.46.1
 ## explicit; go 1.20
+go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp
+go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp/internal/semconvutil
 # go.opentelemetry.io/otel v1.21.0
 ## explicit; go 1.20
 go.opentelemetry.io/otel
@@ -279,14 +292,8 @@ go.opentelemetry.io/otel/internal/attribute
 go.opentelemetry.io/otel/internal/baggage
 go.opentelemetry.io/otel/internal/global
 go.opentelemetry.io/otel/propagation
-go.opentelemetry.io/otel/semconv/internal/v2
 go.opentelemetry.io/otel/semconv/v1.17.0
-go.opentelemetry.io/otel/semconv/v1.17.0/httpconv
 go.opentelemetry.io/otel/semconv/v1.21.0
-# go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.21.0
-## explicit; go 1.20
-# go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.21.0
-## explicit; go 1.20
 # go.opentelemetry.io/otel/metric v1.21.0
 ## explicit; go 1.20
 go.opentelemetry.io/otel/metric
@@ -304,23 +311,22 @@ go.opentelemetry.io/otel/sdk/trace
 go.opentelemetry.io/otel/trace
 go.opentelemetry.io/otel/trace/embedded
 go.opentelemetry.io/otel/trace/noop
-# golang.org/x/mod v0.11.0
-## explicit; go 1.17
+# golang.org/x/mod v0.14.0
+## explicit; go 1.18
 golang.org/x/mod/semver
-# golang.org/x/net v0.18.0
+# golang.org/x/net v0.20.0
 ## explicit; go 1.18
 golang.org/x/net/http/httpguts
 golang.org/x/net/http2
 golang.org/x/net/http2/h2c
 golang.org/x/net/http2/hpack
 golang.org/x/net/idna
-# golang.org/x/sync v0.5.0
+# golang.org/x/sync v0.6.0
 ## explicit; go 1.18
 golang.org/x/sync/errgroup
 golang.org/x/sync/semaphore
-# golang.org/x/sys v0.14.0
+# golang.org/x/sys v0.16.0
 ## explicit; go 1.18
-golang.org/x/sys/execabs
 golang.org/x/sys/unix
 golang.org/x/sys/windows
 golang.org/x/sys/windows/registry
@@ -330,15 +336,16 @@ golang.org/x/text/secure/bidirule
 golang.org/x/text/transform
 golang.org/x/text/unicode/bidi
 golang.org/x/text/unicode/norm
-# golang.org/x/time v0.4.0
+# golang.org/x/time v0.5.0
 ## explicit; go 1.18
 golang.org/x/time/rate
-# golang.org/x/tools v0.10.0
+# golang.org/x/tools v0.17.0
 ## explicit; go 1.18
 golang.org/x/tools/cmd/stringer
 golang.org/x/tools/go/gcexportdata
 golang.org/x/tools/go/internal/packagesdriver
 golang.org/x/tools/go/packages
+golang.org/x/tools/go/types/objectpath
 golang.org/x/tools/internal/event
 golang.org/x/tools/internal/event/core
 golang.org/x/tools/internal/event/keys
@@ -351,10 +358,11 @@ golang.org/x/tools/internal/pkgbits
 golang.org/x/tools/internal/tokeninternal
 golang.org/x/tools/internal/typeparams
 golang.org/x/tools/internal/typesinternal
-# google.golang.org/genproto/googleapis/rpc v0.0.0-20231106174013-bbf56f31fb17
+golang.org/x/tools/internal/versions
+# google.golang.org/genproto/googleapis/rpc v0.0.0-20240108191215-35c7eff3a6b1
 ## explicit; go 1.19
 google.golang.org/genproto/googleapis/rpc/status
-# google.golang.org/grpc v1.59.0
+# google.golang.org/grpc v1.60.1
 ## explicit; go 1.19
 google.golang.org/grpc/attributes
 google.golang.org/grpc/codes
@@ -368,8 +376,9 @@ google.golang.org/grpc/internal/status
 google.golang.org/grpc/resolver
 google.golang.org/grpc/serviceconfig
 google.golang.org/grpc/status
-# google.golang.org/protobuf v1.31.0
-## explicit; go 1.11
+# google.golang.org/protobuf v1.32.0
+## explicit; go 1.17
+google.golang.org/protobuf/encoding/protodelim
 google.golang.org/protobuf/encoding/prototext
 google.golang.org/protobuf/encoding/protowire
 google.golang.org/protobuf/internal/descfmt
@@ -430,3 +439,7 @@ oras.land/oras-go/v2/registry/remote/auth
 oras.land/oras-go/v2/registry/remote/errcode
 oras.land/oras-go/v2/registry/remote/internal/errutil
 oras.land/oras-go/v2/registry/remote/retry
+# sigs.k8s.io/yaml v1.4.0
+## explicit; go 1.12
+sigs.k8s.io/yaml
+sigs.k8s.io/yaml/goyaml.v2
