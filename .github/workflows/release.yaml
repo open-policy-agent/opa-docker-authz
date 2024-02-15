@@ -18,6 +18,12 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v4
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Set TAG_NAME in Environment
       # Subsequent jobs will be have the computed tag name
         run: echo "TAG_NAME=${GITHUB_REF##*/}" >> $GITHUB_ENV
@@ -34,4 +40,6 @@ jobs:
           REPO: ghcr.io/${{ github.repository }}
         run: |-
           REPO=${{ env.REPO }} VERSION=${{ env.TAG_NAME }} make plugin
+          docker plugin push "${{ env.REPO }}:${{ env.TAG_NAME }}-linux-amd64"
+          docker plugin push "${{ env.REPO }}:${{ env.TAG_NAME }}-linux-arm64"
           docker plugin push "${{ env.REPO }}:${{ env.TAG_NAME }}"
