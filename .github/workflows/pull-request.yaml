@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-20.04
     steps:
     - name: Check out code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v3
 
@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-20.04
     steps:
     - name: Check out code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Unit Test
       run: make test
@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-20.04
     steps:
     - name: Check out code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Golang Style and Lint Check
       run: make check
