@@ -55,6 +55,13 @@ type Options struct {
 	// Hooks allows hooking into the internals of SDK operations (TODO(sr): find better words)
 	Hooks hooks.Hooks
 
+	V1Compatible bool
+
+	// ManagerOpts allows customization of the plugin manager.
+	// The given options get appended to the list of options already provided by the SDK and eventually
+	// overriding them.
+	ManagerOpts []func(manager *plugins.Manager)
+
 	config []byte
 	block  bool
 }

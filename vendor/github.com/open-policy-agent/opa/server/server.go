@@ -146,6 +146,7 @@ type Server struct {
 	distributedTracingOpts tracing.Options
 	ndbCacheEnabled        bool
 	unixSocketPerm         *string
+	cipherSuites           *[]uint16
 }
 
 // Metrics defines the interface that the server requires for recording HTTP
@@ -184,7 +185,7 @@ func New() *Server {
 // Init initializes the server. This function MUST be called before starting any loops
 // from s.Listeners().
 func (s *Server) Init(ctx context.Context) (*Server, error) {
-	s.initRouters()
+	s.initRouters(ctx)
 
 	txn, err := s.store.NewTransaction(ctx, storage.WriteParams)
 	if err != nil {
@@ -397,6 +398,12 @@ func (s *Server) WithDistributedTracingOpts(opts tracing.Options) *Server {
 // WithNDBCacheEnabled sets whether the ND builtins cache is to be used.
 func (s *Server) WithNDBCacheEnabled(ndbCacheEnabled bool) *Server {
 	s.ndbCacheEnabled = ndbCacheEnabled
+	return s
+}
+
+// WithCipherSuites sets the list of enabled TLS 1.0–1.2 cipher suites.
+func (s *Server) WithCipherSuites(cipherSuites *[]uint16) *Server {
+	s.cipherSuites = cipherSuites
 	return s
 }
 
@@ -635,36 +642,42 @@ func (s *Server) getListenerForHTTPSServer(u *url.URL, h http.Handler, t httpLis
 		return nil, nil, fmt.Errorf("TLS certificate required but not supplied")
 	}
 
-	httpsServer := http.Server{
-		Addr:    u.Host,
-		Handler: h,
-		TLSConfig: &tls.Config{
-			GetCertificate: s.getCertificate,
-			// GetConfigForClient is used to ensure that a fresh config is provided containing the latest cert pool.
-			// This is not required, but appears to be how connect time updates config should be done:
-			// https://github.com/golang/go/issues/16066#issuecomment-250606132
-			GetConfigForClient: func(info *tls.ClientHelloInfo) (*tls.Config, error) {
-				s.tlsConfigMtx.Lock()
-				defer s.tlsConfigMtx.Unlock()
+	tlsConfig := tls.Config{
+		GetCertificate: s.getCertificate,
+		// GetConfigForClient is used to ensure that a fresh config is provided containing the latest cert pool.
+		// This is not required, but appears to be how connect time updates config should be done:
+		// https://github.com/golang/go/issues/16066#issuecomment-250606132
+		GetConfigForClient: func(info *tls.ClientHelloInfo) (*tls.Config, error) {
+			s.tlsConfigMtx.Lock()
+			defer s.tlsConfigMtx.Unlock()
 
-				cfg := &tls.Config{
-					GetCertificate: s.getCertificate,
-					ClientCAs:      s.certPool,
-				}
+			cfg := &tls.Config{
+				GetCertificate: s.getCertificate,
+				ClientCAs:      s.certPool,
+			}
 
-				if s.authentication == AuthenticationTLS {
-					cfg.ClientAuth = tls.RequireAndVerifyClientCert
-				}
+			if s.authentication == AuthenticationTLS {
+				cfg.ClientAuth = tls.RequireAndVerifyClientCert
+			}
 
-				if s.minTLSVersion != 0 {
-					cfg.MinVersion = s.minTLSVersion
-				} else {
-					cfg.MinVersion = defaultMinTLSVersion
-				}
+			if s.minTLSVersion != 0 {
+				cfg.MinVersion = s.minTLSVersion
+			} else {
+				cfg.MinVersion = defaultMinTLSVersion
+			}
 
-				return cfg, nil
-			},
+			if s.cipherSuites != nil {
+				cfg.CipherSuites = *s.cipherSuites
+			}
+
+			return cfg, nil
 		},
+	}
+
+	httpsServer := http.Server{
+		Addr:      u.Host,
+		Handler:   h,
+		TLSConfig: &tlsConfig,
 	}
 
 	l := newHTTPListener(&httpsServer, t)
@@ -755,7 +768,7 @@ func (s *Server) initHandlerCompression(handler http.Handler) (http.Handler, err
 	return compressHandler, nil
 }
 
-func (s *Server) initRouters() {
+func (s *Server) initRouters(ctx context.Context) {
 	mainRouter := s.router
 	if mainRouter == nil {
 		mainRouter = mux.NewRouter()
@@ -764,7 +777,7 @@ func (s *Server) initRouters() {
 	diagRouter := mux.NewRouter()
 
 	// authorizer, if configured, needs the iCache to be set up already
-	s.interQueryBuiltinCache = iCache.NewInterQueryCache(s.manager.InterQueryBuiltinCacheConfig())
+	s.interQueryBuiltinCache = iCache.NewInterQueryCacheWithContext(ctx, s.manager.InterQueryBuiltinCacheConfig())
 	s.manager.RegisterCacheTrigger(s.updateCacheConfig)
 
 	// Add authorization handler. This must come BEFORE authentication handler
@@ -871,22 +884,13 @@ func (s *Server) instrumentHandler(handler func(http.ResponseWriter, *http.Reque
 	return httpHandler
 }
 
-func (s *Server) execQuery(ctx context.Context, br bundleRevisions, txn storage.Transaction, parsedQuery ast.Body, input ast.Value, m metrics.Metrics, explainMode types.ExplainModeV1, includeMetrics, includeInstrumentation, pretty bool) (*types.QueryResponseV1, error) {
+func (s *Server) execQuery(ctx context.Context, br bundleRevisions, txn storage.Transaction, parsedQuery ast.Body, input ast.Value, rawInput *interface{}, m metrics.Metrics, explainMode types.ExplainModeV1, includeMetrics, includeInstrumentation, pretty bool) (*types.QueryResponseV1, error) {
 	results := types.QueryResponseV1{}
 	logger := s.getDecisionLogger(br)
 
 	var buf *topdown.BufferTracer
 	if explainMode != types.ExplainOffV1 {
 		buf = topdown.NewBufferTracer()
-	}
-
-	var rawInput *interface{}
-	if input != nil {
-		x, err := ast.JSON(input)
-		if err != nil {
-			return nil, err
-		}
-		rawInput = &x
 	}
 
 	var ndbCache builtins.NDBCache
@@ -1024,20 +1028,10 @@ func (s *Server) v0QueryPath(w http.ResponseWriter, r *http.Request, urlPath str
 	ctx := logging.WithDecisionID(r.Context(), decisionID)
 	annotateSpan(ctx, decisionID)
 
-	input, err := readInputV0(r)
+	input, goInput, err := readInputV0(r)
 	if err != nil {
 		writer.ErrorString(w, http.StatusBadRequest, types.CodeInvalidParameter, fmt.Errorf("unexpected parse error for input: %w", err))
 		return
-	}
-
-	var goInput *interface{}
-	if input != nil {
-		x, err := ast.JSON(input)
-		if err != nil {
-			writer.ErrorString(w, http.StatusInternalServerError, types.CodeInvalidParameter, fmt.Errorf("could not marshal input: %w", err))
-			return
-		}
-		goInput = &x
 	}
 
 	// Prepare for query.
@@ -1056,7 +1050,7 @@ func (s *Server) v0QueryPath(w http.ResponseWriter, r *http.Request, urlPath str
 	}
 
 	if useDefaultDecisionPath {
-		urlPath = s.defaultDecisionPath
+		urlPath = s.generateDefaultDecisionPath()
 	}
 
 	logger := s.getDecisionLogger(br)
@@ -1442,24 +1436,15 @@ func (s *Server) v1DataGet(w http.ResponseWriter, r *http.Request) {
 	inputs := r.URL.Query()[types.ParamInputV1]
 
 	var input ast.Value
+	var goInput *interface{}
 
 	if len(inputs) > 0 {
 		var err error
-		input, err = readInputGetV1(inputs[len(inputs)-1])
+		input, goInput, err = readInputGetV1(inputs[len(inputs)-1])
 		if err != nil {
 			writer.ErrorString(w, http.StatusBadRequest, types.CodeInvalidParameter, err)
 			return
 		}
-	}
-
-	var goInput *interface{}
-	if input != nil {
-		x, err := ast.JSON(input)
-		if err != nil {
-			writer.ErrorString(w, http.StatusInternalServerError, types.CodeInvalidParameter, fmt.Errorf("could not marshal input: %w", err))
-			return
-		}
-		goInput = &x
 	}
 
 	m.Timer(metrics.RegoInputParse).Stop()
@@ -1674,20 +1659,10 @@ func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
 
 	m.Timer(metrics.RegoInputParse).Start()
 
-	input, err := readInputPostV1(r)
+	input, goInput, err := readInputPostV1(r)
 	if err != nil {
 		writer.ErrorString(w, http.StatusBadRequest, types.CodeInvalidParameter, err)
 		return
-	}
-
-	var goInput *interface{}
-	if input != nil {
-		x, err := ast.JSON(input)
-		if err != nil {
-			writer.ErrorString(w, http.StatusInternalServerError, types.CodeInvalidParameter, fmt.Errorf("could not marshal input: %w", err))
-			return
-		}
-		goInput = &x
 	}
 
 	m.Timer(metrics.RegoInputParse).Stop()
@@ -2264,7 +2239,7 @@ func (s *Server) v1QueryGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pretty := pretty(r)
-	results, err := s.execQuery(ctx, br, txn, parsedQuery, nil, m, explainMode, includeMetrics(r), includeInstrumentation, pretty)
+	results, err := s.execQuery(ctx, br, txn, parsedQuery, nil, nil, m, explainMode, includeMetrics(r), includeInstrumentation, pretty)
 	if err != nil {
 		switch err := err.(type) {
 		case ast.Errors:
@@ -2334,7 +2309,7 @@ func (s *Server) v1QueryPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results, err := s.execQuery(ctx, br, txn, parsedQuery, input, m, explainMode, includeMetrics, includeInstrumentation, pretty)
+	results, err := s.execQuery(ctx, br, txn, parsedQuery, input, request.Input, m, explainMode, includeMetrics, includeInstrumentation, pretty)
 	if err != nil {
 		switch err := err.(type) {
 		case ast.Errors:
@@ -2748,17 +2723,18 @@ func getExplain(p []string, zero types.ExplainModeV1) types.ExplainModeV1 {
 	return zero
 }
 
-func readInputV0(r *http.Request) (ast.Value, error) {
+func readInputV0(r *http.Request) (ast.Value, *interface{}, error) {
 
 	parsed, ok := authorizer.GetBodyOnContext(r.Context())
 	if ok {
-		return ast.InterfaceToValue(parsed)
+		v, err := ast.InterfaceToValue(parsed)
+		return v, &parsed, err
 	}
 
 	// decompress the input if sent as zip
 	body, err := readPlainBody(r)
 	if err != nil {
-		return nil, fmt.Errorf("could not decompress the body: %w", err)
+		return nil, nil, fmt.Errorf("could not decompress the body: %w", err)
 	}
 
 	var x interface{}
@@ -2766,41 +2742,44 @@ func readInputV0(r *http.Request) (ast.Value, error) {
 	if strings.Contains(r.Header.Get("Content-Type"), "yaml") {
 		bs, err := io.ReadAll(body)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if len(bs) > 0 {
 			if err = util.Unmarshal(bs, &x); err != nil {
-				return nil, fmt.Errorf("body contains malformed input document: %w", err)
+				return nil, nil, fmt.Errorf("body contains malformed input document: %w", err)
 			}
 		}
 	} else {
 		dec := util.NewJSONDecoder(body)
 		if err := dec.Decode(&x); err != nil && err != io.EOF {
-			return nil, fmt.Errorf("body contains malformed input document: %w", err)
+			return nil, nil, fmt.Errorf("body contains malformed input document: %w", err)
 		}
 	}
 
-	return ast.InterfaceToValue(x)
+	v, err := ast.InterfaceToValue(x)
+	return v, &x, err
 }
 
-func readInputGetV1(str string) (ast.Value, error) {
+func readInputGetV1(str string) (ast.Value, *interface{}, error) {
 	var input interface{}
 	if err := util.UnmarshalJSON([]byte(str), &input); err != nil {
-		return nil, fmt.Errorf("parameter contains malformed input document: %w", err)
+		return nil, nil, fmt.Errorf("parameter contains malformed input document: %w", err)
 	}
-	return ast.InterfaceToValue(input)
+	v, err := ast.InterfaceToValue(input)
+	return v, &input, err
 }
 
-func readInputPostV1(r *http.Request) (ast.Value, error) {
+func readInputPostV1(r *http.Request) (ast.Value, *interface{}, error) {
 
 	parsed, ok := authorizer.GetBodyOnContext(r.Context())
 	if ok {
 		if obj, ok := parsed.(map[string]interface{}); ok {
 			if input, ok := obj["input"]; ok {
-				return ast.InterfaceToValue(input)
+				v, err := ast.InterfaceToValue(input)
+				return v, &input, err
 			}
 		}
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	var request types.DataRequestV1
@@ -2808,7 +2787,7 @@ func readInputPostV1(r *http.Request) (ast.Value, error) {
 	// decompress the input if sent as zip
 	body, err := readPlainBody(r)
 	if err != nil {
-		return nil, fmt.Errorf("could not decompress the body: %w", err)
+		return nil, nil, fmt.Errorf("could not decompress the body: %w", err)
 	}
 
 	ct := r.Header.Get("Content-Type")
@@ -2817,25 +2796,26 @@ func readInputPostV1(r *http.Request) (ast.Value, error) {
 	if strings.Contains(ct, "yaml") {
 		bs, err := io.ReadAll(body)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if len(bs) > 0 {
 			if err = util.Unmarshal(bs, &request); err != nil {
-				return nil, fmt.Errorf("body contains malformed input document: %w", err)
+				return nil, nil, fmt.Errorf("body contains malformed input document: %w", err)
 			}
 		}
 	} else {
 		dec := util.NewJSONDecoder(body)
 		if err := dec.Decode(&request); err != nil && err != io.EOF {
-			return nil, fmt.Errorf("body contains malformed input document: %w", err)
+			return nil, nil, fmt.Errorf("body contains malformed input document: %w", err)
 		}
 	}
 
 	if request.Input == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 
-	return ast.InterfaceToValue(*request.Input)
+	v, err := ast.InterfaceToValue(*request.Input)
+	return v, request.Input, err
 }
 
 type compileRequest struct {
