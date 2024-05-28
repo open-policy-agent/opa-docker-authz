@@ -8,10 +8,12 @@ package discovery
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -22,7 +24,6 @@ import (
 	"github.com/open-policy-agent/opa/hooks"
 	bundleUtils "github.com/open-policy-agent/opa/internal/bundle"
 	cfg "github.com/open-policy-agent/opa/internal/config"
-	"github.com/open-policy-agent/opa/internal/errors"
 	"github.com/open-policy-agent/opa/keys"
 	"github.com/open-policy-agent/opa/logging"
 	"github.com/open-policy-agent/opa/metrics"
@@ -32,6 +33,7 @@ import (
 	"github.com/open-policy-agent/opa/plugins/status"
 	"github.com/open-policy-agent/opa/rego"
 	"github.com/open-policy-agent/opa/storage/inmem"
+	"github.com/open-policy-agent/opa/util"
 )
 
 const (
@@ -49,19 +51,21 @@ const (
 // started it will periodically download a configuration bundle and try to
 // reconfigure the OPA.
 type Discovery struct {
-	manager           *plugins.Manager
-	config            *Config
-	factories         map[string]plugins.Factory
-	downloader        bundle.Loader                       // discovery bundle downloader
-	status            *bundle.Status                      // discovery status
-	listenersMtx      sync.Mutex                          // lock for listener map
-	listeners         map[interface{}]func(bundle.Status) // listeners for discovery update events
-	etag              string                              // discovery bundle etag for caching purposes
-	metrics           metrics.Metrics
-	readyOnce         sync.Once
-	logger            logging.Logger
-	bundlePersistPath string
-	hooks             hooks.Hooks
+	manager              *plugins.Manager
+	config               *Config
+	factories            map[string]plugins.Factory
+	downloader           bundle.Loader                       // discovery bundle downloader
+	status               *bundle.Status                      // discovery status
+	listenersMtx         sync.Mutex                          // lock for listener map
+	listeners            map[interface{}]func(bundle.Status) // listeners for discovery update events
+	etag                 string                              // discovery bundle etag for caching purposes
+	metrics              metrics.Metrics
+	readyOnce            sync.Once
+	logger               logging.Logger
+	bundlePersistPath    string
+	hooks                hooks.Hooks
+	bootConfig           map[string]interface{}
+	overriddenConfigKeys []string
 }
 
 // Factories provides a set of factory functions to use for
@@ -82,6 +86,12 @@ func Metrics(m metrics.Metrics) func(*Discovery) {
 func Hooks(hs hooks.Hooks) func(*Discovery) {
 	return func(d *Discovery) {
 		d.hooks = hs
+	}
+}
+
+func BootConfig(bootConfig map[string]interface{}) func(*Discovery) {
+	return func(d *Discovery) {
+		d.bootConfig = bootConfig
 	}
 }
 
@@ -107,10 +117,6 @@ func New(manager *plugins.Manager, opts ...func(*Discovery)) (*Discovery, error)
 		return result, nil
 	}
 
-	if names := manager.Config.PluginNames(); len(names) > 0 {
-		return nil, fmt.Errorf("discovery prohibits manual configuration of %v", strings.Join(names, " and "))
-	}
-
 	result.config = config
 	restClient := manager.Client(config.service)
 	if strings.ToLower(restClient.Config().Type) == "oci" {
@@ -121,12 +127,15 @@ func New(manager *plugins.Manager, opts ...func(*Discovery)) (*Discovery, error)
 		result.downloader = download.NewOCI(config.Config, restClient, config.path, ociStorePath).
 			WithCallback(result.oneShot).
 			WithBundleVerificationConfig(config.Signing).
-			WithBundlePersistence(config.Persist)
+			WithBundlePersistence(config.Persist).
+			WithBundleParserOpts(manager.ParserOptions())
 	} else {
-		result.downloader = download.New(config.Config, restClient, config.path).
+		d := download.New(config.Config, restClient, config.path).
 			WithCallback(result.oneShot).
 			WithBundleVerificationConfig(config.Signing).
-			WithBundlePersistence(config.Persist)
+			WithBundlePersistence(config.Persist).
+			WithBundleParserOpts(manager.ParserOptions())
+		result.downloader = d
 	}
 	result.status = &bundle.Status{
 		Name: Name,
@@ -263,7 +272,8 @@ func (c *Discovery) loadAndActivateBundleFromDisk(ctx context.Context) {
 }
 
 func (c *Discovery) loadBundleFromDisk() (*bundleApi.Bundle, error) {
-	return bundleUtils.LoadBundleFromDisk(c.bundlePersistPath, c.discoveryBundleDirName(), c.config.Signing)
+	return bundleUtils.LoadBundleFromDiskForRegoVersion(c.manager.ParserOptions().RegoVersion,
+		c.bundlePersistPath, c.discoveryBundleDirName(), c.config.Signing)
 }
 
 func (c *Discovery) saveBundleToDisk(raw io.Reader) error {
@@ -349,6 +359,14 @@ func (c *Discovery) processUpdate(ctx context.Context, u download.Update) {
 		c.status.SetError(nil)
 		c.status.SetActivateSuccess(u.Bundle.Manifest.Revision)
 
+		// include the local overrides in the status update
+		if len(c.overriddenConfigKeys) != 0 {
+			msg := fmt.Sprintf("Keys in the discovered configuration overridden by boot configuration: %v", strings.Join(c.overriddenConfigKeys, ", "))
+			c.logger.Debug(msg)
+			c.status.Message = msg
+		}
+		c.overriddenConfigKeys = nil
+
 		// On the first activation success mark the plugin as being in OK state
 		c.readyOnce.Do(func() {
 			c.manager.UpdatePluginStatus(Name, &plugins.Status{State: plugins.StateOK})
@@ -388,6 +406,33 @@ func (c *Discovery) reconfigure(ctx context.Context, u download.Update) error {
 	}
 
 	return nil
+}
+
+func (c *Discovery) applyLocalPluginConfigOverride(conf *config.Config) (*config.Config, []string, error) {
+	raw, err := json.Marshal(conf)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var newConfig map[string]interface{}
+	err = util.Unmarshal(raw, &newConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	_, overriddenKeys := mergeValuesAndListOverrides(newConfig, c.bootConfig, "")
+
+	bs, err := json.Marshal(newConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	parsedConf, err := config.ParseConfig(bs, c.manager.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return parsedConf, overriddenKeys, nil
 }
 
 func (c *Discovery) processBundle(ctx context.Context, b *bundleApi.Bundle) (*pluginSet, error) {
@@ -450,11 +495,23 @@ func (c *Discovery) processBundle(ctx context.Context, b *bundleApi.Bundle) (*pl
 		}
 	}
 
-	if err := c.manager.Reconfigure(config); err != nil {
+	overriddenConfig, overriddenKeys, err := c.applyLocalPluginConfigOverride(config)
+	if err != nil {
 		return nil, err
 	}
 
-	return getPluginSet(c.factories, c.manager, config, c.metrics, c.config.Trigger)
+	if err := c.manager.Reconfigure(overriddenConfig); err != nil {
+		return nil, err
+	}
+
+	ps, err := getPluginSet(c.factories, c.manager, overriddenConfig, c.metrics, c.config.Trigger)
+	if err != nil {
+		return nil, err
+	}
+
+	c.overriddenConfigKeys = overriddenKeys
+
+	return ps, nil
 }
 
 // discoveryBundleDirName returns the name of the directory where the discovery bundle will be persisted.
@@ -673,4 +730,46 @@ func registerBundleStatusUpdates(m *plugins.Manager) {
 	} else {
 		bp.RegisterBulkListener(pluginlistener(status.Name), sp.BulkUpdateBundleStatus)
 	}
+}
+
+// mergeValuesAndListOverrides will merge source and destination map, preferring values from the source map.
+// It will also return a list of keys in the destination map which were overridden by those in the source map
+func mergeValuesAndListOverrides(dest map[string]interface{}, src map[string]interface{}, prefix string) (map[string]interface{}, []string) {
+	overriddenKeys := []string{}
+
+	for k, v := range src {
+		// If the key doesn't exist already, then just set the key to that value
+		if _, exists := dest[k]; !exists {
+			dest[k] = v
+			continue
+		}
+
+		fullKey := k
+		if prefix != "" {
+			fullKey = fmt.Sprintf("%v.%v", prefix, k)
+		}
+
+		nextMap, ok := v.(map[string]interface{})
+		// If it isn't another map, overwrite the value
+		if !ok {
+			if !reflect.DeepEqual(dest[k], v) {
+				overriddenKeys = append(overriddenKeys, fullKey)
+			}
+			dest[k] = v
+			continue
+		}
+		// Edge case: If the key exists in the destination, but isn't a map
+		destMap, isMap := dest[k].(map[string]interface{})
+		// If the source map has a map for this key, prefer it
+		if !isMap {
+			dest[k] = v
+			overriddenKeys = append(overriddenKeys, fullKey)
+			continue
+		}
+		// If we got to this point, it is a map in both, so merge them
+		merged, overridden := mergeValuesAndListOverrides(destMap, nextMap, fullKey)
+		dest[k] = merged
+		overriddenKeys = append(overriddenKeys, overridden...)
+	}
+	return dest, overriddenKeys
 }
