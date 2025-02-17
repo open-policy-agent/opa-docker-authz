@@ -16,14 +16,14 @@ import (
 
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v3"
 
-	"github.com/open-policy-agent/opa/ast"
 	sdk_errors "github.com/open-policy-agent/opa/internal/wasm/sdk/opa/errors"
 	"github.com/open-policy-agent/opa/internal/wasm/util"
-	"github.com/open-policy-agent/opa/metrics"
-	"github.com/open-policy-agent/opa/topdown"
-	"github.com/open-policy-agent/opa/topdown/builtins"
-	"github.com/open-policy-agent/opa/topdown/cache"
-	"github.com/open-policy-agent/opa/topdown/print"
+	"github.com/open-policy-agent/opa/v1/ast"
+	"github.com/open-policy-agent/opa/v1/metrics"
+	"github.com/open-policy-agent/opa/v1/topdown"
+	"github.com/open-policy-agent/opa/v1/topdown/builtins"
+	"github.com/open-policy-agent/opa/v1/topdown/cache"
+	"github.com/open-policy-agent/opa/v1/topdown/print"
 )
 
 // VM is a wrapper around a Wasm VM instance
@@ -487,11 +487,11 @@ func (i *VM) SetPolicyData(ctx context.Context, opts vmOpts) error {
 			}
 		}
 		mem := i.memory.UnsafeData(i.store)
-		len := int32(len(opts.parsedData))
-		copy(mem[i.baseHeapPtr:i.baseHeapPtr+len], opts.parsedData)
+		length := int32(len(opts.parsedData))
+		copy(mem[i.baseHeapPtr:i.baseHeapPtr+length], opts.parsedData)
 		i.dataAddr = opts.parsedDataAddr
 
-		i.evalHeapPtr = i.baseHeapPtr + len
+		i.evalHeapPtr = i.baseHeapPtr + length
 		err := i.setHeapState(ctx, i.evalHeapPtr)
 		if err != nil {
 			return err
