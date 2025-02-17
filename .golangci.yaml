@@ -18,11 +18,8 @@ linters:
   - gofmt
   - goimports
   - unused
-  - varcheck
-  - deadcode
   - misspell
   - typecheck
-  - structcheck
   - staticcheck
   - gosimple
   # - gosec # too many false positives

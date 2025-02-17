@@ -22,10 +22,10 @@ import (
 
 	"github.com/docker/go-plugins-helpers/authorization"
 	version_pkg "github.com/open-policy-agent/opa-docker-authz/version"
-	"github.com/open-policy-agent/opa/ast"
-	"github.com/open-policy-agent/opa/loader"
-	"github.com/open-policy-agent/opa/rego"
-	"github.com/open-policy-agent/opa/sdk"
+	"github.com/open-policy-agent/opa/v1/ast"
+	"github.com/open-policy-agent/opa/v1/loader"
+	"github.com/open-policy-agent/opa/v1/rego"
+	"github.com/open-policy-agent/opa/v1/sdk"
 )
 
 // DockerAuthZPlugin implements the authorization.Plugin interface. Every
