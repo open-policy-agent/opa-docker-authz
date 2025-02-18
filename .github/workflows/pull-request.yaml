@@ -29,11 +29,16 @@ jobs:
       run: make test
 
   lint:
-    name: Go Lint
+    name: Lint
     runs-on: ubuntu-20.04
     steps:
     - name: Check out code
       uses: actions/checkout@v4
 
-    - name: Golang Style and Lint Check
+    - name: Setup Regal
+      uses: StyraInc/setup-regal@v1
+      with:
+        version: latest
+
+    - name: Go (golangci-lint) and Rego (Regal) Lint
       run: make check

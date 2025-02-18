@@ -1,7 +1,7 @@
 package docker.authz
 
-default allow = false
+default allow := false
 
 allow if {
-    input.Method == "GET"
+	input.Method == "GET"
 }
