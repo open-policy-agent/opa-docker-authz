@@ -12,30 +12,36 @@ package docker.authz
 # of the expressions in the body are true. If any of the expressions in the
 # body are false, the document is undefined. Rego allows you to omit the "=
 # true" portion for conciseness.
-allow {
+allow if {
 	not invalid_network
 	not seccomp_unconfined
 	valid_user_role
 }
 
-invalid_network {
+invalid_network if {
+	# Example for create operations
+	# Use glob.Match to ensure all docker api versions are validated
+	glob.match("/**/containers/create", ["/"], input.Path)
+
 	# These expressions assert that a container with a special label must be
 	# connected to a specific network.
 	labels["com.example/deployment"] = "prod"
-	input.Path = "/v1.23/containers/create"
 	input.Body.HostConfig.NetworkMode != "prod-network"
 }
 
-seccomp_unconfined {
+seccomp_unconfined if {
+	# Use glob to match all versions of the docker api
+	# input.Path = "/v1.23/containers/create"
+	glob.match("/**/containers/create", ["/"], input.Path)
+
 	# This expression asserts that the string on the right hand side exists
 	# within the array SecurityOpt referenced on the left hand side.
-	input.Path = "/v1.23/containers/create"
 	input.Body.HostConfig.SecurityOpt[_] = "seccomp=unconfined"
 }
 
 # valid_user_role defines a document that is the boolean value true if this is
 # a write request and the user is allowed to perform writes.
-valid_user_role {
+valid_user_role if {
 	input.Headers["Authz-User"] = user_id
 	users[user_id] = user
 	input.Method != "GET"
@@ -46,7 +52,7 @@ valid_user_role {
 # like this is defined multiple times, the rule definition must ensure that
 # only one instance evaluates successfully in a given query. If multiple
 # instances evaluated successfully, it indicates a conflict.
-valid_user_role {
+valid_user_role if {
 	input.Headers["Authz-User"] = user_id
 	input.Method = "GET"
 	users[user_id] = user
@@ -54,7 +60,7 @@ valid_user_role {
 
 # labels defines an object document that simply contains the labels from the
 # requested container.
-labels[key] = value {
+labels[key] = value if {
 	input.Body.Labels[key] = value
 }
 
