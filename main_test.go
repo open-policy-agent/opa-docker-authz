@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"reflect"
 	"testing"
+
+	"github.com/docker/go-plugins-helpers/authorization"
 )
 
 func TestNormalizeAllowPath(t *testing.T) {
@@ -144,6 +147,119 @@ func TestListBindMounts(t *testing.T) {
 			result := listBindMounts(body)
 			if len(result) > 0 && len(tc.expected) > 0 && !reflect.DeepEqual(result, tc.expected) {
 				t.Errorf("Expected %v, got %v", tc.expected, result)
+			}
+		})
+	}
+}
+func TestEvaluate(t *testing.T) {
+	tests := []struct {
+		name           string
+		policyFile     string
+		allowPath      string
+		request        authorization.Request
+		expectedResult bool
+		expectedError  bool
+		skipPing       bool
+	}{
+		{
+			name:       "PING",
+			policyFile: "testdata/default_allow.rego",
+			allowPath:  "data.docker.authz.allow",
+			request: authorization.Request{
+				RequestMethod: "HEAD",
+				RequestURI:    "/_ping",
+			},
+			expectedResult: true,
+			expectedError:  false,
+			skipPing:       true,
+		},
+		{
+			name:       "Policy file OK with GET method",
+			policyFile: "testdata/default_allow.rego",
+			allowPath:  "data.docker.authz.allow",
+			request: authorization.Request{
+				RequestMethod: "GET",
+				RequestHeaders: map[string]string{
+					"Authz-User": "alice",
+				},
+				RequestURI: "/v1.23/containers/json",
+			},
+			expectedResult: true,
+			expectedError:  false,
+		},
+		{
+			name:       "Container create allowed for user alice",
+			policyFile: "example.rego",
+			allowPath:  "data.docker.authz.allow",
+			request: authorization.Request{
+				RequestMethod: "POST",
+				RequestURI:    "/v1.47/containers/create",
+				RequestBody:   []byte(`{"Image": "busybox"}`),
+				RequestHeaders: map[string]string{
+					"Content-Type": "application/json",
+					"Authz-User":   "alice",
+				},
+			},
+			expectedResult: true,
+			expectedError:  false,
+		},
+		{
+			name:       "Container create not allowed for readonly user bob",
+			policyFile: "example.rego",
+			allowPath:  "data.docker.authz.allow",
+			request: authorization.Request{
+				RequestMethod: "POST",
+				RequestURI:    "/v1.23/containers/create",
+				RequestBody:   []byte(`{"Image": "busybox"}`),
+				RequestHeaders: map[string]string{
+					"Content-Type": "application/json",
+					"Authz-User":   "bob",
+				},
+			},
+			expectedResult: false,
+			expectedError:  false,
+		},
+		{
+			name:           "Policy file OK with non-GET method",
+			policyFile:     "example.rego",
+			allowPath:      "data.docker.authz.allow",
+			request:        authorization.Request{RequestMethod: "GET"},
+			expectedResult: false,
+			expectedError:  false,
+		},
+		{
+			name:           "Policy file does not exist",
+			policyFile:     "nonexistent.rego",
+			allowPath:      "data.docker.authz.allow",
+			request:        authorization.Request{RequestMethod: "GET"},
+			expectedResult: true, // policy file nonexistent.rego does not exist, failing open and allowing request
+			expectedError:  true,
+		},
+		{
+			name:           "Test v0 policy file",
+			policyFile:     "testdata/v0.rego",
+			allowPath:      "data.docker.authz.allow",
+			request:        authorization.Request{RequestMethod: "GET"},
+			expectedResult: false,
+			expectedError:  true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			plugin := DockerAuthZPlugin{
+				policyFile: tc.policyFile,
+				allowPath:  tc.allowPath,
+				instanceID: "test-instance",
+				quiet:      true,
+				skipPing:   tc.skipPing,
+			}
+			ctx := context.Background()
+			result, err := plugin.evaluate(ctx, tc.request)
+			if (err != nil) != tc.expectedError {
+				t.Errorf("Expected error: %v, got: %v", tc.expectedError, err)
+			}
+			if result != tc.expectedResult {
+				t.Errorf("Expected result: %v, got: %v", tc.expectedResult, result)
 			}
 		})
 	}
