@@ -5,10 +5,17 @@ GO_VERSION := 1.23.4
 GOLANGCI_LINT_VERSION := v1.64.5
 REPO ?= openpolicyagent/opa-docker-authz-v2
 
+REGAL_FORMAT ?= pretty
+ifeq (true,$(GITHUB_ACTIONS))
+REGAL_FORMAT = github
+endif
+
 all: build
 
 check:
 	docker run --rm -v $(shell pwd):/app -w /app golangci/golangci-lint:${GOLANGCI_LINT_VERSION} golangci-lint run -v
+
+	regal lint --format $(REGAL_FORMAT) .
 
 fmt:
 	docker run --rm -v $(shell pwd):/app -w /app golangci/golangci-lint:${GOLANGCI_LINT_VERSION} golangci-lint run -v --fix

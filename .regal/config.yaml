@@ -1,0 +1,10 @@
+rules:
+  idiomatic:
+    directory-package-mismatch:
+      # There isn't much of a directory structure in this project
+      # to begin with, so we can ignore this rule for now.
+      level: ignore
+
+ignore:
+  files:
+    - testdata/
