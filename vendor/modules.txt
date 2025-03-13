@@ -125,9 +125,6 @@ github.com/moby/locker
 github.com/munnerz/goautoneg
 # github.com/open-policy-agent/opa v1.1.0
 ## explicit; go 1.22.7
-github.com/open-policy-agent/opa/ast
-github.com/open-policy-agent/opa/ast/json
-github.com/open-policy-agent/opa/bundle
 github.com/open-policy-agent/opa/capabilities
 github.com/open-policy-agent/opa/internal/bundle
 github.com/open-policy-agent/opa/internal/cidr/merge
@@ -185,10 +182,6 @@ github.com/open-policy-agent/opa/internal/wasm/sdk/opa/capabilities
 github.com/open-policy-agent/opa/internal/wasm/sdk/opa/errors
 github.com/open-policy-agent/opa/internal/wasm/types
 github.com/open-policy-agent/opa/internal/wasm/util
-github.com/open-policy-agent/opa/loader
-github.com/open-policy-agent/opa/rego
-github.com/open-policy-agent/opa/sdk
-github.com/open-policy-agent/opa/storage
 github.com/open-policy-agent/opa/v1/ast
 github.com/open-policy-agent/opa/v1/ast/internal/scanner
 github.com/open-policy-agent/opa/v1/ast/internal/tokens
@@ -328,8 +321,8 @@ go.opentelemetry.io/otel/sdk/trace
 go.opentelemetry.io/otel/trace
 go.opentelemetry.io/otel/trace/embedded
 go.opentelemetry.io/otel/trace/noop
-# golang.org/x/net v0.35.0
-## explicit; go 1.18
+# golang.org/x/net v0.36.0
+## explicit; go 1.23.0
 golang.org/x/net/http/httpguts
 golang.org/x/net/http2
 golang.org/x/net/http2/h2c
