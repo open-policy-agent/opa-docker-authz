@@ -175,10 +175,8 @@ func (c *Config) validateAndInjectDefaults(services []string, keys map[string]*k
 			if err != nil {
 				return fmt.Errorf("invalid configuration for bundle %q: %s", name, err.Error())
 			}
-		} else {
-			if len(keys) > 0 {
-				source.Signing = bundle.NewVerificationConfig(keys, "", "", nil)
-			}
+		} else if len(keys) > 0 {
+			source.Signing = bundle.NewVerificationConfig(keys, "", "", nil)
 		}
 
 		if strings.HasPrefix(source.Resource, "file://") {
@@ -235,7 +233,7 @@ func (c *Config) validateAndInjectDefaultsLegacy(services []string) error {
 	return nil
 }
 
-func (c *Config) getServiceFromList(service string, services []string) (string, error) {
+func (*Config) getServiceFromList(service string, services []string) (string, error) {
 	if service == "" && len(services) != 0 {
 		return services[0], nil
 	}
