@@ -237,7 +237,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	// wait until each server has finished shutting down
 	var errorList []error
-	for i := 0; i < len(s.httpListeners); i++ {
+	for range s.httpListeners {
 		err := <-errChan
 		if err != nil {
 			errorList = append(errorList, err)
@@ -581,9 +581,9 @@ func (b *baseHTTPListener) Type() httpListenerType {
 	return b.t
 }
 
-func isMinTLSVersionSupported(TLSVersion uint16) bool {
+func isMinTLSVersionSupported(tlsVersion uint16) bool {
 	for _, version := range supportedTLSVersions {
-		if TLSVersion == version {
+		if tlsVersion == version {
 			return true
 		}
 	}
@@ -645,7 +645,7 @@ func (s *Server) getListenerForHTTPServer(u *url.URL, h http.Handler, t httpList
 func (s *Server) getListenerForHTTPSServer(u *url.URL, h http.Handler, t httpListenerType) (Loop, httpListener, error) {
 
 	if s.cert == nil {
-		return nil, nil, fmt.Errorf("TLS certificate required but not supplied")
+		return nil, nil, errors.New("TLS certificate required but not supplied")
 	}
 
 	tlsConfig := tls.Config{
@@ -980,7 +980,7 @@ func (s *Server) execQuery(ctx context.Context, br bundleRevisions, txn storage.
 	return &results, nil
 }
 
-func (s *Server) indexGet(w http.ResponseWriter, _ *http.Request) {
+func (*Server) indexGet(w http.ResponseWriter, _ *http.Request) {
 	_ = indexHTML.Execute(w, struct {
 		Version        string
 		BuildCommit    string
@@ -1213,7 +1213,7 @@ func (s *Server) canEval(ctx context.Context) bool {
 	return false
 }
 
-func (s *Server) bundlesReady(pluginStatuses map[string]*plugins.Status) bool {
+func (*Server) bundlesReady(pluginStatuses map[string]*plugins.Status) bool {
 
 	// Look for a discovery plugin first, if it exists and isn't ready
 	// then don't bother with the others.
@@ -1318,7 +1318,7 @@ func (s *Server) unversionedGetHealthWithPolicy(w http.ResponseWriter, r *http.R
 
 	vars := mux.Vars(r)
 	urlPath := vars["path"]
-	healthDataPath := fmt.Sprintf("/system/health/%s", urlPath)
+	healthDataPath := "/system/health/" + urlPath
 	healthDataPath = stringPathToDataRef(healthDataPath).String()
 
 	rego := rego.New(
@@ -2470,7 +2470,7 @@ func (s *Server) getDecisionLogger(br bundleRevisions) (logger decisionLogger) {
 	return logger
 }
 
-func (s *Server) getExplainResponse(explainMode types.ExplainModeV1, trace []*topdown.Event, pretty bool) (explanation types.TraceV1) {
+func (*Server) getExplainResponse(explainMode types.ExplainModeV1, trace []*topdown.Event, pretty bool) (explanation types.TraceV1) {
 	switch explainMode {
 	case types.ExplainNotesV1:
 		var err error
@@ -2569,7 +2569,7 @@ func (s *Server) makeRego(_ context.Context,
 	return rego.New(opts...), nil
 }
 
-func (s *Server) prepareV1PatchSlice(root string, ops []types.PatchV1) (result []patchImpl, err error) {
+func (*Server) prepareV1PatchSlice(root string, ops []types.PatchV1) (result []patchImpl, err error) {
 
 	root = "/" + strings.Trim(root, "/")
 
@@ -2722,7 +2722,7 @@ func getBoolParam(url *url.URL, name string, ifEmpty bool) bool {
 	}
 
 	for _, x := range p {
-		if strings.ToLower(x) == "true" {
+		if strings.EqualFold(x, "true") {
 			return true
 		}
 	}
