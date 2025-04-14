@@ -6,7 +6,7 @@ jobs:
 
   build:
     name: Build
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     steps:
     - name: Check out code
       uses: actions/checkout@v4
@@ -20,7 +20,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     steps:
     - name: Check out code
       uses: actions/checkout@v4
@@ -30,7 +30,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     steps:
     - name: Check out code
       uses: actions/checkout@v4
