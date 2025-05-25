@@ -2,7 +2,7 @@
 
 VERSION ?= 0.9
 GO_VERSION := 1.24.3
-GOLANGCI_LINT_VERSION := v1.64.5
+GOLANGCI_LINT_VERSION := v2.1.6
 REPO ?= openpolicyagent/opa-docker-authz-v2
 
 REGAL_FORMAT ?= pretty

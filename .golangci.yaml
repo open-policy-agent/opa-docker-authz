@@ -1,25 +1,37 @@
-run:
-  timeout: 5m
-
-linter-settings:
-  lll:
-    line-length: 200
-
-  misspell:
-    locale: US
-
+version: "2"
 linters:
-  disable-all: true
+  default: none
   enable:
-  - errcheck
-  - govet
-  - ineffassign
-  - revive # replacement for golint
-  - gofmt
-  - goimports
-  - unused
-  - misspell
-  - typecheck
-  - staticcheck
-  - gosimple
-  # - gosec # too many false positives
+    - errcheck
+    - govet
+    - ineffassign
+    - misspell
+    - revive
+    - staticcheck
+    - unused
+  settings:
+    lll:
+      line-length: 200
+    misspell:
+      locale: US
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
