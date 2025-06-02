@@ -39,6 +39,9 @@ jobs:
           REPO=${{ env.REPO }} VERSION=${{ env.TAG_NAME }} make plugin
           docker plugin push "${{ env.REPO }}:${{ env.TAG_NAME }}-linux-amd64"
           docker plugin push "${{ env.REPO }}:${{ env.TAG_NAME }}-linux-arm64"
+          docker plugin push "${{ env.REPO }}:${{ env.TAG_NAME }}-darwin-amd64"
+          docker plugin push "${{ env.REPO }}:${{ env.TAG_NAME }}-darwin-arm64"
+          docker plugin push "${{ env.REPO }}:${{ env.TAG_NAME }}-windows-amd64"
           docker plugin push "${{ env.REPO }}:${{ env.TAG_NAME }}"
 
           # docker does not currently support multi-arch plugins so we cannot create a list manifest
