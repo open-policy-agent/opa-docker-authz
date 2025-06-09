@@ -4,7 +4,7 @@ go 1.24.3
 
 require (
 	github.com/docker/go-plugins-helpers v0.0.0-20240701071450-45e2431495c8
-	github.com/open-policy-agent/opa v1.5.0
+	github.com/open-policy-agent/opa v1.5.1
 )
 
 require (
