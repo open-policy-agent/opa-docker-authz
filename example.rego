@@ -20,7 +20,15 @@ package docker.authz
 allow if {
 	not invalid_network
 	not seccomp_unconfined
+	valid_image
 	valid_user_role
+}
+
+create_container if {
+	input.Method == "POST"
+
+	# Use glob to match all versions of the docker api
+	glob.match("/**/containers/create", ["/"], input.Path)
 }
 
 invalid_network if {
@@ -35,8 +43,7 @@ invalid_network if {
 }
 
 seccomp_unconfined if {
-	# Use glob to match all versions of the docker api
-	glob.match("/**/containers/create", ["/"], input.Path)
+	create_container
 
 	# This expression asserts that the string on the right hand side exists
 	# within the array SecurityOpt referenced on the left hand side.
@@ -73,4 +80,18 @@ user := users[input.Headers["Authz-User"]]
 users := {
 	"bob": {"readOnly": true},
 	"alice": {"readOnly": false},
+}
+
+allowed_registries := ["public.ecr.aws/"]
+
+allowed_images := ["busybox"]
+
+valid_image if {
+	create_container
+	strings.any_prefix_match(input.Body.Image, allowed_registries)
+}
+
+valid_image if {
+	create_container
+	input.Body.Image in allowed_images
 }
