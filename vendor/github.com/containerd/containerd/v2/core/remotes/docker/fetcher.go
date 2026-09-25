@@ -26,7 +26,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -217,6 +216,40 @@ type dockerFetcher struct {
 	*dockerBase
 }
 
+func stripSensitiveHeadersForExternalURLs(h http.Header) {
+	h.Del("Authorization")
+	h.Del("Proxy-Authorization")
+	h.Del("Cookie")
+	h.Del("Cookie2")
+}
+
+func effectivePort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
+}
+
+func isRegistryOrigin(u *url.URL, hosts []RegistryHost) bool {
+	for _, host := range hosts {
+		if !strings.EqualFold(u.Scheme, host.Scheme) {
+			continue
+		}
+		hostURL := &url.URL{Scheme: host.Scheme, Host: host.Host}
+		if strings.EqualFold(u.Hostname(), hostURL.Hostname()) && effectivePort(u) == effectivePort(hostURL) {
+			return true
+		}
+	}
+	return false
+}
+
 func (r dockerFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error) {
 	ctx = log.WithLogger(ctx, log.G(ctx).WithField("digest", desc.Digest))
 
@@ -254,13 +287,15 @@ func (r dockerFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) (io.R
 				Capabilities: HostCapabilityPull,
 			}
 			req := r.request(host, http.MethodGet)
-			// Strip namespace from base
+			if !isRegistryOrigin(u, hosts) {
+				stripSensitiveHeadersForExternalURLs(req.header)
+			}
 			req.path = u.Path
 			if u.RawQuery != "" {
 				req.path = req.path + "?" + u.RawQuery
 			}
 
-			rc, err := r.open(ctx, req, desc.MediaType, offset, false)
+			rc, _, err := r.open(ctx, req, desc.MediaType, offset, false)
 			if err != nil {
 				if errdefs.IsNotFound(err) {
 					continue // try one of the other urls.
@@ -282,7 +317,7 @@ func (r dockerFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) (io.R
 					return nil, err
 				}
 
-				rc, err := r.open(ctx, req, desc.MediaType, offset, i == len(r.hosts)-1)
+				rc, _, err := r.open(ctx, req, desc.MediaType, offset, i == len(r.hosts)-1)
 				if err != nil {
 					// Store the error for referencing later
 					if firstErr == nil {
@@ -305,7 +340,7 @@ func (r dockerFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) (io.R
 				return nil, err
 			}
 
-			rc, err := r.open(ctx, req, desc.MediaType, offset, i == len(r.hosts)-1)
+			rc, _, err := r.open(ctx, req, desc.MediaType, offset, i == len(r.hosts)-1)
 			if err != nil {
 				// Store the error for referencing later
 				if firstErr == nil {
@@ -419,8 +454,9 @@ func (r dockerFetcher) FetchByDigest(ctx context.Context, dgst digest.Digest, op
 		return nil, desc, firstErr
 	}
 
-	seeker, err := newHTTPReadSeeker(sz, func(offset int64) (io.ReadCloser, error) {
-		return r.open(ctx, getReq, config.Mediatype, offset, true)
+	seeker, err := newHTTPReadSeeker(sz, func(offset int64) (rc io.ReadCloser, err error) {
+		rc, _, err = r.open(ctx, getReq, config.Mediatype, offset, true)
+		return
 	})
 	if err != nil {
 		return nil, desc, err
@@ -437,7 +473,7 @@ func (r dockerFetcher) FetchByDigest(ctx context.Context, dgst digest.Digest, op
 	return seeker, desc, nil
 }
 
-func (r dockerFetcher) open(ctx context.Context, req *request, mediatype string, offset int64, lastHost bool) (_ io.ReadCloser, retErr error) {
+func (r dockerFetcher) open(ctx context.Context, req *request, mediatype string, offset int64, lastHost bool) (_ io.ReadCloser, _ int64, retErr error) {
 	const minChunkSize = 512
 
 	chunkSize := int64(r.performances.ConcurrentLayerFetchBuffer)
@@ -457,29 +493,42 @@ func (r dockerFetcher) open(ctx context.Context, req *request, mediatype string,
 	}
 
 	if err := r.Acquire(ctx, 1); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	resp, err := req.doWithRetries(ctx, lastHost, withErrorCheck, withOffsetCheck(offset))
+	var remaining int64
+	resp, err := req.doWithRetries(ctx, lastHost, withErrorCheck, withOffsetCheck(offset, parallelism))
 	switch err {
 	case nil:
 		// all good
+		remaining = resp.ContentLength
 	case errContentRangeIgnored:
 		if parallelism != 1 {
 			log.G(ctx).WithError(err).Info("remote host ignored content range, forcing parallelism to 1")
 			parallelism = 1
 		}
+		remaining = resp.ContentLength - offset
 	default:
 		log.G(ctx).WithError(err).Debug("fetch failed")
 		r.Release(1)
-		return nil, err
+		return nil, 0, err
 	}
 
-	body := resp.Body
+	body := &fnOnClose{
+		BeforeClose: func() {
+			r.Release(1)
+		},
+		ReadCloser: resp.Body,
+	}
+	defer func() {
+		if retErr != nil {
+			body.Close()
+		}
+	}()
+
 	encoding := strings.FieldsFunc(resp.Header.Get("Content-Encoding"), func(r rune) bool {
 		return r == ' ' || r == '\t' || r == ','
 	})
 
-	remaining, _ := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 0)
 	if remaining <= chunkSize {
 		parallelism = 1
 	}
@@ -505,29 +554,33 @@ func (r dockerFetcher) open(ctx context.Context, req *request, mediatype string,
 		for i := range numChunks {
 			readers[i], writers[i] = newPipeWriter(bufPool)
 		}
+		// keep reference of the initial body value to ensure it is closed
+		ibody := body
 		go func() {
 			for i := range numChunks {
 				select {
 				case queue <- i:
 				case <-done:
+					if i == 0 {
+						ibody.Close()
+					}
 					return // avoid leaking a goroutine if we exit early.
 				}
 			}
 			close(queue)
 		}()
-		r.Release(1)
 		for range parallelism {
 			go func() {
 				for i := range queue { // first in first out
 					copy := func() error {
-						if err := r.Acquire(ctx, 1); err != nil {
-							return err
-						}
-						defer r.Release(1)
 						var body io.ReadCloser
 						if i == 0 {
-							body = resp.Body
+							body = ibody
 						} else {
+							if err := r.Acquire(ctx, 1); err != nil {
+								return err
+							}
+							defer r.Release(1)
 							reqClone := req.clone()
 							reqClone.setOffset(offset + i*chunkSize)
 							nresp, err := reqClone.doWithRetries(ctx, lastHost, withErrorCheck)
@@ -564,40 +617,35 @@ func (r dockerFetcher) open(ctx context.Context, req *request, mediatype string,
 			},
 			ReadCloser: io.NopCloser(io.MultiReader(readers...)),
 		}
-	} else {
-		body = &fnOnClose{
-			BeforeClose: func() {
-				r.Release(1)
-			},
-			ReadCloser: body,
-		}
 	}
+
 	for i := len(encoding) - 1; i >= 0; i-- {
 		algorithm := strings.ToLower(encoding[i])
 		switch algorithm {
 		case "zstd":
-			r, err := zstd.NewReader(body,
+			r, err := zstd.NewReader(body.ReadCloser,
 				zstd.WithDecoderLowmem(false),
 			)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
-			body = r.IOReadCloser()
+			body.ReadCloser = r.IOReadCloser()
 		case "gzip":
-			body, err = gzip.NewReader(body)
+			r, err := gzip.NewReader(body.ReadCloser)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
+			body.ReadCloser = r
 		case "deflate":
-			body = flate.NewReader(body)
+			body.ReadCloser = flate.NewReader(body.ReadCloser)
 		case "identity", "":
 			// no content-encoding applied, use raw body
 		default:
-			return nil, errors.New("unsupported Content-Encoding algorithm: " + algorithm)
+			return nil, 0, errors.New("unsupported Content-Encoding algorithm: " + algorithm)
 		}
 	}
 
-	return body, nil
+	return body, remaining, nil
 }
 
 type fnOnClose struct {
