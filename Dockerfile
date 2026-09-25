@@ -1,11 +1,9 @@
-FROM alpine:latest as certs
+FROM --platform=$BUILDPLATFORM alpine:latest AS certs
 RUN apk --update add ca-certificates
 
 FROM scratch
 ARG TARGETOS
 ARG TARGETARCH
-
-LABEL maintainer="Torin Sandall <torinsandall@gmail.com>"
 
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
