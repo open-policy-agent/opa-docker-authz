@@ -10,10 +10,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"slices"
-	"sort"
 	"strings"
+	"sync"
 
 	"github.com/open-policy-agent/opa/internal/semver"
 	"github.com/open-policy-agent/opa/internal/wasm/sdk/opa/capabilities"
@@ -38,14 +39,15 @@ type VersionIndex struct {
 //go:embed version_index.json
 var versionIndexBs []byte
 
-var minVersionIndex = func() VersionIndex {
+// init only on demand, as JSON unmarshalling comes with some cost, and contributes
+// noise to things like pprof stats
+var minVersionIndexOnce = sync.OnceValue(func() VersionIndex {
 	var vi VersionIndex
-	err := json.Unmarshal(versionIndexBs, &vi)
-	if err != nil {
+	if err := json.Unmarshal(versionIndexBs, &vi); err != nil {
 		panic(err)
 	}
 	return vi
-}()
+})
 
 // In the compiler, we used this to check that we're OK working with ref heads.
 // If this isn't present, we'll fail. This is to ensure that older versions of
@@ -56,12 +58,14 @@ const FeatureRefHeads = "rule_head_refs"
 const FeatureRegoV1 = "rego_v1"
 const FeatureRegoV1Import = "rego_v1_import"
 const FeatureKeywordsInRefs = "keywords_in_refs"
+const FeatureTemplateStrings = "template_strings"
 
 // Features carries the default features supported by this version of OPA.
 // Use RegisterFeatures to add to them.
 var Features = []string{
 	FeatureRegoV1,
 	FeatureKeywordsInRefs,
+	FeatureTemplateStrings,
 }
 
 // RegisterFeatures lets applications wrapping OPA register features, to be
@@ -93,7 +97,6 @@ type Capabilities struct {
 	// As of now, this only controls fetching remote refs for using JSON Schemas in
 	// the type checker.
 	// TODO(sr): support ports to further restrict connection peers
-	// TODO(sr): support restricting `http.send` using the same mechanism (see https://github.com/open-policy-agent/opa/issues/3665)
 	AllowNet []string `json:"allow_net,omitempty"`
 }
 
@@ -105,7 +108,8 @@ type WasmABIVersion struct {
 }
 
 type CapabilitiesOptions struct {
-	regoVersion RegoVersion
+	regoVersion          RegoVersion
+	experimentalKeywords bool
 }
 
 func newCapabilitiesOptions(opts []CapabilitiesOption) CapabilitiesOptions {
@@ -121,6 +125,21 @@ type CapabilitiesOption func(*CapabilitiesOptions)
 func CapabilitiesRegoVersion(regoVersion RegoVersion) CapabilitiesOption {
 	return func(o *CapabilitiesOptions) {
 		o.regoVersion = regoVersion
+	}
+}
+
+// CapabilitiesExperimentalKeywords controls whether experimental future
+// keywords are included in the returned capabilities. When enabled, the
+// future_keywords list will include keywords that are recognized by the
+// parser but are not yet ready for general use.
+//
+// Experimental keywords are subject to change or removal without notice and
+// are not covered by OPA's compatibility guarantees. Enable this option only
+// when you intentionally want to opt in to in-progress language features
+// (for example, when writing tests for those features).
+func CapabilitiesExperimentalKeywords(yes bool) CapabilitiesOption {
+	return func(o *CapabilitiesOptions) {
+		o.experimentalKeywords = yes
 	}
 }
 
@@ -144,6 +163,9 @@ func CapabilitiesForThisVersion(opts ...CapabilitiesOption) *Capabilities {
 	switch co.regoVersion {
 	case RegoV0, RegoV0CompatV1:
 		for kw := range allFutureKeywords {
+			if _, internal := experimentalFutureKeywords[kw]; internal && !co.experimentalKeywords {
+				continue
+			}
 			f.FutureKeywords = append(f.FutureKeywords, kw)
 		}
 
@@ -156,6 +178,9 @@ func CapabilitiesForThisVersion(opts ...CapabilitiesOption) *Capabilities {
 		}
 	default:
 		for kw := range futureKeywords {
+			if _, internal := experimentalFutureKeywords[kw]; internal && !co.experimentalKeywords {
+				continue
+			}
 			f.FutureKeywords = append(f.FutureKeywords, kw)
 		}
 
@@ -163,8 +188,8 @@ func CapabilitiesForThisVersion(opts ...CapabilitiesOption) *Capabilities {
 		copy(f.Features, Features)
 	}
 
-	sort.Strings(f.FutureKeywords)
-	sort.Strings(f.Features)
+	slices.Sort(f.FutureKeywords)
+	slices.Sort(f.Features)
 
 	return f
 }
@@ -214,23 +239,15 @@ func LoadCapabilitiesVersions() ([]string, error) {
 		return nil, err
 	}
 
-	capabilitiesVersions := make([]string, 0, len(ents))
-	for _, ent := range ents {
-		capabilitiesVersions = append(capabilitiesVersions, strings.Replace(ent.Name(), ".json", "", 1))
-	}
-	return capabilitiesVersions, nil
+	return util.SortedStableFunc(util.Map(ents, removeJsonSuffix), semver.Compare), nil
 }
 
 // MinimumCompatibleVersion returns the minimum compatible OPA version based on
 // the built-ins, features, and keywords in c.
 func (c *Capabilities) MinimumCompatibleVersion() (string, bool) {
-
-	var maxVersion semver.Version
-
 	// this is the oldest OPA release that includes capabilities
-	if err := maxVersion.Set("0.17.0"); err != nil {
-		panic("unreachable")
-	}
+	maxVersion := semver.MustParse("0.17.0")
+	minVersionIndex := minVersionIndexOnce()
 
 	for _, bi := range c.Builtins {
 		v, ok := minVersionIndex.Builtins[bi.Name]
@@ -269,17 +286,31 @@ func (c *Capabilities) ContainsFeature(feature string) bool {
 	return slices.Contains(c.Features, feature)
 }
 
+func (c *Capabilities) ContainsBuiltin(name string) bool {
+	return slices.ContainsFunc(c.Builtins, func(builtin *Builtin) bool {
+		return builtin.Name == name
+	})
+}
+
+func (c *Capabilities) ContainsFutureKeyword(kw string) bool {
+	return slices.Contains(c.FutureKeywords, kw)
+}
+
 // addBuiltinSorted inserts a built-in into c in sorted order. An existing built-in with the same name
 // will be overwritten.
 func (c *Capabilities) addBuiltinSorted(bi *Builtin) {
-	i := sort.Search(len(c.Builtins), func(x int) bool {
-		return c.Builtins[x].Name >= bi.Name
-	})
-	if i < len(c.Builtins) && bi.Name == c.Builtins[i].Name {
-		c.Builtins[i] = bi
-		return
+	i, found := slices.BinarySearchFunc(c.Builtins, bi, cmpBuiltinName)
+	if !found {
+		c.Builtins = append(c.Builtins, nil)
+		copy(c.Builtins[i+1:], c.Builtins[i:])
 	}
-	c.Builtins = append(c.Builtins, nil)
-	copy(c.Builtins[i+1:], c.Builtins[i:])
 	c.Builtins[i] = bi
+}
+
+func cmpBuiltinName(a, b *Builtin) int {
+	return strings.Compare(a.Name, b.Name)
+}
+
+func removeJsonSuffix(ent fs.DirEntry) string {
+	return strings.Replace(ent.Name(), ".json", "", 1)
 }

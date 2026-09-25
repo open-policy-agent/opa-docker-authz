@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/open-policy-agent/opa/v1/ast"
+	"github.com/open-policy-agent/opa/v1/util"
 )
 
 // saveSet contains a stack of terms that are considered 'unknown' during
@@ -183,40 +184,33 @@ func (sse *saveSetElem) containsVar(t *ast.Term, b *bindings) bool {
 // partially evaluated. In this case, the partially evaluated rule will be
 // output in the support module.
 type saveStack struct {
-	Stack []saveStackQuery
+	Stack util.GroupStack[saveStackElem]
 }
 
 func newSaveStack() *saveStack {
-	return &saveStack{
-		Stack: []saveStackQuery{
-			{},
-		},
-	}
+	s := &saveStack{}
+	s.Stack.PushGroup(nil)
+	return s
 }
 
 func (s *saveStack) PushQuery(query saveStackQuery) {
-	s.Stack = append(s.Stack, query)
+	s.Stack.PushGroup(query)
 }
 
 func (s *saveStack) PopQuery() saveStackQuery {
-	last := s.Stack[len(s.Stack)-1]
-	s.Stack = s.Stack[:len(s.Stack)-1]
-	return last
+	return s.Stack.PopGroup()
 }
 
 func (s *saveStack) Peek() saveStackQuery {
-	return s.Stack[len(s.Stack)-1]
+	return s.Stack.PeekGroup()
 }
 
 func (s *saveStack) Push(expr *ast.Expr, b1 *bindings, b2 *bindings) {
-	idx := len(s.Stack) - 1
-	s.Stack[idx] = append(s.Stack[idx], saveStackElem{expr, b1, b2})
+	s.Stack.Push(saveStackElem{expr, b1, b2})
 }
 
 func (s *saveStack) Pop() {
-	idx := len(s.Stack) - 1
-	query := s.Stack[idx]
-	s.Stack[idx] = query[:len(query)-1]
+	s.Stack.Pop()
 }
 
 type saveStackQuery []saveStackElem
@@ -298,7 +292,7 @@ func (s *saveSupport) Exists(path ast.Ref) bool {
 	if len(ruleRef) == 1 {
 		name := ruleRef[0].Value.(ast.Var)
 		for _, rule := range module.Rules {
-			if rule.Head.Name.Equal(name) {
+			if rule.Head.Name == name {
 				return true
 			}
 		}
@@ -357,7 +351,7 @@ func splitPackageAndRule(path ast.Ref) (ast.Ref, ast.Ref) {
 // being saved. This check allows the evaluator to evaluate statements
 // completely during partial evaluation as long as they do not depend on any
 // kind of unknown value or statements that would generate saves.
-func saveRequired(c *ast.Compiler, ic *inliningControl, icIgnoreInternal bool, ss *saveSet, b *bindings, x any, rec bool) bool {
+func saveRequired(compilerTree *ast.TreeNode, extStack *externalTreeStack, ic *inliningControl, icIgnoreInternal bool, ss *saveSet, b *bindings, x any, rec bool) bool {
 
 	var found bool
 
@@ -389,12 +383,17 @@ func saveRequired(c *ast.Compiler, ic *inliningControl, icIgnoreInternal bool, s
 				} else if ic.Disabled(v.ConstantPrefix(), icIgnoreInternal) {
 					found = true
 				} else {
-					for _, rule := range c.GetRulesDynamicWithOpts(v, ast.RulesOptions{IncludeHiddenModules: false}) {
-						if saveRequired(c, ic, icIgnoreInternal, ss, b, rule, true) {
-							found = true
-							break
-						}
+					// Only terms from the call site can be plugged: once traversal
+					// recurses into a rule, that rule's variables belong to another
+					// binding list and could resolve to unrelated values in b.
+					lookup := v
+					if !rec {
+						lookup = plugRefForRuleLookup(v, b)
 					}
+					found = anyRuleDynamic(compilerTree, extStack, lookup, ast.RulesOptions{IncludeHiddenModules: false},
+						func(rule *ast.Rule) bool {
+							return saveRequired(compilerTree, extStack, ic, icIgnoreInternal, ss, b, rule, true)
+						})
 				}
 			}
 		}
@@ -404,6 +403,119 @@ func saveRequired(c *ast.Compiler, ic *inliningControl, icIgnoreInternal bool, s
 	vis.Walk(x)
 
 	return found
+}
+
+// plugRefForRuleLookup replaces variables in ref that are bound to a scalar with
+// that value, narrowing rule lookup to the sub-tree that will actually be
+// evaluated. Positions left as-is, because they are unbound or bound to a
+// composite, fan out over all children as before.
+func plugRefForRuleLookup(ref ast.Ref, b *bindings) ast.Ref {
+	if b == nil {
+		return ref
+	}
+
+	cpy := ref
+
+	for i := 1; i < len(ref); i++ {
+		if _, ok := ref[i].Value.(ast.Var); !ok {
+			continue
+		}
+		plugged := b.Plug(ref[i])
+		if !ast.IsScalar(plugged.Value) {
+			continue
+		}
+		if len(cpy) == len(ref) && &cpy[0] == &ref[0] {
+			cpy = make(ast.Ref, len(ref))
+			copy(cpy, ref)
+		}
+		cpy[i] = plugged
+	}
+
+	return cpy
+}
+
+// anyRuleDynamic invokes f for the rules matching ref in the external trees and
+// the compiler tree, stopping as soon as f returns true. Rules are streamed to f
+// rather than collected so that callers only interested in whether *some* rule
+// satisfies a predicate don't pay for walking the whole matching sub-tree, which
+// for refs with non-constant elements can mean every rule loaded.
+func anyRuleDynamic(compilerTree *ast.TreeNode, extStack *externalTreeStack, ref ast.Ref, opts ast.RulesOptions, f func(*ast.Rule) bool) bool {
+	// Check external trees
+	if extStack != nil {
+		for i := range extStack.entries {
+			entry := &extStack.entries[i]
+			if entry.tree != nil && ref.HasPrefix(entry.ref) {
+				// Navigate into the external tree using the remaining path
+				remaining := ref[len(entry.ref):]
+				if anyRuleFromTree(entry.tree, remaining, opts, f) {
+					return true
+				}
+			}
+		}
+	}
+
+	// Then check compiler tree
+	return anyRuleFromTree(compilerTree, ref, opts, f)
+}
+
+// anyRuleFromTree walks a tree to find rules matching the given ref, invoking f
+// for each and stopping early if f returns true.
+func anyRuleFromTree(node *ast.TreeNode, ref ast.Ref, opts ast.RulesOptions, f func(*ast.Rule) bool) bool {
+	var walk func(*ast.TreeNode, int) bool
+	walk = func(nav *ast.TreeNode, i int) bool {
+		switch {
+		case i >= len(ref):
+			// The rules on nav itself have already been passed to f by the caller,
+			// unless nav is where the walk started.
+			return anyRuleDescendant(nav, opts, f, i == 0)
+
+		case i == 0 || ast.IsConstant(ref[i].Value):
+			child := nav.Child(ref[i].Value)
+			if child == nil {
+				return false
+			}
+			return anyRule(child.Values, f) || walk(child, i+1)
+
+		default:
+			for _, child := range nav.Children {
+				if child.Hide && !opts.IncludeHiddenModules {
+					continue
+				}
+				if anyRule(child.Values, f) || walk(child, i+1) {
+					return true
+				}
+			}
+			return false
+		}
+	}
+
+	return walk(node, 0)
+}
+
+// anyRuleDescendant invokes f for every rule in node's sub-tree, stopping early
+// if f returns true. The rules on node itself are only visited if visitSelf is
+// set. Hidden nodes are not descended into unless opts.IncludeHiddenModules is
+// set.
+func anyRuleDescendant(node *ast.TreeNode, opts ast.RulesOptions, f func(*ast.Rule) bool, visitSelf bool) bool {
+	if visitSelf && anyRule(node.Values, f) {
+		return true
+	}
+
+	if node.Hide && !opts.IncludeHiddenModules {
+		return false
+	}
+
+	for _, child := range node.Children {
+		if anyRuleDescendant(child, opts, f, true) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func anyRule(rules []*ast.Rule, f func(*ast.Rule) bool) bool {
+	return slices.ContainsFunc(rules, f)
 }
 
 func ignoreExprDuringPartial(expr *ast.Expr) bool {
@@ -515,7 +627,7 @@ func (i *inliningControl) DisabledVar(v ast.Var, ignoreInternal bool) bool {
 	}
 
 	for _, frame := range i.disable {
-		if (!frame.internal || !ignoreInternal) && frame.v.Equal(v) {
+		if (!frame.internal || !ignoreInternal) && frame.v == v {
 			return true
 		}
 	}

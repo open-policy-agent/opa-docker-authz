@@ -10,7 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
+	"log/slog"
 	"math/rand"
 	"net/url"
 	"reflect"
@@ -18,8 +18,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/time/rate"
 
 	"github.com/open-policy-agent/opa/internal/ref"
 	"github.com/open-policy-agent/opa/v1/ast"
@@ -34,6 +32,8 @@ import (
 	"github.com/open-policy-agent/opa/v1/storage"
 	"github.com/open-policy-agent/opa/v1/util"
 )
+
+const DecisionLogType = "openpolicyagent.org/decision_logs"
 
 // Logger defines the interface for decision logging plugins.
 type Logger interface {
@@ -68,6 +68,7 @@ type EventV1 struct {
 	Timestamp           time.Time               `json:"timestamp"`
 	Metrics             map[string]any          `json:"metrics,omitempty"`
 	RequestID           uint64                  `json:"req_id,omitempty"`
+	RuleLabels          []map[string]any        `json:"rule_labels,omitempty"`
 	RequestContext      *RequestContext         `json:"request_context,omitempty"`
 	Custom              map[string]any          `json:"custom,omitempty"`
 
@@ -207,6 +208,13 @@ func (e *EventV1) AST() (ast.Value, error) {
 
 	if len(e.RequestedBy) > 0 {
 		event.Insert(ast.InternedTerm("requested_by"), ast.StringTerm(e.RequestedBy))
+	}
+
+	if len(e.RuleLabels) > 0 {
+		v, err := ast.InterfaceToValue(e.RuleLabels)
+		if err == nil {
+			event.Insert(ast.InternedTerm("rule_labels"), ast.NewTerm(v))
+		}
 	}
 
 	// Use the timestamp JSON marshaller to ensure the format is the same as
@@ -455,25 +463,31 @@ func (c *Config) validateAndInjectDefaults(services []string, pluginsList []stri
 	return nil
 }
 
+type buffer interface {
+	Name() string
+	Push(*EventV1)
+	Upload(context.Context) error
+	WithMetrics(metrics.Metrics)
+	Stop(context.Context)
+	Flush() []*EventV1
+}
+
 // Plugin implements decision log buffering and uploading.
 type Plugin struct {
 	manager       *plugins.Manager
 	config        Config
-	runningBuffer string
 	reconfigMtx   sync.RWMutex // reconfigMtx blocks reads/writes on buffer reconfiguration
-	eventBuffer   *eventBuffer
-	buffer        *logBuffer
-	enc           *chunkEncoder
-	mtx           sync.Mutex
+	b             buffer
 	statusMtx     sync.Mutex
 	stop          chan chan struct{}
 	reconfig      chan reconfigure
 	preparedMask  prepareOnce
 	preparedDrop  prepareOnce
-	limiter       *rate.Limiter
 	metrics       metrics.Metrics
 	logger        logging.Logger
 	status        *lstat.Status
+	cachedSlogger *slog.Logger
+	sloggerMtx    sync.RWMutex
 }
 
 type prepareOnce struct {
@@ -584,12 +598,10 @@ func (b *ConfigBuilder) Parse() (*Config, error) {
 
 // New returns a new Plugin with the given config.
 func New(parsedConfig *Config, manager *plugins.Manager) *Plugin {
-
 	plugin := &Plugin{
 		manager:      manager,
 		config:       *parsedConfig,
 		stop:         make(chan chan struct{}),
-		enc:          newChunkEncoder(*parsedConfig.Reporting.UploadSizeLimitBytes),
 		reconfig:     make(chan reconfigure),
 		logger:       manager.Logger().WithFields(map[string]any{"plugin": Name}),
 		status:       &lstat.Status{},
@@ -597,25 +609,23 @@ func New(parsedConfig *Config, manager *plugins.Manager) *Plugin {
 		preparedMask: *newPrepareOnce(),
 	}
 
-	plugin.enc.WithLogger(plugin.logger)
-
 	switch parsedConfig.Reporting.BufferType {
 	case eventBufferType:
-		plugin.eventBuffer = newEventBuffer(
+		plugin.b = newEventBuffer(
 			*parsedConfig.Reporting.BufferSizeLimitEvents,
+			*parsedConfig.Reporting.UploadSizeLimitBytes,
 			plugin.manager.Client(plugin.config.Service),
 			*parsedConfig.Resource,
-			*parsedConfig.Reporting.UploadSizeLimitBytes,
-		).WithLogger(plugin.logger).WithMetrics(plugin.metrics)
-		plugin.runningBuffer = eventBufferType
+			*parsedConfig.Reporting.Trigger,
+		).WithLogger(plugin.logger).WithLimiter(parsedConfig.Reporting.MaxDecisionsPerSecond)
 	case sizeBufferType:
-		plugin.buffer = newLogBuffer(*parsedConfig.Reporting.BufferSizeLimitBytes)
-		plugin.runningBuffer = sizeBufferType
-	}
-
-	if parsedConfig.Reporting.MaxDecisionsPerSecond != nil {
-		limit := *parsedConfig.Reporting.MaxDecisionsPerSecond
-		plugin.limiter = rate.NewLimiter(rate.Limit(limit), int(math.Max(1, limit)))
+		plugin.b = newSizeBuffer(
+			*parsedConfig.Reporting.BufferSizeLimitBytes,
+			*parsedConfig.Reporting.UploadSizeLimitBytes,
+			plugin.manager.Client(plugin.config.Service),
+			*parsedConfig.Resource,
+			*parsedConfig.Reporting.Trigger,
+		).WithLogger(plugin.logger).WithLimiter(parsedConfig.Reporting.MaxDecisionsPerSecond)
 	}
 
 	manager.RegisterCompilerTrigger(plugin.compilerUpdated)
@@ -628,7 +638,7 @@ func New(parsedConfig *Config, manager *plugins.Manager) *Plugin {
 // WithMetrics sets the global metrics provider to be used by the plugin.
 func (p *Plugin) WithMetrics(m metrics.Metrics) *Plugin {
 	p.metrics = m
-	p.enc.WithMetrics(m)
+	p.b.WithMetrics(m)
 	return p
 }
 
@@ -654,8 +664,9 @@ func (p *Plugin) Start(_ context.Context) error {
 // Stop stops the plugin.
 func (p *Plugin) Stop(ctx context.Context) {
 	p.logger.Info("Stopping decision logger.")
+	p.b.Stop(ctx)
 
-	if *p.config.Reporting.Trigger == plugins.TriggerPeriodic {
+	if *p.config.Reporting.Trigger == plugins.TriggerPeriodic || *p.config.Reporting.Trigger == plugins.TriggerImmediate {
 		if _, ok := ctx.Deadline(); ok && p.config.Service != "" {
 			p.flushDecisions(ctx)
 		}
@@ -679,7 +690,7 @@ func (p *Plugin) flushDecisions(ctx context.Context) {
 
 	go func(ctx context.Context, done chan bool) {
 		for ctx.Err() == nil {
-			if err := p.oneShot(ctx); err != nil && !errors.Is(err, &bufferEmpty{}) {
+			if err := p.b.Upload(ctx); err != nil && !errors.Is(err, &bufferEmpty{}) {
 				p.logger.Error("Error flushing decisions: %s", err)
 				// Wait some before retrying, but skip incrementing interval since we are shutting down
 				time.Sleep(1 * time.Second)
@@ -726,6 +737,7 @@ func (p *Plugin) Log(ctx context.Context, decision *server.Info) error {
 		RequestedBy:         decision.RemoteAddr,
 		Timestamp:           decision.Timestamp,
 		RequestID:           decision.RequestID,
+		RuleLabels:          decision.EvaluatedRuleLabels,
 		inputAST:            decision.InputAST,
 		Custom:              decision.Custom,
 	}
@@ -771,7 +783,6 @@ func (p *Plugin) Log(ctx context.Context, decision *server.Info) error {
 	}
 
 	if err := p.maskEvent(ctx, decision.Txn, input, &event); err != nil {
-		// TODO(tsandall): see note below about error handling.
 		p.logger.Error("Log event masking failed: %v.", err)
 		return nil
 	}
@@ -783,18 +794,62 @@ func (p *Plugin) Log(ctx context.Context, decision *server.Info) error {
 	}
 
 	if p.config.Service != "" {
-		p.encodeAndBufferEvent(event)
+		p.push(event)
 	}
 
 	if p.config.Plugin != nil {
-		proxy, ok := p.manager.Plugin(*p.config.Plugin).(Logger)
-		if !ok {
-			return errors.New("plugin does not implement Logger interface")
+		plugin := p.manager.Plugin(*p.config.Plugin)
+		if plugin == nil {
+			return fmt.Errorf("plugin %q not found", *p.config.Plugin)
 		}
-		return proxy.Log(ctx, event)
+
+		switch l := plugin.(type) {
+		case Logger:
+			return l.Log(ctx, event)
+		case plugins.LoggerPlugin:
+			logger, err := p.getSlogLogger(l)
+			if err != nil {
+				return err
+			}
+			logger.LogAttrs(ctx, slog.LevelInfo, "Decision Log", eventToAttrs(event)...)
+			return nil
+		}
+
+		return fmt.Errorf("plugin %q does not implement Logger or LoggerPlugin interface", *p.config.Plugin)
 	}
 
 	return nil
+}
+
+func (p *Plugin) getSlogLogger(l plugins.LoggerPlugin) (*slog.Logger, error) {
+	p.sloggerMtx.RLock()
+	if p.cachedSlogger != nil {
+		logger := p.cachedSlogger
+		p.sloggerMtx.RUnlock()
+		return logger, nil
+	}
+	p.sloggerMtx.RUnlock()
+
+	p.sloggerMtx.Lock()
+	defer p.sloggerMtx.Unlock()
+
+	if p.cachedSlogger != nil {
+		return p.cachedSlogger, nil
+	}
+
+	handler := l.Logger()
+	if handler == nil {
+		return nil, fmt.Errorf("plugin %q returned nil logger", *p.config.Plugin)
+	}
+
+	p.cachedSlogger = slog.New(handler)
+	return p.cachedSlogger, nil
+}
+
+func (p *Plugin) clearSlogCache() {
+	p.sloggerMtx.Lock()
+	p.cachedSlogger = nil
+	p.sloggerMtx.Unlock()
 }
 
 // Reconfigure notifies the plugin with a new configuration.
@@ -805,8 +860,10 @@ func (p *Plugin) Reconfigure(_ context.Context, config any) {
 
 	p.preparedMask.drop()
 	p.preparedDrop.drop()
+	p.clearSlogCache()
 
 	<-done
+	go p.loop()
 }
 
 // Trigger can be used to control when the plugin attempts to upload
@@ -850,7 +907,9 @@ func (p *Plugin) loop() {
 	for {
 		var waitC chan struct{}
 
-		if *p.config.Reporting.Trigger == plugins.TriggerPeriodic && p.config.Service != "" {
+		if (*p.config.Reporting.Trigger == plugins.TriggerPeriodic || *p.config.Reporting.Trigger == plugins.TriggerImmediate) && p.config.Service != "" {
+			p.reconfigMtx.RLock()
+
 			err := p.doOneShot(ctx)
 
 			var delay time.Duration
@@ -863,11 +922,13 @@ func (p *Plugin) loop() {
 				delay = util.DefaultBackoff(float64(minRetryDelay), float64(*p.config.Reporting.MaxDelaySeconds), retry)
 			}
 
+			p.reconfigMtx.RUnlock()
+
 			p.logger.Debug("Waiting %v before next upload/retry.", delay)
 
 			waitC = make(chan struct{})
 			go func() {
-				timer, timerCancel := util.TimerWithCancel(delay)
+				timer := time.NewTimer(delay)
 				select {
 				case <-timer.C:
 					if err != nil {
@@ -876,8 +937,10 @@ func (p *Plugin) loop() {
 						retry = 0
 					}
 					close(waitC)
+					return
 				case <-ctx.Done():
-					timerCancel() // explicitly cancel the timer.
+					timer.Stop()
+					return
 				}
 			}()
 		}
@@ -885,8 +948,10 @@ func (p *Plugin) loop() {
 		select {
 		case <-waitC:
 		case update := <-p.reconfig:
+			cancel() // need to cancel so that the timer loop is closed and reset
 			p.reconfigure(ctx, update.config)
 			update.done <- struct{}{}
+			return
 		case done := <-p.stop:
 			cancel()
 			done <- struct{}{}
@@ -901,12 +966,19 @@ func (*bufferEmpty) Error() string {
 	return "buffer is empty"
 }
 
-func (p *Plugin) doOneShot(ctx context.Context) error {
-	err := p.oneShot(ctx)
+type uploadCancelled struct{}
 
+func (*uploadCancelled) Error() string {
+	return "cancelled upload"
+}
+
+func (p *Plugin) doOneShot(ctx context.Context) error {
+	err := p.b.Upload(ctx)
 	if err != nil {
 		if errors.Is(err, &bufferEmpty{}) {
 			p.logger.Debug("Log upload queue was empty.")
+			err = nil
+		} else if errors.Is(err, &uploadCancelled{}) {
 			err = nil
 		} else {
 			p.logger.Error("%v.", err)
@@ -919,65 +991,6 @@ func (p *Plugin) doOneShot(ctx context.Context) error {
 	return err
 }
 
-func (p *Plugin) oneShot(ctx context.Context) error {
-	if p.runningBuffer == eventBufferType {
-		return p.eventBuffer.Upload(ctx)
-	}
-
-	// Make a local copy of the plugin's encoder and buffer and create
-	// a new encoder and buffer. This is needed as locking the buffer for
-	// the upload duration will block policy evaluation and result in
-	// increased latency for OPA clients
-	p.mtx.Lock()
-	oldChunkEnc := p.enc
-	oldBuffer := p.buffer
-	p.buffer = newLogBuffer(*p.config.Reporting.BufferSizeLimitBytes)
-	p.enc = newChunkEncoder(*p.config.Reporting.UploadSizeLimitBytes).WithMetrics(p.metrics).WithLogger(p.logger).
-		WithUncompressedLimit(oldChunkEnc.uncompressedLimit, oldChunkEnc.uncompressedLimitScaleDownExponent, oldChunkEnc.uncompressedLimitScaleUpExponent)
-	p.mtx.Unlock()
-
-	// Along with uploading the compressed events in the buffer
-	// to the remote server, flush any pending compressed data to the
-	// underlying writer and add to the buffer.
-	chunk, err := oldChunkEnc.Flush()
-	if err != nil {
-		return err
-	}
-
-	for _, ch := range chunk {
-		p.bufferChunk(oldBuffer, ch)
-	}
-
-	if oldBuffer.Len() == 0 {
-		return &bufferEmpty{}
-	}
-
-	for bs := oldBuffer.Pop(); bs != nil; bs = oldBuffer.Pop() {
-		if err == nil {
-			err = uploadChunk(ctx, p.manager.Client(p.config.Service), *p.config.Resource, bs)
-		}
-		if err != nil {
-			if p.limiter != nil {
-				events, decErr := newChunkDecoder(bs).decode()
-				if decErr != nil {
-					continue
-				}
-
-				for i := range events {
-					p.encodeAndBufferEvent(events[i])
-				}
-			} else {
-				// requeue the chunk
-				p.mtx.Lock()
-				p.bufferChunk(p.buffer, bs)
-				p.mtx.Unlock()
-			}
-		}
-	}
-
-	return err
-}
-
 func (p *Plugin) reconfigure(ctx context.Context, config any) {
 	newConfig := config.(*Config)
 
@@ -986,93 +999,50 @@ func (p *Plugin) reconfigure(ctx context.Context, config any) {
 		return
 	}
 
-	p.logger.Info("Decision log uploader configuration changed.")
-	p.config = *newConfig
-
 	p.reconfigMtx.Lock()
 	defer p.reconfigMtx.Unlock()
 
+	p.logger.Info("Decision log uploader configuration changed.")
+	p.config = *newConfig
+
+	// upload all events in the current buffer type
+	if err := p.b.Upload(ctx); err != nil && !errors.Is(err, &bufferEmpty{}) {
+		p.setStatus(err)
+	}
+	p.b.Stop(ctx)
+	events := p.b.Flush()
+
 	switch newConfig.Reporting.BufferType {
 	case eventBufferType:
-		if p.eventBuffer == nil {
-			p.eventBuffer = newEventBuffer(
-				*p.config.Reporting.BufferSizeLimitEvents,
-				p.manager.Client(p.config.Service),
-				*p.config.Resource,
-				*p.config.Reporting.UploadSizeLimitBytes).WithLogger(p.logger).WithMetrics(p.metrics)
-		} else {
-			p.eventBuffer.Reconfigure(
-				*p.config.Reporting.BufferSizeLimitEvents,
-				p.manager.Client(p.config.Service),
-				*p.config.Resource,
-				*p.config.Reporting.UploadSizeLimitBytes)
-		}
-
-		if p.runningBuffer == sizeBufferType {
-			if err := p.oneShot(ctx); err != nil && !errors.Is(err, &bufferEmpty{}) {
-				p.setStatus(err)
-			}
-		}
-
-		p.runningBuffer = eventBufferType
+		p.b = newEventBuffer(
+			*p.config.Reporting.BufferSizeLimitEvents,
+			*p.config.Reporting.UploadSizeLimitBytes,
+			p.manager.Client(p.config.Service),
+			*p.config.Resource,
+			*p.config.Reporting.Trigger,
+		).WithLogger(p.logger).WithLimiter(p.config.Reporting.MaxDecisionsPerSecond)
 	case sizeBufferType:
-		if p.runningBuffer == eventBufferType {
-			if err := p.eventBuffer.Upload(ctx); err != nil && !errors.Is(err, &bufferEmpty{}) {
-				p.setStatus(err)
-			}
-		}
+		p.b = newSizeBuffer(
+			*p.config.Reporting.BufferSizeLimitBytes,
+			*p.config.Reporting.UploadSizeLimitBytes,
+			p.manager.Client(p.config.Service),
+			*p.config.Resource,
+			*p.config.Reporting.Trigger,
+		).WithLogger(p.logger).WithLimiter(p.config.Reporting.MaxDecisionsPerSecond)
+	}
+	p.b.WithMetrics(p.metrics)
 
-		if p.buffer == nil {
-			p.buffer = newLogBuffer(*p.config.Reporting.BufferSizeLimitBytes)
-		}
-
-		p.runningBuffer = sizeBufferType
+	for _, event := range events {
+		p.b.Push(event)
 	}
 }
 
-// NOTE(philipc): Because ND builtins caching can cause unbounded growth in
-// decision log entry size, we do best-effort event encoding here, and when we
-// run out of space, we drop the ND builtins cache, and try encoding again.
-func (p *Plugin) encodeAndBufferEvent(event EventV1) {
-	if p.limiter != nil && !p.limiter.Allow() {
-		p.incrMetric(logRateLimitExDropCounterName)
-		p.logger.Error("Decision log dropped as rate limit exceeded. Reduce reporting interval or increase rate limit.")
-		return
-	}
-
+func (p *Plugin) push(event EventV1) {
 	// only blocks when the buffer is being reconfigured
 	p.reconfigMtx.RLock()
 	defer p.reconfigMtx.RUnlock()
 
-	if p.runningBuffer == eventBufferType {
-		p.eventBuffer.Push(&event)
-		return
-	}
-
-	eventBytes, err := json.Marshal(&event)
-	if err != nil {
-		p.logger.Error("Decision log dropped due to error serializing event to JSON: %v", err)
-		return
-	}
-
-	p.mtx.Lock()
-	defer p.mtx.Unlock()
-	result, err := p.enc.Encode(event, eventBytes)
-	if err != nil {
-		return
-	}
-	for _, chunk := range result {
-		p.bufferChunk(p.buffer, chunk)
-	}
-}
-
-func (p *Plugin) bufferChunk(buffer *logBuffer, bs []byte) {
-	dropped := buffer.Push(bs)
-	if dropped > 0 {
-		p.incrMetric(logBufferEventDropCounterName)
-		p.incrMetric(logBufferSizeLimitExDropCounterName)
-		p.logger.Error("Dropped %v chunks from buffer. Reduce reporting interval or increase buffer size.", dropped)
-	}
+	p.b.Push(&event)
 }
 
 func (p *Plugin) maskEvent(ctx context.Context, txn storage.Transaction, input ast.Value, event *EventV1) error {
@@ -1192,25 +1162,200 @@ func uploadChunk(ctx context.Context, client rest.Client, uploadPath string, dat
 }
 
 func (p *Plugin) logEvent(event EventV1) error {
-	eventBuf, err := json.Marshal(&event)
-	if err != nil {
-		return err
-	}
-	fields := map[string]any{}
-	err = util.UnmarshalJSON(eventBuf, &fields)
-	if err != nil {
-		return err
-	}
-	p.manager.ConsoleLogger().WithFields(fields).WithFields(map[string]any{
-		"type": "openpolicyagent.org/decision_logs",
-	}).Info("Decision Log")
+	fields := eventToFields(event)
+	p.manager.ConsoleLogger().WithFields(fields).Info("Decision Log")
 	return nil
 }
 
-func (p *Plugin) incrMetric(name string) {
-	if p.metrics != nil {
-		p.metrics.Counter(name).Incr()
+func addAttrIfNonZeroString(attrs *[]slog.Attr, key string, value string) {
+	if value != "" {
+		*attrs = append(*attrs, slog.String(key, value))
 	}
+}
+
+func addAttrIfNonZero[T comparable](attrs *[]slog.Attr, key string, value T) {
+	var zero T
+	if value != zero {
+		*attrs = append(*attrs, slog.Any(key, value))
+	}
+}
+
+func addAttrIfNotNil[T any](attrs *[]slog.Attr, key string, value *T) {
+	if value != nil {
+		*attrs = append(*attrs, slog.Any(key, *value))
+	}
+}
+
+func addAttrIfHasLen[M ~map[K]V, K comparable, V any](attrs *[]slog.Attr, key string, value M) {
+	if len(value) > 0 {
+		*attrs = append(*attrs, slog.Any(key, value))
+	}
+}
+
+func addAttrIfSliceNotEmpty[T any](attrs *[]slog.Attr, key string, value []T) {
+	if len(value) > 0 {
+		*attrs = append(*attrs, slog.Any(key, value))
+	}
+}
+
+func eventToAttrs(event EventV1) []slog.Attr {
+	attrs := make([]slog.Attr, 0, 24)
+	attrs = append(attrs,
+		slog.String("type", DecisionLogType),
+		slog.Time("timestamp", event.Timestamp),
+		slog.String("decision_id", event.DecisionID))
+	addAttrIfNonZeroString(&attrs, "batch_decision_id", event.BatchDecisionID)
+	addAttrIfNonZeroString(&attrs, "trace_id", event.TraceID)
+	addAttrIfNonZeroString(&attrs, "span_id", event.SpanID)
+	addAttrIfHasLen(&attrs, "labels", event.Labels)
+	addAttrIfNonZeroString(&attrs, "revision", event.Revision)
+	addAttrIfHasLen(&attrs, "bundles", event.Bundles)
+	addAttrIfNonZeroString(&attrs, "path", event.Path)
+	addAttrIfNonZeroString(&attrs, "query", event.Query)
+	addAttrIfNotNil(&attrs, "input", event.Input)
+	addAttrIfNotNil(&attrs, "result", event.Result)
+	addAttrIfHasLen(&attrs, "intermediate_results", event.IntermediateResults)
+	addAttrIfNotNil(&attrs, "mapped_result", event.MappedResult)
+	addAttrIfNotNil(&attrs, "nd_builtin_cache", event.NDBuiltinCache)
+	addAttrIfSliceNotEmpty(&attrs, "erased", event.Erased)
+	addAttrIfSliceNotEmpty(&attrs, "masked", event.Masked)
+
+	if event.Error != nil {
+		attrs = append(attrs, slog.String("error", event.Error.Error()))
+	}
+
+	addAttrIfNonZeroString(&attrs, "requested_by", event.RequestedBy)
+	addAttrIfHasLen(&attrs, "metrics", event.Metrics)
+	addAttrIfNonZero(&attrs, "req_id", event.RequestID)
+
+	if event.RequestContext != nil {
+		attrs = append(attrs, slog.Any("request_context", event.RequestContext))
+	}
+
+	addAttrIfSliceNotEmpty(&attrs, "rule_labels", event.RuleLabels)
+	addAttrIfHasLen(&attrs, "custom", event.Custom)
+
+	return attrs
+}
+
+func addIfNonZero[T comparable](fields map[string]any, key string, value T) {
+	var zero T
+	if value != zero {
+		fields[key] = value
+	}
+}
+
+func addIfHasLen[M ~map[K]V, K comparable, V any](fields map[string]any, key string, value M) {
+	if len(value) > 0 {
+		fields[key] = value
+	}
+}
+
+func addIfSliceNotEmpty[T any](fields map[string]any, key string, value []T) {
+	if len(value) > 0 {
+		fields[key] = value
+	}
+}
+
+// roundTripAny JSON-marshals and unmarshals a value into a fresh any,
+// ensuring that struct types are converted to map[string]any etc.
+// Unlike util.RoundTrip, this always unmarshals into a nil any target,
+// which prevents json.Decoder from reusing the existing concrete type.
+func roundTripAny(x any) (v any, err error) {
+	if !util.NeedsRoundTrip(x) {
+		return x, nil
+	}
+	var bs []byte
+	if bs, err = json.Marshal(x); err == nil {
+		err = util.UnmarshalJSON(bs, &v)
+	}
+	return v, err
+}
+
+func stringsMapToAny(m map[string]string) map[string]any {
+	result := make(map[string]any, len(m))
+	for k, v := range m {
+		result[k] = v
+	}
+	return result
+}
+
+func eventToFields(event EventV1) map[string]any {
+	// NOTE(sr): This used to do a JSON roundtrip. I didn't like that, so I've converted
+	// it to simple conversion steps. These, however, try to keep types as they were
+	// before after the roundtrip. So if you find any of the [stringsToAny] business
+	// curious, that's why we're doing it.
+	fields := make(map[string]any)
+	fields["type"] = DecisionLogType
+	fields["timestamp"] = event.Timestamp.UTC().Format(time.RFC3339Nano)
+	fields["decision_id"] = event.DecisionID
+	addIfNonZero(fields, "batch_decision_id", event.BatchDecisionID)
+	addIfNonZero(fields, "trace_id", event.TraceID)
+	addIfNonZero(fields, "span_id", event.SpanID)
+	if len(event.Labels) > 0 {
+		fields["labels"] = stringsMapToAny(event.Labels)
+	}
+	addIfNonZero(fields, "revision", event.Revision)
+	addIfHasLen(fields, "bundles", event.Bundles)
+	addIfNonZero(fields, "path", event.Path)
+	addIfNonZero(fields, "query", event.Query)
+	if event.Input != nil {
+		if v, err := roundTripAny(*event.Input); err == nil {
+			fields["input"] = v
+		}
+	}
+	if event.Result != nil {
+		if v, err := roundTripAny(*event.Result); err == nil {
+			fields["result"] = v
+		}
+	}
+	addIfHasLen(fields, "intermediate_results", event.IntermediateResults)
+	if event.MappedResult != nil {
+		if v, err := roundTripAny(*event.MappedResult); err == nil {
+			fields["mapped_result"] = v
+		}
+	}
+	if event.NDBuiltinCache != nil {
+		v := *event.NDBuiltinCache
+		if err := util.RoundTrip(&v); err == nil {
+			fields["nd_builtin_cache"] = v
+		}
+	}
+	addIfSliceNotEmpty(fields, "erased", util.ToSliceOfAny(event.Erased))
+	addIfSliceNotEmpty(fields, "masked", util.ToSliceOfAny(event.Masked))
+
+	if event.Error != nil {
+		fields["error"] = event.Error.Error()
+	}
+
+	addIfNonZero(fields, "requested_by", event.RequestedBy)
+	addIfHasLen(fields, "metrics", event.Metrics)
+	if event.RequestID != 0 {
+		var v any = event.RequestID
+		if err := util.RoundTrip(&v); err == nil {
+			fields["req_id"] = v
+		}
+	}
+
+	if event.RequestContext != nil {
+		fields["request_context"] = event.RequestContext
+	}
+
+	if len(event.RuleLabels) > 0 {
+		var v any = event.RuleLabels
+		if err := util.RoundTrip(&v); err == nil {
+			fields["rule_labels"] = v
+		}
+	}
+
+	if len(event.Custom) > 0 {
+		var v any = event.Custom
+		if err := util.RoundTrip(&v); err == nil {
+			fields["custom"] = v
+		}
+	}
+
+	return fields
 }
 
 func (p *Plugin) setStatus(err error) {

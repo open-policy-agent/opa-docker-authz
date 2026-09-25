@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"io"
-	"sort"
+	"slices"
 	"time"
 
 	"github.com/open-policy-agent/opa/v1/ast"
@@ -16,6 +16,7 @@ import (
 	"github.com/open-policy-agent/opa/v1/topdown/copypropagation"
 	"github.com/open-policy-agent/opa/v1/topdown/print"
 	"github.com/open-policy-agent/opa/v1/tracing"
+	"github.com/open-policy-agent/opa/v1/util"
 )
 
 // QueryResultSet represents a collection of results returned by a query.
@@ -63,6 +64,9 @@ type Query struct {
 	tracingOpts                 tracing.Options
 	virtualCache                VirtualCache
 	baseCache                   BaseCache
+	requestMetadata             map[string]any
+	responseMetadata            map[string]any
+	evaluated                   *EvaluatedRuleTracker
 }
 
 // Builtin represents a built-in function that queries can call.
@@ -121,6 +125,7 @@ func (q *Query) WithInput(input *ast.Term) *Query {
 }
 
 // WithTracer adds a query tracer to use during evaluation. This is optional.
+//
 // Deprecated: Use WithQueryTracer instead.
 func (q *Query) WithTracer(tracer Tracer) *Query {
 	qt, ok := tracer.(QueryTracer)
@@ -133,7 +138,7 @@ func (q *Query) WithTracer(tracer Tracer) *Query {
 // WithQueryTracer adds a query tracer to use during evaluation. This is optional.
 // Disabled QueryTracers will be ignored.
 func (q *Query) WithQueryTracer(tracer QueryTracer) *Query {
-	if !tracer.Enabled() {
+	if tracer == nil || !tracer.Enabled() {
 		return q
 	}
 
@@ -277,9 +282,7 @@ func (q *Query) WithBuiltinErrorList(list *[]Error) *Query {
 
 // WithResolver configures an external resolver to use for the given ref.
 func (q *Query) WithResolver(ref ast.Ref, r resolver.Resolver) *Query {
-	if q.external == nil {
-		q.external = newResolverTrie()
-	}
+	q.external = util.Or(q.external, newResolverTrie)
 	q.external.Put(ref, r)
 	return q
 }
@@ -332,6 +335,28 @@ func (q *Query) WithNondeterministicBuiltins(yes bool) *Query {
 	return q
 }
 
+// WithRequestMetadata sets arbitrary metadata from the caller that can be
+// used by wrapping projects. The data is stored but not directly used by
+// OPA's evaluation engine.
+func (q *Query) WithRequestMetadata(m map[string]any) *Query {
+	q.requestMetadata = m
+	return q
+}
+
+// WithResponseMetadata sets a map that wrapping projects can populate during
+// evaluation to include additional fields in the API response.
+func (q *Query) WithResponseMetadata(m map[string]any) *Query {
+	q.responseMetadata = m
+	return q
+}
+
+// WithEvaluatedRuleTracker sets a tracker to record rule identifiers that were
+// successfully evaluated.
+func (q *Query) WithEvaluatedRuleTracker(t *EvaluatedRuleTracker) *Query {
+	q.evaluated = t
+	return q
+}
+
 // PartialRun executes partial evaluation on the query with respect to unknown
 // values. Partial evaluation attempts to evaluate as much of the query as
 // possible without requiring values for the unknowns set on the query. The
@@ -343,15 +368,16 @@ func (q *Query) PartialRun(ctx context.Context) (partials []ast.Body, support []
 	if q.partialNamespace == "" {
 		q.partialNamespace = "partial" // lazily initialize partial namespace
 	}
+	if q.evaluated != nil && q.compiler != nil {
+		q.evaluated.WithAnnotationSet(q.compiler.GetAnnotationSet())
+	}
 	if q.seed == nil {
 		q.seed = rand.Reader
 	}
 	if q.time.IsZero() {
 		q.time = time.Now()
 	}
-	if q.metrics == nil {
-		q.metrics = metrics.New()
-	}
+	q.metrics = util.Or(q.metrics, metrics.New)
 
 	f := &queryIDFactory{}
 	b := newBindings(0, q.instr)
@@ -374,7 +400,7 @@ func (q *Query) PartialRun(ctx context.Context) (partials []ast.Body, support []
 		ctx:                         ctx,
 		metrics:                     q.metrics,
 		seed:                        q.seed,
-		time:                        ast.NumberTerm(int64ToJSONNumber(q.time.UnixNano())),
+		timeStart:                   q.time.UnixNano(),
 		cancel:                      q.cancel,
 		query:                       q.query,
 		queryCompiler:               q.queryCompiler,
@@ -406,13 +432,16 @@ func (q *Query) PartialRun(ctx context.Context) (partials []ast.Body, support []
 			shallow:                  q.shallowInlining,
 			nondeterministicBuiltins: q.nondeterministicBuiltins,
 		},
-		genvarprefix:  q.genvarprefix,
-		runtime:       q.runtime,
-		indexing:      q.indexing,
-		earlyExit:     q.earlyExit,
-		builtinErrors: &builtinErrors{},
-		printHook:     q.printHook,
-		strictObjects: q.strictObjects,
+		genvarprefix:     q.genvarprefix,
+		runtime:          q.runtime,
+		indexing:         q.indexing,
+		earlyExit:        q.earlyExit,
+		builtinErrors:    &builtinErrors{},
+		printHook:        q.printHook,
+		strictObjects:    q.strictObjects,
+		requestMetadata:  q.requestMetadata,
+		responseMetadata: q.responseMetadata,
+		evaluated:        q.evaluated,
 	}
 
 	if len(q.disableInlining) > 0 {
@@ -447,7 +476,7 @@ func (q *Query) PartialRun(ctx context.Context) (partials []ast.Body, support []
 		// Build output from saved expressions.
 		body := ast.NewBody()
 
-		for _, elem := range e.saveStack.Stack[len(e.saveStack.Stack)-1] {
+		for _, elem := range e.saveStack.Peek() {
 			body.Append(elem.Plug(e.bindings))
 		}
 
@@ -460,9 +489,7 @@ func (q *Query) PartialRun(ctx context.Context) (partials []ast.Body, support []
 		}) // cannot return error
 
 		// Sort binding expressions so that results are deterministic.
-		sort.Slice(bindingExprs, func(i, j int) bool {
-			return bindingExprs[i].Compare(bindingExprs[j]) < 0
-		})
+		slices.SortFunc(bindingExprs, (*ast.Expr).Compare)
 
 		for i := range bindingExprs {
 			body.Append(bindingExprs[i])
@@ -509,10 +536,7 @@ func (q *Query) PartialRun(ctx context.Context) (partials []ast.Body, support []
 		if regoVersion := q.compiler.DefaultRegoVersion(); regoVersion != ast.RegoUndefined {
 			ast.SetModuleRegoVersion(m, q.compiler.DefaultRegoVersion())
 		}
-
-		sort.Slice(support[i].Rules, func(j, k int) bool {
-			return support[i].Rules[j].Compare(support[i].Rules[k]) < 0
-		})
+		slices.SortFunc(support[i].Rules, (*ast.Rule).Compare)
 	}
 
 	return partials, support, err
@@ -539,15 +563,17 @@ func (q *Query) Iter(ctx context.Context, iter func(QueryResult) error) error {
 		}
 	}
 
+	if q.evaluated != nil && q.compiler != nil {
+		q.evaluated.WithAnnotationSet(q.compiler.GetAnnotationSet())
+	}
+
 	if q.seed == nil {
 		q.seed = rand.Reader
 	}
 	if q.time.IsZero() {
 		q.time = time.Now()
 	}
-	if q.metrics == nil {
-		q.metrics = metrics.New()
-	}
+	q.metrics = util.Or(q.metrics, metrics.New)
 
 	f := &queryIDFactory{}
 
@@ -569,7 +595,7 @@ func (q *Query) Iter(ctx context.Context, iter func(QueryResult) error) error {
 		ctx:                         ctx,
 		metrics:                     q.metrics,
 		seed:                        q.seed,
-		time:                        ast.NumberTerm(int64ToJSONNumber(q.time.UnixNano())),
+		timeStart:                   q.time.UnixNano(),
 		cancel:                      q.cancel,
 		query:                       q.query,
 		queryCompiler:               q.queryCompiler,
@@ -601,6 +627,12 @@ func (q *Query) Iter(ctx context.Context, iter func(QueryResult) error) error {
 		tracingOpts:                 q.tracingOpts,
 		strictObjects:               q.strictObjects,
 		roundTripper:                q.roundTripper,
+		requestMetadata:             q.requestMetadata,
+		responseMetadata:            q.responseMetadata,
+		evaluated:                   q.evaluated,
+	}
+	if e.requestMetadata == nil {
+		e.requestMetadata = map[string]any{}
 	}
 	e.caller = e
 	q.metrics.Timer(metrics.RegoQueryEval).Start()

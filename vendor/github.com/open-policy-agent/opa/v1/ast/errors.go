@@ -87,7 +87,6 @@ type Error struct {
 }
 
 func (e *Error) Error() string {
-
 	var prefix string
 
 	if e.Location != nil {
@@ -99,26 +98,63 @@ func (e *Error) Error() string {
 		}
 	}
 
-	msg := fmt.Sprintf("%v: %v", e.Code, e.Message)
-
+	sb := strings.Builder{}
 	if len(prefix) > 0 {
-		msg = prefix + ": " + msg
+		sb.WriteString(prefix)
+		sb.WriteString(": ")
 	}
+
+	sb.WriteString(e.Code)
+	sb.WriteString(": ")
+	sb.WriteString(e.Message)
 
 	if e.Details != nil {
 		for _, line := range e.Details.Lines() {
-			msg += "\n\t" + line
+			sb.WriteString("\n\t")
+			sb.WriteString(line)
 		}
 	}
 
-	return msg
+	return sb.String()
+}
+
+func (e *Error) Equal(other *Error) bool {
+	if e == other {
+		return true
+	}
+
+	if e == nil || other == nil {
+		return false
+	}
+
+	if e.Code != other.Code || e.Message != other.Message {
+		return false
+	}
+
+	if !e.Location.Equal(other.Location) {
+		return false
+	}
+
+	if (e.Details == nil) != (other.Details == nil) {
+		return false
+	}
+
+	if e.Details != nil && !slices.Equal(e.Details.Lines(), other.Details.Lines()) {
+		return false
+	}
+
+	return true
 }
 
 // NewError returns a new Error object.
 func NewError(code string, loc *Location, f string, a ...any) *Error {
+	return newErrorString(code, loc, fmt.Sprintf(f, a...))
+}
+
+func newErrorString(code string, loc *Location, m string) *Error {
 	return &Error{
 		Code:     code,
 		Location: loc,
-		Message:  fmt.Sprintf(f, a...),
+		Message:  m,
 	}
 }

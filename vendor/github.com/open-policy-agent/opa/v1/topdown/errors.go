@@ -6,9 +6,10 @@ package topdown
 
 import (
 	"errors"
-	"fmt"
+	"strconv"
 
 	"github.com/open-policy-agent/opa/v1/ast"
+	"github.com/open-policy-agent/opa/v1/util"
 )
 
 // Halt is a special error type that built-in function implementations return to indicate
@@ -72,8 +73,7 @@ func IsCancel(err error) bool {
 
 // Is allows matching topdown errors using errors.Is (see IsCancel).
 func (e *Error) Is(target error) bool {
-	var t *Error
-	if errors.As(target, &t) {
+	if t, ok := errors.AsType[*Error](target); ok {
 		return (t.Code == "" || e.Code == t.Code) &&
 			(t.Message == "" || e.Message == t.Message) &&
 			(t.Location == nil || t.Location.Compare(e.Location) == 0)
@@ -82,13 +82,27 @@ func (e *Error) Is(target error) bool {
 }
 
 func (e *Error) Error() string {
-	msg := fmt.Sprintf("%v: %v", e.Code, e.Message)
+	buf, _ := e.AppendText(make([]byte, 0, e.StringLength()))
+	return util.ByteSliceToString(buf)
+}
 
+func (e *Error) AppendText(buf []byte) ([]byte, error) {
 	if e.Location != nil {
-		msg = e.Location.String() + ": " + msg
+		buf, _ := e.Location.AppendText(buf)
+		buf = append(append(buf, ": "...), e.Code...)
+		buf = append(append(buf, ": "...), e.Message...)
+		return buf, nil
 	}
 
-	return msg
+	return append(append(append(buf, e.Code...), ": "...), e.Message...), nil
+}
+
+func (e *Error) StringLength() int {
+	l := len(e.Code) + 2 + len(e.Message)
+	if e.Location != nil {
+		l += e.Location.StringLength() + 2
+	}
+	return l
 }
 
 func (e *Error) Wrap(err error) *Error {
@@ -124,11 +138,11 @@ func objectDocKeyConflictErr(loc *ast.Location) error {
 	}
 }
 
-func unsupportedBuiltinErr(loc *ast.Location) error {
+func unsupportedBuiltinErr(loc *ast.Location, name string) error {
 	return &Error{
 		Code:     InternalErr,
 		Location: loc,
-		Message:  "unsupported built-in",
+		Message:  "unsupported built-in: " + name,
 	}
 }
 
@@ -137,6 +151,18 @@ func mergeConflictErr(loc *ast.Location) error {
 		Code:     WithMergeErr,
 		Location: loc,
 		Message:  "real and replacement data could not be merged",
+	}
+}
+
+// unevaluatedOperandErr is returned when a built-in function would have been
+// called with an operand that requires evaluation, which indicates a bug in OPA
+// rather than in the policy being evaluated.
+func unevaluatedOperandErr(loc *ast.Location, name string, pos int, operand *ast.Term) error {
+	return &Error{
+		Code:     InternalErr,
+		Location: loc,
+		Message: "built-in function " + name + " called with operand " + strconv.Itoa(pos) +
+			" that requires evaluation: " + operand.String(),
 	}
 }
 

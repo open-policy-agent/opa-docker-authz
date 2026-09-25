@@ -12,11 +12,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net/http"
 	"net/http/httputil"
 	"reflect"
 	"strings"
+	"sync"
 
 	"github.com/open-policy-agent/opa/internal/version"
 	"github.com/open-policy-agent/opa/v1/keys"
@@ -40,8 +40,13 @@ var maskedHeaderKeys = map[string]struct{}{
 
 // An HTTPAuthPlugin represents a mechanism to construct and configure HTTP authentication for a REST service
 type HTTPAuthPlugin interface {
-	// implementations can assume NewClient will be called before Prepare
+	// NewClient is called once per Client instance and the result is cached.
+	// Implementations MUST NOT perform per-request operations here.
+	// All per-request authentication logic MUST be in Prepare().
 	NewClient(Config) (*http.Client, error)
+
+	// Prepare is called before every HTTP request.
+	// Implementations should perform per-request authentication here.
 	Prepare(*http.Request) error
 }
 
@@ -62,9 +67,11 @@ type Config struct {
 		AzureManagedIdentity *azureManagedIdentitiesAuthPlugin  `json:"azure_managed_identity,omitempty"`
 		Plugin               *string                            `json:"plugin,omitempty"`
 	} `json:"credentials"`
-	Type   string `json:"type,omitempty"`
-	keys   map[string]*keys.Config
-	logger logging.Logger
+	Type          string `json:"type,omitempty"`
+	keys          map[string]*keys.Config
+	logger        logging.Logger
+	minTLSVersion uint16
+	cipherSuites  *[]uint16
 }
 
 // Equal returns true if this client config is equal to the other.
@@ -95,8 +102,8 @@ func (c *Config) AuthPlugin(lookup AuthPluginLookupFunc) (HTTPAuthPlugin, error)
 	}
 	// reflection avoids need for this code to change as auth plugins are added
 	s := reflect.ValueOf(c.Credentials)
-	for i := range s.NumField() {
-		if s.Field(i).IsNil() {
+	for _, field := range s.Fields() {
+		if field.IsNil() {
 			continue
 		}
 
@@ -104,7 +111,7 @@ func (c *Config) AuthPlugin(lookup AuthPluginLookupFunc) (HTTPAuthPlugin, error)
 			return nil, errors.New("a maximum one credential method must be specified")
 		}
 
-		candidate = s.Field(i).Interface().(HTTPAuthPlugin)
+		candidate = field.Interface().(HTTPAuthPlugin)
 	}
 
 	if candidate == nil {
@@ -113,20 +120,12 @@ func (c *Config) AuthPlugin(lookup AuthPluginLookupFunc) (HTTPAuthPlugin, error)
 	return candidate, nil
 }
 
-func (c *Config) authHTTPClient(lookup AuthPluginLookupFunc) (*http.Client, error) {
-	plugin, err := c.AuthPlugin(lookup)
-	if err != nil {
-		return nil, err
-	}
-	return plugin.NewClient(*c)
-}
-
-func (c *Config) authPrepare(req *http.Request, lookup AuthPluginLookupFunc) error {
-	plugin, err := c.AuthPlugin(lookup)
-	if err != nil {
-		return err
-	}
-	return plugin.Prepare(req)
+// clientCache holds the cached HTTP client and related state with thread-safe initialization
+type clientCache struct {
+	mu         sync.Mutex
+	httpClient *http.Client
+	authPlugin HTTPAuthPlugin
+	initErr    error
 }
 
 // Client implements an HTTP/REST client for communicating with remote
@@ -140,6 +139,7 @@ type Client struct {
 	logger                logging.Logger
 	loggerFields          map[string]any
 	distributedTacingOpts tracing.Options
+	cache                 *clientCache
 }
 
 // Name returns an option that overrides the service name on the client.
@@ -173,6 +173,20 @@ func DistributedTracingOpts(tr tracing.Options) func(*Client) {
 	}
 }
 
+// MinTLSVersion sets the minimum TLS version for the client
+func MinTLSVersion(v uint16) func(*Client) {
+	return func(c *Client) {
+		c.config.minTLSVersion = v
+	}
+}
+
+// CipherSuites sets the cipher suites for the client
+func CipherSuites(cs *[]uint16) func(*Client) {
+	return func(c *Client) {
+		c.config.cipherSuites = cs
+	}
+}
+
 // New returns a new Client for config.
 func New(config []byte, keys map[string]*keys.Config, opts ...func(*Client)) (Client, error) {
 	var parsedConfig Config
@@ -191,6 +205,7 @@ func New(config []byte, keys map[string]*keys.Config, opts ...func(*Client)) (Cl
 
 	client := Client{
 		config: parsedConfig,
+		cache:  &clientCache{},
 	}
 
 	for _, f := range opts {
@@ -204,6 +219,36 @@ func New(config []byte, keys map[string]*keys.Config, opts ...func(*Client)) (Cl
 	client.config.logger = client.logger
 
 	return client, nil
+}
+
+func (c *Client) ensureHTTPClient() error {
+	c.cache.mu.Lock()
+	defer c.cache.mu.Unlock()
+
+	if c.cache.httpClient != nil && c.cache.authPlugin != nil {
+		return c.cache.initErr
+	}
+
+	plugin, err := c.config.AuthPlugin(c.authPluginLookup)
+	if err != nil {
+		c.cache.initErr = err
+		return err
+	}
+
+	hc, err := plugin.NewClient(c.config)
+	if err != nil {
+		c.cache.initErr = err
+		return err
+	}
+
+	if len(c.distributedTacingOpts) > 0 {
+		hc.Transport = tracing.NewTransport(hc.Transport, c.distributedTacingOpts)
+	}
+
+	c.cache.httpClient = hc
+	c.cache.authPlugin = plugin
+	c.cache.initErr = nil
+	return nil
 }
 
 // AuthPluginLookup returns the lookup function to find a custom registered
@@ -225,6 +270,7 @@ func (c Client) Config() *Config {
 // SetResponseHeaderTimeout sets the "ResponseHeaderTimeout" in the http client's Transport
 func (c Client) SetResponseHeaderTimeout(timeout *int64) Client {
 	c.config.ResponseHeaderTimeoutSeconds = timeout
+	c.cache = &clientCache{}
 	return c
 }
 
@@ -270,13 +316,8 @@ func (c Client) WithBytes(body []byte) Client {
 // Do executes a request using the client.
 func (c Client) Do(ctx context.Context, method, path string) (*http.Response, error) {
 
-	httpClient, err := c.config.authHTTPClient(c.authPluginLookup)
-	if err != nil {
+	if err := c.ensureHTTPClient(); err != nil {
 		return nil, err
-	}
-
-	if len(c.distributedTacingOpts) > 0 {
-		httpClient.Transport = tracing.NewTransport(httpClient.Transport, c.distributedTacingOpts)
 	}
 
 	path = strings.Trim(path, "/")
@@ -299,21 +340,21 @@ func (c Client) Do(ctx context.Context, method, path string) (*http.Response, er
 		return nil, err
 	}
 
-	headers := map[string]string{
-		"User-Agent": version.UserAgent,
+	// NB(sr): Set() overwrites existing headers with the same key
+	req.Header.Set("User-Agent", version.UserAgent)
+	for key, value := range c.config.Headers { // Copy custom headers from config.
+		req.Header.Set(key, value)
 	}
-
-	// Copy custom headers from config.
-	maps.Copy(headers, c.config.Headers)
-
-	// Overwrite with headers set directly on client.
-	maps.Copy(headers, c.headers)
-
-	for key, value := range headers {
+	for key, value := range c.headers { // Overwrite with headers set directly on client.
 		req.Header.Add(key, value)
 	}
 
-	if err = c.config.authPrepare(req, c.authPluginLookup); err != nil {
+	c.cache.mu.Lock()
+	authPlugin := c.cache.authPlugin
+	httpClient := c.cache.httpClient
+	c.cache.mu.Unlock()
+
+	if err := authPlugin.Prepare(req); err != nil {
 		return nil, err
 	}
 
@@ -344,7 +385,7 @@ func (c Client) Do(ctx context.Context, method, path string) (*http.Response, er
 			if len(dump) < defaultResponseSizeLimitBytes {
 				c.loggerFields["response"] = string(dump)
 			} else {
-				c.loggerFields["response"] = fmt.Sprintf("%v...", string(dump[:defaultResponseSizeLimitBytes]))
+				c.loggerFields["response"] = string(dump[:defaultResponseSizeLimitBytes]) + "..."
 			}
 		}
 		c.logger.WithFields(c.loggerFields).Debug("Received response.")
@@ -354,13 +395,9 @@ func (c Client) Do(ctx context.Context, method, path string) (*http.Response, er
 }
 
 func withMaskedHeaders(headers http.Header) http.Header {
-	masked := make(http.Header)
-	for k, v := range headers {
-		if _, ok := maskedHeaderKeys[k]; ok {
-			masked.Set(k, "REDACTED")
-		} else {
-			masked[k] = v
-		}
+	masked := headers.Clone()
+	for k := range maskedHeaderKeys {
+		masked.Set(k, "REDACTED") // Set() replaces existing headers
 	}
 	return masked
 }

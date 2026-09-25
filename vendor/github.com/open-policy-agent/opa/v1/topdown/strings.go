@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -18,6 +17,12 @@ import (
 
 	"github.com/open-policy-agent/opa/v1/ast"
 	"github.com/open-policy-agent/opa/v1/topdown/builtins"
+	"github.com/open-policy-agent/opa/v1/util"
+)
+
+var (
+	trueAny                 any = true
+	errEmptySearchCharacter     = errors.New("empty search character")
 )
 
 func builtinAnyPrefixMatch(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term) error) error {
@@ -102,13 +107,17 @@ func anyStartsWithAny(strs []string, prefixes []string) bool {
 		return strings.HasPrefix(strs[0], prefixes[0])
 	}
 
+	// The trie is local, and only ever inserted into and searched, so it's safe
+	// to hand it byte slices aliasing the operand strings' memory. Note that
+	// patricia's compact() writes through the key slices it retains, so Delete
+	// and DeleteSubtree must not be used here: they'd corrupt those strings.
 	trie := patricia.NewTrie()
 	for i := range strs {
-		trie.Insert([]byte(strs[i]), true)
+		trie.Insert(util.StringToByteSlice(strs[i]), trueAny)
 	}
 
 	for i := range prefixes {
-		if trie.MatchSubtree([]byte(prefixes[i])) {
+		if trie.MatchSubtree(util.StringToByteSlice(prefixes[i])) {
 			return true
 		}
 	}
@@ -129,29 +138,48 @@ func builtinFormatInt(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Ter
 	}
 
 	var format string
+	var radix int
 	switch base {
 	case ast.Number("2"):
 		format = "%b"
+		radix = 2
 	case ast.Number("8"):
 		format = "%o"
+		radix = 8
 	case ast.Number("10"):
+		// Fast path: for numbers whose decimal string is already interned (e.g.
+		// "0"–"100"), we can skip strconv.ParseInt entirely.
+		if term := ast.InternedStringTermFromNumber(input); term != nil {
+			return iter(term)
+		}
 		if i, ok := input.Int(); ok {
 			return iter(ast.InternedIntegerString(i))
 		}
 		format = "%d"
+		radix = 10
 	case ast.Number("16"):
 		format = "%x"
+		radix = 16
 	default:
 		return builtins.NewOperandEnumErr(2, "2", "8", "10", "16")
 	}
 
+	// For integer inputs, format the exact big.Int. Routing integers through a
+	// float (as the fractional path below does) loses precision for values that
+	// need more than a float64's 53-bit mantissa, e.g. 18446744073709551617.
+	if i, ok := new(big.Int).SetString(string(input), 10); ok {
+		return iter(ast.InternedTerm(i.Text(radix)))
+	}
+
+	// Fractional inputs (e.g. 15.9) are truncated toward zero, matching the
+	// historical behaviour: format_int(15.9, 16) == "f", format_int(-15.9, 16) == "-f".
 	f := builtins.NumberToFloat(input)
 	i, _ := f.Int(nil)
 
 	return iter(ast.InternedTerm(fmt.Sprintf(format, i)))
 }
 
-func builtinConcat(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term) error) error {
+func builtinConcat(bctx BuiltinContext, operands []*ast.Term, iter func(*ast.Term) error) error {
 	join, err := builtins.StringOperand(operands[0].Value, 1)
 	if err != nil {
 		return err
@@ -162,11 +190,13 @@ func builtinConcat(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term) 
 		return iter(term)
 	}
 
+	sb := newSink(ast.Concat.Name, 0, bctx.Cancel)
+
 	// NOTE(anderseknert):
 	// More or less Go's strings.Join implementation, but where we avoid
 	// creating an intermediate []string slice to pass to that function,
 	// as that's expensive (3.5x more space allocated). Instead we build
-	// the string directly using a strings.Builder to concatenate the string
+	// the string directly using the sink to concatenate the string
 	// values from the array/set with the separator.
 	n := 0
 	switch b := operands[1].Value.(type) {
@@ -181,25 +211,36 @@ func builtinConcat(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term) 
 		}
 		sep := string(join)
 		n += len(sep) * (l - 1)
-		var sb strings.Builder
 		sb.Grow(n)
-		sb.WriteString(string(b.Elem(0).Value.(ast.String)))
+		if _, err := sb.WriteString(string(b.Elem(0).Value.(ast.String))); err != nil {
+			return err
+		}
 		if sep == "" {
 			for i := 1; i < l; i++ {
-				sb.WriteString(string(b.Elem(i).Value.(ast.String)))
+				if _, err := sb.WriteString(string(b.Elem(i).Value.(ast.String))); err != nil {
+					return err
+				}
 			}
 		} else if len(sep) == 1 {
 			// when the separator is a single byte, sb.WriteByte is substantially faster
 			bsep := sep[0]
 			for i := 1; i < l; i++ {
-				sb.WriteByte(bsep)
-				sb.WriteString(string(b.Elem(i).Value.(ast.String)))
+				if err := sb.WriteByte(bsep); err != nil {
+					return err
+				}
+				if _, err := sb.WriteString(string(b.Elem(i).Value.(ast.String))); err != nil {
+					return err
+				}
 			}
 		} else {
 			// for longer separators, there is no such difference between WriteString and Write
 			for i := 1; i < l; i++ {
-				sb.WriteString(sep)
-				sb.WriteString(string(b.Elem(i).Value.(ast.String)))
+				if _, err := sb.WriteString(sep); err != nil {
+					return err
+				}
+				if _, err := sb.WriteString(string(b.Elem(i).Value.(ast.String))); err != nil {
+					return err
+				}
 			}
 		}
 		return iter(ast.InternedTerm(sb.String()))
@@ -214,12 +255,15 @@ func builtinConcat(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term) 
 		sep := string(join)
 		l := b.Len()
 		n += len(sep) * (l - 1)
-		var sb strings.Builder
 		sb.Grow(n)
 		for i, v := range b.Slice() {
-			sb.WriteString(string(v.Value.(ast.String)))
+			if _, err := sb.WriteString(string(v.Value.(ast.String))); err != nil {
+				return err
+			}
 			if i < l-1 {
-				sb.WriteString(sep)
+				if _, err := sb.WriteString(sep); err != nil {
+					return err
+				}
 			}
 		}
 		return iter(ast.InternedTerm(sb.String()))
@@ -277,12 +321,12 @@ func builtinIndexOf(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term)
 		return err
 	}
 	if len(string(search)) == 0 {
-		return errors.New("empty search character")
+		return errEmptySearchCharacter
 	}
 
 	if isASCII(string(base)) && isASCII(string(search)) {
-		// this is a false positive in the indexAlloc rule that thinks
-		// we're converting byte arrays to strings
+		// this is a false positive in the indexAlloc rule that thinks we're converting
+		// byte arrays to strings. still a false positive as of 2026-08-19.
 		//nolint:gocritic
 		return iter(ast.InternedTerm(strings.Index(string(base), string(search))))
 	}
@@ -315,7 +359,7 @@ func builtinIndexOfN(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term
 		return err
 	}
 	if len(string(search)) == 0 {
-		return errors.New("empty search character")
+		return errEmptySearchCharacter
 	}
 
 	baseRunes := []rune(string(base))
@@ -337,7 +381,6 @@ func builtinIndexOfN(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term
 }
 
 func builtinSubstring(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term) error) error {
-
 	base, err := builtins.StringOperand(operands[0].Value, 1)
 	if err != nil {
 		return err
@@ -514,21 +557,54 @@ func builtinSplit(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term) e
 		return err
 	}
 
-	if !strings.Contains(string(s), string(d)) {
+	text, delim := string(s), string(d)
+	if !strings.Contains(text, delim) {
 		return iter(ast.ArrayTerm(operands[0]))
 	}
 
-	elems := strings.Split(string(s), string(d))
-	arr := make([]*ast.Term, len(elems))
-
-	for i := range elems {
-		arr[i] = ast.InternedTerm(elems[i])
-	}
-
-	return iter(ast.ArrayTerm(arr...))
+	return iter(ast.ArrayTerm(util.SplitMap(text, delim, ast.InternedTerm)...))
 }
 
-func builtinReplace(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term) error) error {
+func builtinSplitN(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term) error) error {
+	s, err := builtins.StringOperand(operands[0].Value, 1)
+	if err != nil {
+		return err
+	}
+
+	d, err := builtins.StringOperand(operands[1].Value, 2)
+	if err != nil {
+		return err
+	}
+
+	n, err := builtins.IntOperand(operands[2].Value, 3)
+	if err != nil {
+		return err
+	}
+
+	text, delim := string(s), string(d)
+
+	var result []*ast.Term
+	if n >= 0 {
+		// n+1 may overflow for very large n; a negative limit means no limit.
+		limit := n + 1
+		if limit < 0 {
+			limit = -1
+		}
+		parts := strings.SplitN(text, delim, limit)
+		result = make([]*ast.Term, min(n, len(parts)))
+		for i := range result {
+			result[i] = ast.InternedTerm(parts[i])
+		}
+	} else {
+		parts := strings.Split(text, delim)
+		start := max(len(parts)+n, 0)
+		result = util.Map(parts[start:], ast.InternedTerm)
+	}
+
+	return iter(ast.ArrayTerm(result...))
+}
+
+func builtinReplace(bctx BuiltinContext, operands []*ast.Term, iter func(*ast.Term) error) error {
 	s, err := builtins.StringOperand(operands[0].Value, 1)
 	if err != nil {
 		return err
@@ -544,7 +620,12 @@ func builtinReplace(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term)
 		return err
 	}
 
-	replaced := strings.ReplaceAll(string(s), string(old), string(n))
+	sink := newSink(ast.Replace.Name, len(s), bctx.Cancel)
+	replacer := strings.NewReplacer(string(old), string(n))
+	if _, err := replacer.WriteString(sink, string(s)); err != nil {
+		return err
+	}
+	replaced := sink.String()
 	if replaced == string(s) {
 		return iter(operands[0])
 	}
@@ -552,34 +633,38 @@ func builtinReplace(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term)
 	return iter(ast.InternedTerm(replaced))
 }
 
-func builtinReplaceN(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term) error) error {
+func builtinReplaceN(bctx BuiltinContext, operands []*ast.Term, iter func(*ast.Term) error) error {
 	patterns, err := builtins.ObjectOperand(operands[0].Value, 1)
 	if err != nil {
 		return err
 	}
-	keys := patterns.Keys()
-	sort.Slice(keys, func(i, j int) bool { return ast.Compare(keys[i].Value, keys[j].Value) < 0 })
 
 	s, err := builtins.StringOperand(operands[1].Value, 2)
 	if err != nil {
 		return err
 	}
 
-	oldnewArr := make([]string, 0, len(keys)*2)
+	keys := util.SortedFunc(patterns.Keys(), ast.TermValueCompare)
+	pairs := make([]string, 0, len(keys)*2)
+
 	for _, k := range keys {
 		keyVal, ok := k.Value.(ast.String)
 		if !ok {
 			return builtins.NewOperandErr(1, "non-string key found in pattern object")
 		}
-		val := patterns.Get(k) // cannot be nil
-		strVal, ok := val.Value.(ast.String)
+		strVal, ok := patterns.Get(k).Value.(ast.String)
 		if !ok {
 			return builtins.NewOperandErr(1, "non-string value found in pattern object")
 		}
-		oldnewArr = append(oldnewArr, string(keyVal), string(strVal))
+		pairs = append(pairs, string(keyVal), string(strVal))
 	}
 
-	return iter(ast.InternedTerm(strings.NewReplacer(oldnewArr...).Replace(string(s))))
+	sink := newSink(ast.ReplaceN.Name, len(s), bctx.Cancel)
+	replacer := strings.NewReplacer(pairs...)
+	if _, err := replacer.WriteString(sink, string(s)); err != nil {
+		return err
+	}
+	return iter(ast.InternedTerm(sink.String()))
 }
 
 func builtinTrim(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term) error) error {
@@ -593,12 +678,13 @@ func builtinTrim(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term) er
 		return err
 	}
 
-	trimmed := strings.Trim(string(s), string(c))
-	if trimmed == string(s) {
+	str := string(s)
+	trimmed := strings.Trim(str, string(c))
+	if trimmed == str {
 		return iter(operands[0])
 	}
 
-	return iter(ast.InternedTerm(strings.Trim(string(s), string(c))))
+	return iter(ast.InternedTerm(trimmed))
 }
 
 func builtinTrimLeft(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term) error) error {
@@ -697,15 +783,15 @@ func builtinSprintf(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term)
 		return err
 	}
 
-	astArr, ok := operands[1].Value.(*ast.Array)
-	if !ok {
-		return builtins.NewOperandTypeErr(2, operands[1].Value, "array")
+	a, err := builtins.ArrayOperand(operands[1].Value, 2)
+	if err != nil {
+		return err
 	}
 
 	// Optimized path for where sprintf is used as a "to_string" function for
 	// a single integer, i.e. sprintf("%d", [x]) where x is an integer.
-	if s == "%d" && astArr.Len() == 1 {
-		if n, ok := astArr.Elem(0).Value.(ast.Number); ok {
+	if s == "%d" && a.Len() == 1 {
+		if n, ok := a.Elem(0).Value.(ast.Number); ok {
 			if i, ok := n.Int(); ok {
 				if interned := ast.InternedIntegerString(i); interned != nil {
 					return iter(interned)
@@ -715,24 +801,35 @@ func builtinSprintf(_ BuiltinContext, operands []*ast.Term, iter func(*ast.Term)
 		}
 	}
 
-	args := make([]any, astArr.Len())
+	args := make([]any, a.Len())
 
 	for i := range args {
-		switch v := astArr.Elem(i).Value.(type) {
+		t := a.Elem(i)
+		switch v := t.Value.(type) {
 		case ast.Number:
-			if n, ok := v.Int(); ok {
-				args[i] = n
-			} else if b, ok := new(big.Int).SetString(v.String(), 10); ok {
-				args[i] = b
-			} else if f, ok := v.Float64(); ok {
-				args[i] = f
+			ns := string(v)
+			if x, ok := util.Atoi64(ns); ok {
+				args[i] = x
 			} else {
-				args[i] = v.String()
+				if strings.ContainsRune(ns, '.') {
+					if f, ok := v.Float64(); ok {
+						args[i] = f
+						continue
+					} else {
+						args[i] = ns
+					}
+				} else {
+					if b, ok := new(big.Int).SetString(ns, 10); ok {
+						args[i] = b
+					} else {
+						args[i] = ns
+					}
+				}
 			}
 		case ast.String:
 			args[i] = string(v)
 		default:
-			args[i] = astArr.Elem(i).String()
+			args[i] = t.Value.String()
 		}
 	}
 
@@ -765,7 +862,7 @@ func reverseString(str string) string {
 		utf8.EncodeRune(buf[size-start:], r)
 	}
 
-	return string(buf)
+	return util.ByteSliceToString(buf)
 }
 
 func init() {
@@ -781,6 +878,7 @@ func init() {
 	RegisterBuiltinFunc(ast.Upper.Name, builtinUpper)
 	RegisterBuiltinFunc(ast.Lower.Name, builtinLower)
 	RegisterBuiltinFunc(ast.Split.Name, builtinSplit)
+	RegisterBuiltinFunc(ast.SplitN.Name, builtinSplitN)
 	RegisterBuiltinFunc(ast.Replace.Name, builtinReplace)
 	RegisterBuiltinFunc(ast.ReplaceN.Name, builtinReplaceN)
 	RegisterBuiltinFunc(ast.Trim.Name, builtinTrim)
