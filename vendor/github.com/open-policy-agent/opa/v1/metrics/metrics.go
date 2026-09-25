@@ -19,21 +19,27 @@ import (
 
 // Well-known metric names.
 const (
-	BundleRequest       = "bundle_request"
-	ServerHandler       = "server_handler"
-	ServerQueryCacheHit = "server_query_cache_hit"
-	SDKDecisionEval     = "sdk_decision_eval"
-	RegoQueryCompile    = "rego_query_compile"
-	RegoQueryEval       = "rego_query_eval"
-	RegoQueryParse      = "rego_query_parse"
-	RegoModuleParse     = "rego_module_parse"
-	RegoDataParse       = "rego_data_parse"
-	RegoModuleCompile   = "rego_module_compile"
-	RegoPartialEval     = "rego_partial_eval"
-	RegoInputParse      = "rego_input_parse"
-	RegoLoadFiles       = "rego_load_files"
-	RegoLoadBundles     = "rego_load_bundles"
-	RegoExternalResolve = "rego_external_resolve"
+	BundleRequest                     = "bundle_request"
+	ServerHandler                     = "server_handler"
+	ServerQueryCacheHit               = "server_query_cache_hit"
+	SDKDecisionEval                   = "sdk_decision_eval"
+	RegoQueryCompile                  = "rego_query_compile"
+	RegoQueryEval                     = "rego_query_eval"
+	RegoQueryParse                    = "rego_query_parse"
+	RegoModuleParse                   = "rego_module_parse"
+	RegoDataParse                     = "rego_data_parse"
+	RegoModuleCompile                 = "rego_module_compile"
+	RegoPartialEval                   = "rego_partial_eval"
+	RegoInputParse                    = "rego_input_parse"
+	RegoLoadFiles                     = "rego_load_files"
+	RegoLoadBundles                   = "rego_load_bundles"
+	RegoExternalResolve               = "rego_external_resolve"
+	CompilePrepPartial                = "compile_prep_partial"
+	CompileEvalConstraints            = "compile_eval_constraints"
+	CompileTranslateQueries           = "compile_translate_queries"
+	CompileExtractAnnotationsUnknowns = "compile_extract_annotations_unknowns"
+	CompileExtractAnnotationsMask     = "compile_extract_annotations_mask"
+	CompileEvalMaskRule               = "compile_eval_mask_rule"
 )
 
 // Info contains attributes describing the underlying metrics provider.
@@ -305,19 +311,19 @@ type Counter interface {
 }
 
 type counter struct {
-	c uint64
+	c atomic.Uint64
 }
 
 func (c *counter) Incr() {
-	atomic.AddUint64(&c.c, 1)
+	c.c.Add(1)
 }
 
 func (c *counter) Add(n uint64) {
-	atomic.AddUint64(&c.c, n)
+	c.c.Add(n)
 }
 
 func (c *counter) Value() any {
-	return atomic.LoadUint64(&c.c)
+	return c.c.Load()
 }
 
 func Statistics(num ...int64) any {

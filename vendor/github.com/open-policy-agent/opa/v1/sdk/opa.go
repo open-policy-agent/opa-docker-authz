@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/open-policy-agent/opa/internal/ref"
-	"github.com/open-policy-agent/opa/internal/runtime"
 	"github.com/open-policy-agent/opa/internal/uuid"
 	"github.com/open-policy-agent/opa/v1/ast"
 	"github.com/open-policy-agent/opa/v1/bundle"
@@ -27,6 +26,7 @@ import (
 	"github.com/open-policy-agent/opa/v1/plugins/discovery"
 	"github.com/open-policy-agent/opa/v1/plugins/logs"
 	"github.com/open-policy-agent/opa/v1/rego"
+	"github.com/open-policy-agent/opa/v1/runtime/info"
 	"github.com/open-policy-agent/opa/v1/server"
 	"github.com/open-policy-agent/opa/v1/server/types"
 	"github.com/open-policy-agent/opa/v1/storage"
@@ -133,9 +133,13 @@ func New(ctx context.Context, nopts Options) (*OPA, error) {
 // Plugin returns the named plugin. If the plugin does not exist, this function
 // returns nil.
 func (opa *OPA) Plugin(name string) plugins.Plugin {
+	// Release opa.mtx before calling into the manager to avoid inverting the
+	// lock order used by the manager's onCommit callback (see #8873).
 	opa.mtx.Lock()
-	defer opa.mtx.Unlock()
-	return opa.state.manager.Plugin(name)
+	mgr := opa.state.manager
+	opa.mtx.Unlock()
+
+	return mgr.Plugin(name)
 }
 
 // Configure updates the configuration of the OPA in-place. This function should
@@ -143,7 +147,6 @@ func (opa *OPA) Plugin(name string) plugins.Plugin {
 // function is atomic. If the configuration update cannot be successfully
 // applied, the old configuration will remain intact.
 func (opa *OPA) Configure(ctx context.Context, opts ConfigOptions) error {
-
 	if err := opts.init(); err != nil {
 		return err
 	}
@@ -163,21 +166,20 @@ func (opa *OPA) Configure(ctx context.Context, opts ConfigOptions) error {
 }
 
 func (opa *OPA) configure(ctx context.Context, bs []byte, ready chan struct{}, block bool) error {
-	info, err := runtime.Term(runtime.Params{Config: opa.config})
+	runtimeInfo, err := info.NewWithOptions(info.Options{Config: opa.config})
 	if err != nil {
 		return err
 	}
 
-	opts := []func(*plugins.Manager){
-		plugins.Info(info),
+	opts := append([]func(*plugins.Manager){
+		plugins.Info(runtimeInfo),
 		plugins.Logger(opa.logger),
 		plugins.ConsoleLogger(opa.console),
-		plugins.WithParserOptions(ast.ParserOptions{RegoVersion: opa.regoVersion}),
+		plugins.WithParserOptions(ast.ParserOptions{ProcessAnnotation: true, RegoVersion: opa.regoVersion}),
 		plugins.EnablePrintStatements(opa.logger.GetLevel() >= logging.Info),
 		plugins.PrintHook(loggingPrintHook{logger: opa.logger}),
 		plugins.WithHooks(opa.hooks),
-	}
-	opts = append(opts, opa.managerOpts...)
+	}, opa.managerOpts...)
 
 	// Plumb in storage for external bundle activation plugin, if registered with bundle.RegisterStore,
 	// unless the user has passed their own store already.
@@ -205,7 +207,6 @@ func (opa *OPA) configure(ctx context.Context, bs []byte, ready chan struct{}, b
 	})
 
 	manager.RegisterPluginStatusListener("sdk", func(status map[string]*plugins.Status) {
-
 		select {
 		case <-ready:
 			return
@@ -244,20 +245,7 @@ func (opa *OPA) configure(ctx context.Context, bs []byte, ready chan struct{}, b
 
 	manager.Register(discovery.Name, d)
 
-	if err := manager.Start(ctx); err != nil {
-		return err
-	}
-
-	if block {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ready:
-		}
-	}
-
 	opa.mtx.Lock()
-	defer opa.mtx.Unlock()
 
 	// NOTE(tsandall): there is no return value from Stop() and it could block
 	// on async operations (e.g., decision log uploading) so defer the call to
@@ -278,12 +266,29 @@ func (opa *OPA) configure(ctx context.Context, bs []byte, ready chan struct{}, b
 	opa.state.interQueryBuiltinValueCache = cache.NewInterQueryValueCache(ctx, manager.InterQueryBuiltinCacheConfig())
 	opa.config = bs
 
+	opa.mtx.Unlock()
+
+	if err := manager.Start(ctx); err != nil {
+		return err
+	}
+
+	// Resolve the buffered logger: flush to logger plugin if configured,
+	// otherwise discard (no fallback).
+	opa.logger = manager.ResolveBufferedLogger(nil)
+
+	if block {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ready:
+		}
+	}
+
 	return nil
 }
 
 // Stop closes the OPA. The OPA cannot be restarted.
 func (opa *OPA) Stop(ctx context.Context) {
-
 	opa.mtx.Lock()
 	mgr := opa.state.manager
 	opa.mtx.Unlock()
@@ -295,7 +300,6 @@ func (opa *OPA) Stop(ctx context.Context) {
 
 // Decision returns a named decision. This function is threadsafe.
 func (opa *OPA) Decision(ctx context.Context, options DecisionOptions) (*DecisionResult, error) {
-
 	record := server.Info{
 		Timestamp:      options.Now,
 		Path:           options.Path,
@@ -312,6 +316,9 @@ func (opa *OPA) Decision(ctx context.Context, options DecisionOptions) (*Decisio
 			ndbc = v
 		}
 	}
+
+	// TODO: make extractor configurable via SDK options
+	tracker := &topdown.EvaluatedRuleTracker{}
 
 	result, err := opa.executeTransaction(
 		ctx,
@@ -335,10 +342,13 @@ func (opa *OPA) Decision(ctx context.Context, options DecisionOptions) (*Decisio
 				tracer:                      options.Tracer,
 				profiler:                    options.Profiler,
 				instrument:                  options.Instrument,
+				evaluatedRules:              tracker,
+				httpRoundTripper:            options.HTTPRoundTripper,
 			})
 			if record.Error == nil {
 				record.Results = &result.Result
 			}
+			record.EvaluatedRuleLabels = tracker.Labels
 		},
 	)
 	if err != nil {
@@ -360,6 +370,14 @@ type DecisionOptions struct {
 	Profiler            topdown.QueryTracer // specifies the profiler to use, optional
 	Instrument          bool                // if true, instrumentation will be enabled
 	DecisionID          string              // the identifier for this decision; if not set, a globally unique identifier will be generated
+
+	// HTTPRoundTripper customizes the http.RoundTripper used by http.send
+	// during this decision. The provided function receives the http.Transport
+	// OPA would otherwise use — which may be nil for plain-HTTP requests
+	// without TLS or unix-socket options — and returns the http.RoundTripper
+	// to use in its place, typically a wrapper around the received transport.
+	// When nil, OPA's default behavior is preserved.
+	HTTPRoundTripper topdown.CustomizeRoundTripper
 }
 
 // DecisionResult contains the output of query evaluation.
@@ -370,9 +388,7 @@ type DecisionResult struct {
 }
 
 func (opa *OPA) executeTransaction(ctx context.Context, record *server.Info, work func(state, *DecisionResult)) (*DecisionResult, error) {
-	if record.Metrics == nil {
-		record.Metrics = metrics.New()
-	}
+	record.Metrics = util.Or(record.Metrics, metrics.New)
 	record.Metrics.Timer(metrics.SDKDecisionEval).Start()
 
 	if record.DecisionID == "" {
@@ -394,7 +410,7 @@ func (opa *OPA) executeTransaction(ctx context.Context, record *server.Info, wor
 	}
 
 	if record.Path == "" {
-		record.Path = *s.manager.Config.DefaultDecision
+		record.Path = *s.manager.GetConfig().DefaultDecision
 	}
 
 	record.Txn, record.Error = s.manager.Store.NewTransaction(ctx, storage.TransactionParams{})
@@ -429,7 +445,6 @@ func (opa *OPA) executeTransaction(ctx context.Context, record *server.Info, wor
 // Note(philipc): The NDBCache is unused here, because non-deterministic
 // builtins are not run during partial evaluation.
 func (opa *OPA) Partial(ctx context.Context, options PartialOptions) (*PartialResult, error) {
-
 	if options.Mapper == nil {
 		options.Mapper = &RawMapper{}
 	}
@@ -565,10 +580,11 @@ type evalArgs struct {
 	tracer                      topdown.QueryTracer
 	profiler                    topdown.QueryTracer
 	instrument                  bool
+	evaluatedRules              *topdown.EvaluatedRuleTracker
+	httpRoundTripper            topdown.CustomizeRoundTripper
 }
 
 func evaluate(ctx context.Context, args evalArgs) (any, types.ProvenanceV1, ast.Value, map[string]server.BundleInfo, error) {
-
 	provenance := types.ProvenanceV1{
 		Version:   version.Version,
 		Vcs:       version.Vcs,
@@ -592,7 +608,7 @@ func evaluate(ctx context.Context, args evalArgs) (any, types.ProvenanceV1, ast.
 	}
 
 	pq, err := args.queryCache.Get(r.String(), func(query string) (*rego.PreparedEvalQuery, error) {
-		pq, err := rego.New(
+		opts := []func(*rego.Rego){
 			rego.Time(args.now),
 			rego.Metrics(args.m),
 			rego.Query(query),
@@ -602,7 +618,12 @@ func evaluate(ctx context.Context, args evalArgs) (any, types.ProvenanceV1, ast.
 			rego.PrintHook(args.printHook),
 			rego.StrictBuiltinErrors(args.strictBuiltinErrors),
 			rego.Instrument(args.instrument),
-			rego.Runtime(args.runtime)).PrepareForEval(ctx)
+			rego.Runtime(args.runtime),
+		}
+		if args.evaluatedRules != nil {
+			opts = append(opts, rego.EvaluatedRuleTracker(args.evaluatedRules))
+		}
+		pq, err := rego.New(opts...).PrepareForEval(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -629,6 +650,7 @@ func evaluate(ctx context.Context, args evalArgs) (any, types.ProvenanceV1, ast.
 		rego.EvalMetrics(args.m),
 		rego.EvalQueryTracer(args.profiler),
 		rego.EvalInstrument(args.instrument),
+		rego.EvalHTTPRoundTripper(args.httpRoundTripper),
 	)
 	if err != nil {
 		return nil, provenance, inputAST, bundles, err
@@ -657,7 +679,6 @@ type partialEvalArgs struct {
 }
 
 func partial(ctx context.Context, args partialEvalArgs) (*rego.PartialQueries, types.ProvenanceV1, ast.Value, map[string]server.BundleInfo, error) {
-
 	provenance := types.ProvenanceV1{
 		Version: version.Version,
 		Bundles: make(map[string]types.ProvenanceBundleV1),
@@ -756,6 +777,6 @@ type loggingPrintHook struct {
 }
 
 func (h loggingPrintHook) Print(pctx print.Context, msg string) error {
-	h.logger.WithFields(map[string]any{"line": pctx.Location.String()}).Info(msg)
+	h.logger.WithFields(map[string]any{"line": pctx.Location.String()}).Info("%s", msg)
 	return nil
 }

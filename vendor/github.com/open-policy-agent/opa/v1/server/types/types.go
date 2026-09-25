@@ -9,12 +9,110 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 
 	"github.com/open-policy-agent/opa/v1/ast"
 	"github.com/open-policy-agent/opa/v1/topdown"
 	"github.com/open-policy-agent/opa/v1/util"
 )
+
+// jsonFields holds the set of JSON field names declared on registered types.
+// It is populated at package init time (see RegisterJSONFields) and is
+// read-only thereafter, so concurrent reads need no synchronization.
+var jsonFields = map[reflect.Type]map[string]bool{}
+
+// RegisterJSONFields records the JSON field names declared on T so that
+// UnmarshalExtras and MarshalExtras can distinguish known fields from extras.
+// Call from an init() function in the package that defines T.
+func RegisterJSONFields[T any]() {
+	t := reflect.TypeFor[T]()
+	if t.Kind() != reflect.Struct {
+		panic(fmt.Sprintf("types: RegisterJSONFields[%s]: not a struct", t))
+	}
+	f := make(map[string]bool, t.NumField())
+	for sf := range t.Fields() {
+		tag := sf.Tag.Get("json")
+		if tag == "-" {
+			continue
+		}
+		name, _, _ := strings.Cut(tag, ",")
+		if name == "" {
+			name = sf.Name
+		}
+		f[name] = true
+	}
+	jsonFields[t] = f
+}
+
+func knownJSONFields[T any]() map[string]bool {
+	t := reflect.TypeFor[T]()
+	f, ok := jsonFields[t]
+	if !ok {
+		panic(fmt.Sprintf("types: %s not registered with RegisterJSONFields", t))
+	}
+	return f
+}
+
+// UnmarshalExtras decodes data into into (typically a *alias of T to avoid
+// recursing through T's UnmarshalJSON), then returns any top-level JSON keys
+// not declared on T. T must have been registered with RegisterJSONFields.
+func UnmarshalExtras[T any](data []byte, into any) (map[string]any, error) {
+	if err := util.UnmarshalJSON(data, into); err != nil {
+		return nil, err
+	}
+	var raw map[string]json.RawMessage
+	if err := util.UnmarshalJSON(data, &raw); err != nil {
+		return nil, err
+	}
+	known := knownJSONFields[T]()
+	var extra map[string]any
+	for k, val := range raw {
+		if known[k] {
+			continue
+		}
+		var v any
+		if err := util.UnmarshalJSON(val, &v); err != nil {
+			return nil, err
+		}
+		if extra == nil {
+			extra = make(map[string]any)
+		}
+		extra[k] = v
+	}
+	return extra, nil
+}
+
+// MarshalExtras marshals v (typically an alias of T to avoid recursing through
+// T's MarshalJSON) and merges extra into the resulting JSON object, dropping
+// any extra keys that collide with a JSON field declared on T. T must have
+// been registered with RegisterJSONFields.
+func MarshalExtras[T any](v any, extra map[string]any) ([]byte, error) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	if len(extra) == 0 {
+		return data, nil
+	}
+	known := knownJSONFields[T]()
+	var base map[string]any
+	if err := json.Unmarshal(data, &base); err != nil {
+		return nil, err
+	}
+	for k, val := range extra {
+		if known[k] {
+			continue
+		}
+		base[k] = val
+	}
+	return json.Marshal(base)
+}
+
+func init() {
+	RegisterJSONFields[DataRequestV1]()
+	RegisterJSONFields[DataResponseV1]()
+}
 
 // Error codes returned by OPA's REST API.
 const (
@@ -142,6 +240,26 @@ type ProvenanceBundleV1 struct {
 // DataRequestV1 models the request message for Data API POST operations.
 type DataRequestV1 struct {
 	Input *any `json:"input"`
+
+	// Metadata holds any additional top-level fields not defined in this struct.
+	// These fields are preserved during JSON unmarshaling, allowing wrapping
+	// projects to pass through custom key/value pairs.
+	//
+	// Future OPA versions may introduce new top-level keys. To avoid conflicts,
+	// use a unique namespaced key, e.g. "com.example.opa/metadata": { ... }.
+	Metadata map[string]any `json:"-"`
+}
+
+func (r *DataRequestV1) UnmarshalJSON(data []byte) error {
+	type alias DataRequestV1
+	extra, err := UnmarshalExtras[DataRequestV1](data, (*alias)(r))
+	r.Metadata = extra
+	return err
+}
+
+func (r DataRequestV1) MarshalJSON() ([]byte, error) {
+	type alias DataRequestV1
+	return MarshalExtras[DataRequestV1](alias(r), r.Metadata)
 }
 
 // DataResponseV1 models the response message for Data API read operations.
@@ -152,6 +270,26 @@ type DataResponseV1 struct {
 	Metrics     MetricsV1     `json:"metrics,omitempty"`
 	Result      *any          `json:"result,omitempty"`
 	Warning     *Warning      `json:"warning,omitempty"`
+
+	// Metadata holds any additional top-level fields not defined in this struct.
+	// These fields are preserved during JSON marshaling/unmarshaling, allowing
+	// wrapping projects to pass through custom key/value pairs.
+	//
+	// Future OPA versions may introduce new top-level keys. To avoid conflicts,
+	// use a unique namespaced key, e.g. "com.example.opa/metadata": { ... }.
+	Metadata map[string]any `json:"-"`
+}
+
+func (r *DataResponseV1) UnmarshalJSON(data []byte) error {
+	type alias DataResponseV1
+	extra, err := UnmarshalExtras[DataResponseV1](data, (*alias)(r))
+	r.Metadata = extra
+	return err
+}
+
+func (r DataResponseV1) MarshalJSON() ([]byte, error) {
+	type alias DataResponseV1
+	return MarshalExtras[DataResponseV1](alias(r), r.Metadata)
 }
 
 // Warning models DataResponse warnings
@@ -376,7 +514,7 @@ type CompileRequestV1 struct {
 	Options  struct {
 		DisableInlining          []string `json:"disableInlining,omitempty"`
 		NondeterministicBuiltins bool     `json:"nondeterministicBuiltins"`
-	} `json:"options,omitempty"`
+	} `json:"options"`
 }
 
 // CompileResponseV1 models the response message for Compile API operations.
@@ -448,6 +586,7 @@ const (
 	// ParamBundleActivationV1 defines the name of the HTTP URL parameter that
 	// indicates the client wants to include bundle activation in the results
 	// of the health API.
+	//
 	// Deprecated: Use ParamBundlesActivationV1 instead.
 	ParamBundleActivationV1 = "bundle"
 

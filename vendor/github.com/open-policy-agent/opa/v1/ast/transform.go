@@ -19,7 +19,6 @@ type Transformer interface {
 // Transform iterates the AST and calls the Transform function on the
 // Transformer t for x before recursing.
 func Transform(t Transformer, x any) (any, error) {
-
 	if term, ok := x.(*Term); ok {
 		return Transform(t, term.Value)
 	}
@@ -90,14 +89,10 @@ func Transform(t Transformer, x any) (any, error) {
 		}
 		return y, nil
 	case *Import:
-		y.Path, err = transformTerm(t, y.Path)
-		if err != nil {
-			return nil, err
+		if y.Path, err = transformTerm(t, y.Path); err == nil {
+			y.Alias, err = transformVar(t, y.Alias)
 		}
-		if y.Alias, err = transformVar(t, y.Alias); err != nil {
-			return nil, err
-		}
-		return y, nil
+		return y, err
 	case *Rule:
 		if y.Head, err = transformHead(t, y.Head); err != nil {
 			return nil, err
@@ -195,6 +190,29 @@ func Transform(t Transformer, x any) (any, error) {
 				return nil, err
 			}
 			y.Terms = ts
+		case *Not:
+			ts.Body, err = transformBody(t, ts.Body)
+			if err != nil {
+				return nil, err
+			}
+		case *LogicalAnd:
+			ts.Lhs, err = transformBody(t, ts.Lhs)
+			if err != nil {
+				return nil, err
+			}
+			ts.Rhs, err = transformBody(t, ts.Rhs)
+			if err != nil {
+				return nil, err
+			}
+		case *LogicalOr:
+			ts.Lhs, err = transformBody(t, ts.Lhs)
+			if err != nil {
+				return nil, err
+			}
+			ts.Rhs, err = transformBody(t, ts.Rhs)
+			if err != nil {
+				return nil, err
+			}
 		}
 		for i, w := range y.With {
 			w, err := Transform(t, w)
@@ -284,6 +302,19 @@ func Transform(t Transformer, x any) (any, error) {
 			}
 		}
 		return y, nil
+	case *TemplateString:
+		for i := range y.Parts {
+			if expr, ok := y.Parts[i].(*Expr); ok {
+				transformed, err := Transform(t, expr)
+				if err != nil {
+					return nil, err
+				}
+				if y.Parts[i], ok = transformed.(*Expr); !ok {
+					return nil, fmt.Errorf("illegal transform: %T != %T", expr, transformed)
+				}
+			}
+		}
+		return y, nil
 	default:
 		return y, nil
 	}
@@ -291,29 +322,29 @@ func Transform(t Transformer, x any) (any, error) {
 
 // TransformRefs calls the function f on all references under x.
 func TransformRefs(x any, f func(Ref) (Value, error)) (any, error) {
-	t := &GenericTransformer{func(x any) (any, error) {
+	t := NewGenericTransformer(func(x any) (any, error) {
 		if r, ok := x.(Ref); ok {
 			return f(r)
 		}
 		return x, nil
-	}}
+	})
 	return Transform(t, x)
 }
 
 // TransformVars calls the function f on all vars under x.
 func TransformVars(x any, f func(Var) (Value, error)) (any, error) {
-	t := &GenericTransformer{func(x any) (any, error) {
+	t := NewGenericTransformer(func(x any) (any, error) {
 		if v, ok := x.(Var); ok {
 			return f(v)
 		}
 		return x, nil
-	}}
+	})
 	return Transform(t, x)
 }
 
-// TransformComprehensions calls the functio nf on all comprehensions under x.
+// TransformComprehensions calls the function f on all comprehensions under x.
 func TransformComprehensions(x any, f func(any) (Value, error)) (any, error) {
-	t := &GenericTransformer{func(x any) (any, error) {
+	t := NewGenericTransformer(func(x any) (any, error) {
 		switch x := x.(type) {
 		case *ArrayComprehension:
 			return f(x)
@@ -323,7 +354,7 @@ func TransformComprehensions(x any, f func(any) (Value, error)) (any, error) {
 			return f(x)
 		}
 		return x, nil
-	}}
+	})
 	return Transform(t, x)
 }
 
@@ -387,11 +418,7 @@ func transformTerm(t Transformer, term *Term) (*Term, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &Term{
-		Value:    v,
-		Location: term.Location,
-	}
-	return r, nil
+	return &Term{Value: v, Location: term.Location}, nil
 }
 
 func transformValue(t Transformer, v Value) (Value, error) {
@@ -407,13 +434,18 @@ func transformValue(t Transformer, v Value) (Value, error) {
 }
 
 func transformVar(t Transformer, v Var) (Var, error) {
-	v1, err := Transform(t, v)
+	tv, err := t.Transform(v)
 	if err != nil {
 		return "", err
 	}
-	r, ok := v1.(Var)
+
+	if tv == nil {
+		return "", nil
+	}
+
+	r, ok := tv.(Var)
 	if !ok {
-		return "", fmt.Errorf("illegal transform: %T != %T", v, v1)
+		return "", fmt.Errorf("illegal transform: %T != %T", v, tv)
 	}
 	return r, nil
 }
