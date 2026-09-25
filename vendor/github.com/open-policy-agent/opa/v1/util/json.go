@@ -9,25 +9,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"reflect"
+	"slices"
+	"strconv"
 
-	"sigs.k8s.io/yaml"
-
+	"github.com/open-policy-agent/opa/internal/yaml"
 	"github.com/open-policy-agent/opa/v1/loader/extension"
 )
 
 // UnmarshalJSON parses the JSON encoded data and stores the result in the value
 // pointed to by x.
 //
-// This function is intended to be used in place of the standard json.Marshal
-// function when json.Number is required.
+// This function is intended to be used in place of the standard [json.Marshal]
+// function when [json.Number] is required.
 func UnmarshalJSON(bs []byte, x any) error {
 	return unmarshalJSON(bs, x, true)
 }
 
 func unmarshalJSON(bs []byte, x any, ext bool) error {
-	buf := bytes.NewBuffer(bs)
-	decoder := NewJSONDecoder(buf)
+	decoder := NewJSONDecoder(bytes.NewBuffer(bs))
 	if err := decoder.Decode(x); err != nil {
 		if handler := extension.FindExtension(".json"); handler != nil && ext {
 			return handler(bs, x)
@@ -49,8 +50,8 @@ func unmarshalJSON(bs []byte, x any, ext bool) error {
 
 // NewJSONDecoder returns a new decoder that reads from r.
 //
-// This function is intended to be used in place of the standard json.NewDecoder
-// when json.Number is required.
+// This function is intended to be used in place of the standard [json.NewDecoder]
+// when [json.Number] is required.
 func NewJSONDecoder(r io.Reader) *json.Decoder {
 	decoder := json.NewDecoder(r)
 	decoder.UseNumber()
@@ -87,22 +88,177 @@ func MustMarshalJSON(x any) []byte {
 // rego.Input and inmem's Write operations. Works with both references and
 // values.
 func RoundTrip(x *any) error {
+	// Avoid round-tripping types that won't change as a result of
+	// marshalling/unmarshalling, as even for those values, round-tripping
+	// comes with a significant cost.
+	if x == nil || !NeedsRoundTrip(*x) {
+		return nil
+	}
+
+	// For number types, we can write the json.Number representation
+	// directly into x without marshalling to bytes and back.
+	a := *x
+	switch v := a.(type) {
+	case int:
+		*x = json.Number(strconv.Itoa(v))
+		return nil
+	case int8:
+		*x = json.Number(strconv.FormatInt(int64(v), 10))
+		return nil
+	case int16:
+		*x = json.Number(strconv.FormatInt(int64(v), 10))
+		return nil
+	case int32:
+		*x = json.Number(strconv.FormatInt(int64(v), 10))
+		return nil
+	case int64:
+		*x = json.Number(strconv.FormatInt(v, 10))
+		return nil
+	case uint:
+		*x = json.Number(strconv.FormatUint(uint64(v), 10))
+		return nil
+	case uint8:
+		*x = json.Number(strconv.FormatUint(uint64(v), 10))
+		return nil
+	case uint16:
+		*x = json.Number(strconv.FormatUint(uint64(v), 10))
+		return nil
+	case uint32:
+		*x = json.Number(strconv.FormatUint(uint64(v), 10))
+		return nil
+	case uint64:
+		*x = json.Number(strconv.FormatUint(v, 10))
+		return nil
+	case float32:
+		*x = json.Number(strconv.FormatFloat(float64(v), 'f', -1, 32))
+		return nil
+	case float64:
+		*x = json.Number(strconv.FormatFloat(v, 'f', -1, 64))
+		return nil
+	}
+
 	bs, err := json.Marshal(x)
 	if err != nil {
 		return err
 	}
-	return UnmarshalJSON(bs, x)
+
+	// Decode into a fresh value instead of reusing *x: if *x holds a non-nil
+	// pointer, json.Unmarshal decodes into the pointed-to value in place
+	// rather than replacing it.
+	var y any
+	if err := UnmarshalJSON(bs, &y); err != nil {
+		return err
+	}
+	*x = y
+	return nil
+}
+
+// NeedsRoundTrip returns true if the value won't change as a result of
+// a marshalling/unmarshalling round-trip. Since [RoundTrip] itself calls
+// this you normally don't need to call this function directly, unless you
+// want to make decisions based on the round-tripability of a value without
+// actually doing the round-trip.
+func NeedsRoundTrip(x any) bool {
+	switch x.(type) {
+	case nil, bool, string, json.Number:
+		return false
+	}
+	return true
+}
+
+// RoundTripFast is equivalent to [RoundTrip], but recurses natively through
+// map[string]any and []any instead of going through JSON bytes, falling
+// back to [RoundTrip] for any other type.
+func RoundTripFast(x *any) error {
+	if x == nil {
+		return nil
+	}
+	y, err := roundTripFastValue(*x, 0, nil)
+	if err != nil {
+		return err
+	}
+	*x = y
+	return nil
+}
+
+// startDetectingCyclesAfter matches encoding/json's own threshold.
+const startDetectingCyclesAfter = 1000
+
+// depth/seen detect cycles the way encoding/json does: native recursion
+// doesn't get that check for free from json.Marshal like RoundTrip's
+// fallback path does.
+func roundTripFastValue(v any, depth int, seen map[uintptr]struct{}) (any, error) {
+	switch x := v.(type) {
+	case nil, bool, string, json.Number:
+		return x, nil
+	case map[string]any:
+		if x == nil {
+			return nil, nil
+		}
+		ptr := uintptr(reflect.ValueOf(x).UnsafePointer())
+		if depth >= startDetectingCyclesAfter {
+			if _, ok := seen[ptr]; ok {
+				return nil, fmt.Errorf("json: unsupported value: encountered a cycle via %T", x)
+			}
+			seen = markSeen(seen, ptr)
+		}
+		cpy := maps.Clone(x)
+		for k, e := range cpy {
+			c, err := roundTripFastValue(e, depth+1, seen)
+			if err != nil {
+				return nil, err
+			}
+			cpy[k] = c
+		}
+		delete(seen, ptr)
+		return cpy, nil
+	case []any:
+		if x == nil {
+			return nil, nil
+		}
+		ptr := uintptr(reflect.ValueOf(x).UnsafePointer())
+		if depth >= startDetectingCyclesAfter {
+			if _, ok := seen[ptr]; ok {
+				return nil, fmt.Errorf("json: unsupported value: encountered a cycle via %T", x)
+			}
+			seen = markSeen(seen, ptr)
+		}
+		cpy := slices.Clone(x)
+		for i, e := range cpy {
+			c, err := roundTripFastValue(e, depth+1, seen)
+			if err != nil {
+				return nil, err
+			}
+			cpy[i] = c
+		}
+		delete(seen, ptr)
+		return cpy, nil
+	default:
+		y := v
+		if err := RoundTrip(&y); err != nil {
+			return nil, err
+		}
+		return y, nil
+	}
+}
+
+func markSeen(seen map[uintptr]struct{}, ptr uintptr) map[uintptr]struct{} {
+	if seen == nil {
+		seen = map[uintptr]struct{}{}
+	}
+	seen[ptr] = struct{}{}
+	return seen
 }
 
 // Reference returns a pointer to its argument unless the argument already is
 // a pointer. If the argument is **t, or ***t, etc, it will return *t.
 //
 // Used for preparing Go types (including pointers to structs) into values to be
-// put through util.RoundTrip().
+// put through [RoundTrip].
 func Reference(x any) *any {
 	var y any
 	rv := reflect.ValueOf(x)
-	if rv.Kind() == reflect.Ptr {
+	if rv.Kind() == reflect.Pointer {
 		return Reference(rv.Elem().Interface())
 	}
 	if rv.Kind() != reflect.Invalid {
