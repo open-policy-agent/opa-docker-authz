@@ -7,7 +7,6 @@ package rest
 import (
 	"context"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/tls"
@@ -29,9 +28,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/open-policy-agent/opa/internal/jwx/jwa"
-	"github.com/open-policy-agent/opa/internal/jwx/jws"
-	"github.com/open-policy-agent/opa/internal/jwx/jws/sign"
+	"github.com/lestrrat-go/jwx/v3/jwa"
+	"github.com/lestrrat-go/jwx/v3/jws"
 	"github.com/open-policy-agent/opa/internal/providers/aws"
 	"github.com/open-policy-agent/opa/internal/uuid"
 	"github.com/open-policy-agent/opa/v1/keys"
@@ -44,59 +42,6 @@ const (
 	// Default to urn:ietf:params:oauth:client-assertion-type:jwt-bearer for ClientAssertionType when not specified
 	defaultClientAssertionType = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 )
-
-// DefaultTLSConfig defines standard TLS configurations based on the Config
-func DefaultTLSConfig(c Config) (*tls.Config, error) {
-	t := &tls.Config{}
-	url, err := url.Parse(c.URL)
-	if err != nil {
-		return nil, err
-	}
-	if url.Scheme == "https" {
-		t.InsecureSkipVerify = c.AllowInsecureTLS
-	}
-
-	if c.TLS != nil && c.TLS.CACert != "" {
-		caCert, err := os.ReadFile(c.TLS.CACert)
-		if err != nil {
-			return nil, err
-		}
-
-		var rootCAs *x509.CertPool
-		if c.TLS.SystemCARequired {
-			rootCAs, err = x509.SystemCertPool()
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			rootCAs = x509.NewCertPool()
-		}
-
-		ok := rootCAs.AppendCertsFromPEM(caCert)
-		if !ok {
-			return nil, errors.New("unable to parse and append CA certificate to certificate pool")
-		}
-		t.RootCAs = rootCAs
-	}
-
-	return t, nil
-}
-
-// DefaultRoundTripperClient is a reasonable set of defaults for HTTP auth plugins
-func DefaultRoundTripperClient(t *tls.Config, timeout int64) *http.Client {
-	// Ensure we use a http.Transport with proper settings: the zero values are not
-	// a good choice, as they cause leaking connections:
-	// https://github.com/golang/go/issues/19620
-
-	// copy, we don't want to alter the default client's Transport
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.ResponseHeaderTimeout = time.Duration(timeout) * time.Second
-	tr.TLSClientConfig = t
-
-	c := *http.DefaultClient
-	c.Transport = tr
-	return &c
-}
 
 // defaultAuthPlugin represents baseline 'no auth' behavior if no alternative plugin is specified for a service
 type defaultAuthPlugin struct{}
@@ -111,11 +56,6 @@ func (*defaultAuthPlugin) NewClient(c Config) (*http.Client, error) {
 
 func (*defaultAuthPlugin) Prepare(*http.Request) error {
 	return nil
-}
-
-type serverTLSConfig struct {
-	CACert           string `json:"ca_cert,omitempty"`
-	SystemCARequired bool   `json:"system_ca_required,omitempty"`
 }
 
 // bearerAuthPlugin represents authentication via a bearer token in the HTTP Authorization header
@@ -216,8 +156,8 @@ func convertSignatureToBase64(alg string, der []byte) (string, error) {
 	return signatureData, nil
 }
 
-func pointsFromDER(der []byte) (R, S *big.Int, err error) { //nolint:gocritic
-	R, S = &big.Int{}, &big.Int{}
+func pointsFromDER(der []byte) (bigR, bigS *big.Int, err error) {
+	bigR, bigS = &big.Int{}, &big.Int{}
 	data := asn1.RawValue{}
 	if _, err := asn1.Unmarshal(der, &data); err != nil {
 		return nil, nil, fmt.Errorf("failed to unmarshall the signature from DER format %v", err)
@@ -230,8 +170,8 @@ func pointsFromDER(der []byte) (R, S *big.Int, err error) { //nolint:gocritic
 	r := data.Bytes[2 : rLen+2]
 	// Ignore the next 0x02 and slen bytes and just take the start of S to the end of the byte array
 	s := data.Bytes[rLen+4:]
-	R.SetBytes(r)
-	S.SetBytes(s)
+	bigR.SetBytes(r)
+	bigS.SetBytes(s)
 	return
 }
 
@@ -247,13 +187,12 @@ func convertPointsToBase64(alg string, r, s []byte) (string, error) {
 	// We serialize the outputs (r and s) into big-endian byte arrays and pad
 	// them with zeros on the left to make sure the sizes work out. Both arrays
 	// must be keyBytes long, and the output must be 2*keyBytes long.
-	rBytesPadded := make([]byte, keyBytes)
+	rBytesPadded := make([]byte, keyBytes, 2*keyBytes)
 	copy(rBytesPadded[keyBytes-len(r):], r)
 	sBytesPadded := make([]byte, keyBytes)
 	copy(sBytesPadded[keyBytes-len(s):], s)
-	signatureEnc := append(rBytesPadded, sBytesPadded...)
 
-	return base64.RawURLEncoding.EncodeToString(signatureEnc), nil
+	return base64.RawURLEncoding.EncodeToString(append(rBytesPadded, sBytesPadded...)), nil
 }
 
 func retrieveCurveBits(alg string) (int, error) {
@@ -317,7 +256,7 @@ type oauth2ClientCredentialsAuthPlugin struct {
 	signingKey       *keys.Config
 	signingKeyParsed any
 	tokenCache       *oauth2Token
-	tlsSkipVerify    bool
+	tokenTLSConfig   *tls.Config
 	logger           logging.Logger
 }
 
@@ -391,11 +330,28 @@ func (ap *oauth2ClientCredentialsAuthPlugin) createAuthJWT(ctx context.Context, 
 	case ap.AzureKeyVault != nil:
 		clientAssertion, err = ap.SignWithKeyVault(ctx, payload, header)
 	default:
-		clientAssertion, err = jws.SignLiteral(payload,
-			jwa.SignatureAlgorithm(alg),
-			signingKey,
-			header,
-			rand.Reader)
+		// Parse the algorithm string to jwa.SignatureAlgorithm
+		algObj, ok := jwa.LookupSignatureAlgorithm(alg)
+		if !ok {
+			return nil, fmt.Errorf("unknown signature algorithm: %s", alg)
+		}
+
+		// Parse headers
+		var headers map[string]any
+		if err := json.Unmarshal(header, &headers); err != nil {
+			return nil, err
+		}
+
+		// Create protected headers
+		protectedHeaders := jws.NewHeaders()
+		for k, v := range headers {
+			if err := protectedHeaders.Set(k, v); err != nil {
+				return nil, err
+			}
+		}
+
+		clientAssertion, err = jws.Sign(payload,
+			jws.WithKey(algObj, signingKey, jws.WithProtectedHeaders(protectedHeaders)))
 	}
 	if err != nil {
 		return nil, err
@@ -459,7 +415,6 @@ func (ap *oauth2ClientCredentialsAuthPlugin) SignWithKeyVault(ctx context.Contex
 	input := encodedHdr + "." + encodedPayload
 	digest, err := messageDigest([]byte(input), ap.AzureSigningPlugin.keyVaultSignPlugin.config.Alg)
 	if err != nil {
-		fmt.Println("unsupported algorithm", ap.AzureSigningPlugin.keyVaultSignPlugin.config.Alg)
 		return nil, err
 	}
 
@@ -485,13 +440,38 @@ func (ap *oauth2ClientCredentialsAuthPlugin) parseSigningKey(c Config) (err erro
 		return errors.New("signing_key refers to non-existent key")
 	}
 
-	alg := jwa.SignatureAlgorithm(ap.signingKey.Algorithm)
-	ap.signingKeyParsed, err = sign.GetSigningKey(ap.signingKey.PrivateKey, alg)
-	if err != nil {
-		return err
+	alg, ok := jwa.LookupSignatureAlgorithm(ap.signingKey.Algorithm)
+	if !ok {
+		return fmt.Errorf("unknown signature algorithm: %s", ap.signingKey.Algorithm)
 	}
 
-	return nil
+	// Parse the private key directly
+	keyData := ap.signingKey.PrivateKey
+
+	// For HMAC algorithms, return the key as bytes
+	if alg == jwa.HS256() || alg == jwa.HS384() || alg == jwa.HS512() {
+		ap.signingKeyParsed = []byte(keyData)
+		return nil
+	}
+
+	// For RSA/ECDSA algorithms, parse the PEM-encoded key
+	block, _ := pem.Decode([]byte(keyData))
+	if block == nil {
+		return errors.New("failed to decode PEM key")
+	}
+
+	switch block.Type {
+	case "RSA PRIVATE KEY":
+		ap.signingKeyParsed, err = x509.ParsePKCS1PrivateKey(block.Bytes)
+	case "PRIVATE KEY":
+		ap.signingKeyParsed, err = x509.ParsePKCS8PrivateKey(block.Bytes)
+	case "EC PRIVATE KEY":
+		ap.signingKeyParsed, err = x509.ParseECPrivateKey(block.Bytes)
+	default:
+		return fmt.Errorf("unsupported key type: %s", block.Type)
+	}
+
+	return err
 }
 
 func (ap *oauth2ClientCredentialsAuthPlugin) NewClient(c Config) (*http.Client, error) {
@@ -513,8 +493,14 @@ func (ap *oauth2ClientCredentialsAuthPlugin) NewClient(c Config) (*http.Client, 
 		}
 	}
 
-	// Inherit skip verify from the "parent" settings. Should this be configurable on the credentials too?
-	ap.tlsSkipVerify = c.AllowInsecureTLS
+	// Inherit TLS config from the "parent" service config so that the token
+	// endpoint client uses the same CA certs, min TLS version, cipher suites,
+	// and insecure-skip-verify setting as the service itself.
+	ap.tokenTLSConfig = t.Clone()
+	// The token URL is always https (validated below). DefaultTLSConfig only
+	// sets InsecureSkipVerify when the *service* URL is https, but we need
+	// the setting to apply to the token endpoint regardless.
+	ap.tokenTLSConfig.InsecureSkipVerify = c.AllowInsecureTLS
 
 	ap.logger = c.logger
 
@@ -670,7 +656,7 @@ func (ap *oauth2ClientCredentialsAuthPlugin) requestToken(ctx context.Context) (
 		r.Header.Add(k, v)
 	}
 
-	client := DefaultRoundTripperClient(&tls.Config{InsecureSkipVerify: ap.tlsSkipVerify}, 10)
+	client := DefaultRoundTripperClient(ap.tokenTLSConfig.Clone(), 10)
 	response, err := client.Do(r)
 	if err != nil {
 		return nil, err
@@ -714,120 +700,6 @@ func (ap *oauth2ClientCredentialsAuthPlugin) Prepare(req *http.Request) error {
 	}
 
 	req.Header.Add("Authorization", fmt.Sprintf("Bearer %v", ap.tokenCache.Token))
-	return nil
-}
-
-// clientTLSAuthPlugin represents authentication via client certificate on a TLS connection
-type clientTLSAuthPlugin struct {
-	Cert                 string `json:"cert"`
-	PrivateKey           string `json:"private_key"`
-	PrivateKeyPassphrase string `json:"private_key_passphrase,omitempty"`
-	CACert               string `json:"ca_cert,omitempty"`            // Deprecated: Use `services[_].tls.ca_cert` instead
-	SystemCARequired     bool   `json:"system_ca_required,omitempty"` // Deprecated: Use `services[_].tls.system_ca_required` instead
-}
-
-func (ap *clientTLSAuthPlugin) NewClient(c Config) (*http.Client, error) {
-	tlsConfig, err := DefaultTLSConfig(c)
-	if err != nil {
-		return nil, err
-	}
-
-	if ap.Cert == "" {
-		return nil, errors.New("client certificate is needed when client TLS is enabled")
-	}
-	if ap.PrivateKey == "" {
-		return nil, errors.New("private key is needed when client TLS is enabled")
-	}
-
-	var keyPEMBlock []byte
-	data, err := os.ReadFile(ap.PrivateKey)
-	if err != nil {
-		return nil, err
-	}
-
-	block, _ := pem.Decode(data)
-	if block == nil {
-		return nil, errors.New("PEM data could not be found")
-	}
-
-	// nolint: staticcheck // We don't want to forbid users from using this encryption.
-	if x509.IsEncryptedPEMBlock(block) {
-		if ap.PrivateKeyPassphrase == "" {
-			return nil, errors.New("client certificate passphrase is needed, because the certificate is password encrypted")
-		}
-		// nolint: staticcheck // We don't want to forbid users from using this encryption.
-		block, err := x509.DecryptPEMBlock(block, []byte(ap.PrivateKeyPassphrase))
-		if err != nil {
-			return nil, err
-		}
-		key, err := x509.ParsePKCS8PrivateKey(block)
-		if err != nil {
-			key, err = x509.ParsePKCS1PrivateKey(block)
-			if err != nil {
-				return nil, fmt.Errorf("private key should be a PEM or plain PKCS1 or PKCS8; parse error: %v", err)
-			}
-		}
-		rsa, ok := key.(*rsa.PrivateKey)
-		if !ok {
-			return nil, errors.New("private key is invalid")
-		}
-		keyPEMBlock = pem.EncodeToMemory(
-			&pem.Block{
-				Type:  "RSA PRIVATE KEY",
-				Bytes: x509.MarshalPKCS1PrivateKey(rsa),
-			},
-		)
-	} else {
-		keyPEMBlock = data
-	}
-
-	certPEMBlock, err := os.ReadFile(ap.Cert)
-	if err != nil {
-		return nil, err
-	}
-
-	cert, err := tls.X509KeyPair(certPEMBlock, keyPEMBlock)
-	if err != nil {
-		return nil, err
-	}
-	tlsConfig.Certificates = []tls.Certificate{cert}
-
-	var client *http.Client
-
-	if c.TLS != nil && c.TLS.CACert != "" {
-		client = DefaultRoundTripperClient(tlsConfig, *c.ResponseHeaderTimeoutSeconds)
-	} else {
-		if ap.CACert != "" {
-			c.logger.Warn("Deprecated 'services[_].credentials.client_tls.ca_cert' configuration specified. Use 'services[_].tls.ca_cert' instead. See https://www.openpolicyagent.org/docs/latest/configuration/#services")
-			caCert, err := os.ReadFile(ap.CACert)
-			if err != nil {
-				return nil, err
-			}
-
-			var caCertPool *x509.CertPool
-			if ap.SystemCARequired {
-				caCertPool, err = x509.SystemCertPool()
-				if err != nil {
-					return nil, err
-				}
-			} else {
-				caCertPool = x509.NewCertPool()
-			}
-
-			ok := caCertPool.AppendCertsFromPEM(caCert)
-			if !ok {
-				return nil, errors.New("unable to parse and append CA certificate to certificate pool")
-			}
-			tlsConfig.RootCAs = caCertPool
-		}
-
-		client = DefaultRoundTripperClient(tlsConfig, *c.ResponseHeaderTimeoutSeconds)
-	}
-
-	return client, nil
-}
-
-func (*clientTLSAuthPlugin) Prepare(_ *http.Request) error {
 	return nil
 }
 
@@ -1088,7 +960,6 @@ type azureSigningAuthPlugin struct {
 	MIAuthPlugin       *azureManagedIdentitiesAuthPlugin `json:"azure_managed_identity,omitempty"`
 	keyVaultSignPlugin *azureKeyVaultSignPlugin
 	keyVaultConfig     *azureKeyVaultConfig
-	host               string
 	Service            string `json:"service"`
 	logger             logging.Logger
 }
@@ -1098,13 +969,6 @@ func (ap *azureSigningAuthPlugin) NewClient(c Config) (*http.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	tknURL, err := url.Parse(c.URL)
-	if err != nil {
-		return nil, err
-	}
-
-	ap.host = tknURL.Host
 
 	if ap.logger == nil {
 		ap.logger = c.logger

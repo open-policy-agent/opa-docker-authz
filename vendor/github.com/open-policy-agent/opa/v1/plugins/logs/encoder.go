@@ -53,6 +53,10 @@ type chunkEncoder struct {
 	uncompressedLimit                  int64
 	uncompressedLimitScaleUpExponent   float64
 	uncompressedLimitScaleDownExponent float64
+
+	// scalingDown records that a scaleDown is already in progress further up the
+	// stack, so a nested one that cannot lower the limit knows it would cycle
+	scalingDown bool
 }
 
 func newChunkEncoder(limit int64) *chunkEncoder {
@@ -66,15 +70,6 @@ func newChunkEncoder(limit int64) *chunkEncoder {
 	enc.initialize()
 
 	return enc
-}
-
-func (enc *chunkEncoder) Reconfigure(limit int64) {
-	enc.limit = limit
-	enc.uncompressedLimit = limit
-	enc.uncompressedLimitScaleUpExponent = 0
-	enc.uncompressedLimitScaleDownExponent = 0
-	enc.threshold = int(float64(limit) * encCompressedLimitThreshold)
-	enc.lastDroppedNDSize = 0
 }
 
 // WithUncompressedLimit keep the adaptive uncompressed limit throughout the lifecycle of the size buffer
@@ -135,7 +130,7 @@ func (enc *chunkEncoder) Encode(event EventV1, eventBytes []byte) ([][]byte, err
 		}
 	}
 
-	if int64(len(eventBytes)+enc.bytesWritten+1) <= enc.uncompressedLimit {
+	if int64(len(eventBytes)+enc.bytesWritten+1) < enc.uncompressedLimit {
 		return nil, enc.appendEvent(eventBytes)
 	}
 
@@ -167,16 +162,12 @@ func (enc *chunkEncoder) Encode(event EventV1, eventBytes []byte) ([][]byte, err
 		}
 
 		currentSize := len(result)
-		if currentSize < int(enc.limit) {
+		if currentSize <= int(enc.limit) {
 			// success! the incoming chunk doesn't have to lose the ND cache and can go into a chunk by itself
 			// scale up the uncompressed limit using the uncompressed event size as a base
-			err = enc.appendEvent(eventBytes)
-			if err != nil {
-				return nil, err
-			}
 			enc.uncompressedLimit = int64(len(eventBytes))
 			enc.scaleUp()
-			return nil, nil
+			return [][]byte{result}, nil
 		}
 
 		// The ND cache has to be dropped, record this size as a known maximum event size
@@ -185,7 +176,6 @@ func (enc *chunkEncoder) Encode(event EventV1, eventBytes []byte) ([][]byte, err
 		}
 
 		// 2. Drop the ND cache and see if the incoming event can fit within the current chunk without the cache (so we can maximize chunk size)
-		enc.initialize()
 		enc.incrMetric(encLogExUploadSizeLimitCounterName)
 		// If there's no ND builtins cache in the event, then we don't need to retry encoding anything.
 		if event.NDBuiltinCache == nil {
@@ -300,6 +290,8 @@ func (enc *chunkEncoder) Encode(event EventV1, eventBytes []byte) ([][]byte, err
 }
 
 func (enc *chunkEncoder) scaleDown(events []EventV1) ([][]byte, error) {
+	reduced := false
+
 	if enc.uncompressedLimit > enc.limit {
 		enc.incrMetric(encUncompressedLimitScaleDownCounterName)
 		enc.incrMetric(encSoftLimitScaleDownCounterName)
@@ -314,10 +306,22 @@ func (enc *chunkEncoder) scaleDown(events []EventV1) ([][]byte, error) {
 		if enc.uncompressedLimitScaleUpExponent > 0 {
 			enc.uncompressedLimitScaleUpExponent -= uncompressedLimitExponentScaleFactor
 		}
+
+		reduced = true
 	}
 
 	// The uncompressed limit has grown too large the events need to be split up into multiple chunks
 	enc.initialize()
+
+	// A nested call that can't lower the limit further would re-encode the same
+	// events into the same branch, recursing until the stack is exhausted.
+	// Closing the chunk per event avoids it, as Encode never then reaches that
+	// branch. Surfaced by Go 1.27's compress/flate sizes, but not specific to it.
+	oneChunkPerEvent := enc.scalingDown && !reduced
+
+	wasScalingDown := enc.scalingDown
+	enc.scalingDown = true
+	defer func() { enc.scalingDown = wasScalingDown }()
 
 	// split the events into multiple chunks
 	var result [][]byte
@@ -335,6 +339,16 @@ func (enc *chunkEncoder) scaleDown(events []EventV1) ([][]byte, error) {
 
 		if chunks != nil {
 			result = append(result, chunks...)
+		}
+
+		if oneChunkPerEvent {
+			chunk, err := enc.reset()
+			if err != nil {
+				return nil, err
+			}
+			if chunk != nil {
+				result = append(result, chunk)
+			}
 		}
 	}
 
@@ -393,6 +407,9 @@ func (enc *chunkEncoder) Flush() ([][]byte, error) {
 		r, err := enc.reset()
 		if err != nil {
 			return nil, err
+		}
+		if r == nil {
+			return result, nil
 		}
 		if len(r) < int(enc.limit) {
 			return append(result, r), nil

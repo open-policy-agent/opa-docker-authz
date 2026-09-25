@@ -227,25 +227,27 @@ func (t *testFixture) setClient(client rest.Client) {
 	t.client = client
 }
 
-func (t *testFixture) oneShot(ctx context.Context, u Update) {
+func (t *testFixture) oneShot(_ context.Context, u Update) error {
 
 	t.updates = append(t.updates, u)
 
 	if u.Error != nil {
 		etag := t.etags["test/bundle1"]
 		t.d.SetCache(etag)
-		return
+		return u.Error
 	}
 
 	if u.Bundle != nil {
 		if t.mockBundleActivationError {
 			etag := t.etags["test/bundle1"]
 			t.d.SetCache(etag)
-			return
+			return errors.New("activation error")
 		}
 	}
 
 	t.etags["test/bundle1"] = u.ETag
+
+	return nil
 }
 
 type fileInfo struct {
@@ -436,7 +438,7 @@ func (t *testServer) handle(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(404)
 				return
 			}
-			buf.WriteString(string(bs))
+			buf.Write(bs)
 			w.Write(buf.Bytes())
 			return
 		}
@@ -445,14 +447,15 @@ func (t *testServer) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if strings.HasPrefix(r.URL.Path, "/v2/org/repo/manifests/") {
-		sha, size, err := getFileSHAandSize("testdata/" + strings.TrimPrefix(r.URL.Path, "/v2/org/repo/manifests/") + ".manifest")
+		path := "testdata/" + strings.TrimPrefix(r.URL.Path, "/v2/org/repo/manifests/") + ".manifest"
+		sha, size, err := getFileSHAandSize(path)
 		if err != nil {
 			w.WriteHeader(404)
 			return
 		}
 
 		w.Header().Add("Content-Length", strconv.Itoa(int(size)))
-		w.Header().Add("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Add("Content-Type", getManifestMediaType(path))
 		w.Header().Add("Docker-Content-Digest", "sha256:"+fmt.Sprintf("%x", sha))
 		w.WriteHeader(200)
 		return
@@ -540,6 +543,24 @@ func getPreferHeaderField(r *http.Request, field string) string {
 		}
 	}
 	return ""
+}
+
+// getManifestMediaType returns the mediaType declared by the manifest file, so
+// the fixture can serve an image index as well as an image manifest.
+func getManifestMediaType(filePath string) string {
+	bs, err := os.ReadFile(filePath)
+	if err != nil {
+		return "application/vnd.oci.image.manifest.v1+json"
+	}
+
+	var manifest struct {
+		MediaType string `json:"mediaType"`
+	}
+	if err := json.Unmarshal(bs, &manifest); err != nil || manifest.MediaType == "" {
+		return "application/vnd.oci.image.manifest.v1+json"
+	}
+
+	return manifest.MediaType
 }
 
 func getFileSHAandSize(filePath string) ([]byte, int64, error) {
