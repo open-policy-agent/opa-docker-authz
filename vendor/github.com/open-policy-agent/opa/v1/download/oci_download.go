@@ -17,17 +17,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containerd/containerd/v2/core/remotes"
-	"github.com/containerd/containerd/v2/core/remotes/docker"
-	"github.com/containerd/errdefs"
-
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	oraslib "oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/oci"
+	"oras.land/oras-go/v2/registry"
+	"oras.land/oras-go/v2/registry/remote/auth"
 
 	"github.com/open-policy-agent/opa/v1/ast"
 	"github.com/open-policy-agent/opa/v1/bundle"
-	"github.com/open-policy-agent/opa/v1/logging"
 	"github.com/open-policy-agent/opa/v1/metrics"
 	"github.com/open-policy-agent/opa/v1/plugins"
 	"github.com/open-policy-agent/opa/v1/plugins/rest"
@@ -36,24 +34,37 @@ import (
 
 // NewOCI returns a new Downloader that can be started.
 func NewOCI(config Config, client rest.Client, path, storePath string) *OCIDownloader {
+	localStoreIsTemp := false
+	if storePath == "" {
+		var err error
+		storePath, err = os.MkdirTemp("", "opa-oci-*")
+		if err != nil {
+			panic(err)
+		}
+		localStoreIsTemp = true
+	}
+
 	localstore, err := oci.New(storePath)
 	if err != nil {
+		if localStoreIsTemp {
+			_ = os.RemoveAll(storePath)
+		}
 		panic(err)
 	}
 	return &OCIDownloader{
-		config:         config,
-		path:           path,
-		localStorePath: storePath,
-		client:         client,
-		trigger:        make(chan chan struct{}),
-		stop:           make(chan chan struct{}),
-		logger:         client.Logger(),
-		store:          localstore,
+		config:           config,
+		path:             path,
+		localStorePath:   storePath,
+		localStoreIsTemp: localStoreIsTemp,
+		client:           client,
+		stop:             make(chan chan struct{}),
+		logger:           client.Logger(),
+		store:            localstore,
 	}
 }
 
 // WithCallback registers a function f to be called when download updates occur.
-func (d *OCIDownloader) WithCallback(f func(context.Context, Update)) *OCIDownloader {
+func (d *OCIDownloader) WithCallback(f func(context.Context, Update) error) *OCIDownloader {
 	d.f = f
 	return d
 }
@@ -101,17 +112,24 @@ func (d *OCIDownloader) SetCache(etag string) {
 // Trigger can be used to control when the downloader attempts to download
 // a new bundle in manual triggering mode.
 func (d *OCIDownloader) Trigger(ctx context.Context) error {
-	done := make(chan error)
+	d.stateMtx.Lock()
+	if d.stopped {
+		d.stateMtx.Unlock()
+		return errors.New("downloader stopped")
+	}
+	d.triggerWG.Add(1)
+	d.stateMtx.Unlock()
+
+	done := make(chan error, 1)
 
 	go func() {
+		defer d.triggerWG.Done()
+
 		err := d.oneShot(ctx)
 		if err != nil {
 			d.logger.Error("OCI - Bundle download failed: %v.", err)
-			if ctx.Err() == nil {
-				done <- err
-			}
 		}
-		close(done)
+		done <- err
 	}()
 
 	select {
@@ -131,20 +149,29 @@ func (d *OCIDownloader) Start(ctx context.Context) {
 
 // Stop tells the Downloader to stop downloading bundles.
 func (d *OCIDownloader) Stop(context.Context) {
-	if *d.config.Trigger == plugins.TriggerManual {
+	d.stopOnce.Do(func() {
+		d.stateMtx.Lock()
+		d.stopped = true
+		d.stateMtx.Unlock()
+
+		if *d.config.Trigger == plugins.TriggerPeriodic {
+			done := make(chan struct{})
+			d.stop <- done
+			<-done
+		}
+
+		d.triggerWG.Wait()
+		d.cleanupLocalStore()
+	})
+}
+
+func (d *OCIDownloader) cleanupLocalStore() {
+	if !d.localStoreIsTemp {
 		return
 	}
-
-	d.mtx.Lock()
-	defer d.mtx.Unlock()
-
-	if d.stopped {
-		return
+	if err := os.RemoveAll(d.localStorePath); err != nil {
+		d.logger.Error("OCI - Failed to remove temporary store %q: %v.", d.localStorePath, err)
 	}
-
-	done := make(chan struct{})
-	d.stop <- done
-	<-done
 }
 
 func (d *OCIDownloader) doStart(context.Context) {
@@ -157,7 +184,6 @@ func (d *OCIDownloader) doStart(context.Context) {
 	done := <-d.stop // blocks until there's something to read
 	cancel()
 	d.wg.Wait()
-	d.stopped = true
 	close(done)
 }
 
@@ -177,11 +203,11 @@ func (d *OCIDownloader) loop(ctx context.Context) {
 		}
 
 		if err != nil {
-			delay = util.DefaultBackoff(float64(minRetryDelay), float64(*d.config.Polling.MaxDelaySeconds), retry)
+			delay = util.DefaultBackoff(float64(minRetryDelay), float64(*d.config.Polling.parsedMaxDelaySeconds), retry)
 		} else {
 			// revert the response header timeout value on the http client's transport
-			min := float64(*d.config.Polling.MinDelaySeconds)
-			max := float64(*d.config.Polling.MaxDelaySeconds)
+			min := float64(*d.config.Polling.parsedMinDelaySeconds)
+			max := float64(*d.config.Polling.parsedMaxDelaySeconds)
 			delay = time.Duration(((max - min) * rand.Float64()) + min)
 		}
 
@@ -207,14 +233,16 @@ func (d *OCIDownloader) oneShot(ctx context.Context) error {
 	resp, err := d.download(ctx, m)
 	if err != nil {
 		if d.f != nil {
-			d.f(ctx, Update{ETag: "", Bundle: nil, Error: err, Metrics: m, Raw: nil})
+			err = errors.Join(err, d.f(ctx, Update{ETag: "", Bundle: nil, Error: err, Metrics: m, Raw: nil}))
 		}
 		return err
 	}
 	d.SetCache(resp.etag) // set the current etag sha to the cache
 
 	if d.f != nil {
-		d.f(ctx, Update{ETag: resp.etag, Bundle: resp.b, Error: nil, Metrics: m, Raw: resp.raw, Size: resp.size})
+		if err := d.f(ctx, Update{ETag: resp.etag, Bundle: resp.b, Error: nil, Metrics: m, Raw: resp.raw, Size: resp.size}); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -229,6 +257,8 @@ func (d *OCIDownloader) download(ctx context.Context, m metrics.Metrics) (*downl
 	d.client = d.client.WithHeader("Prefer", preferValue)
 
 	m.Timer(metrics.BundleRequest).Start()
+	defer m.Timer(metrics.BundleRequest).Stop()
+
 	desc, err := d.pull(ctx, d.path)
 	if err != nil {
 		return &downloaderResponse{}, fmt.Errorf("failed to pull %s: %w", d.path, err)
@@ -239,14 +269,8 @@ func (d *OCIDownloader) download(ctx context.Context, m metrics.Metrics) (*downl
 		return nil, err
 	}
 
-	tarballDescriptor := ocispec.Descriptor{}
-	for _, descriptor := range manifest.Layers {
-		if descriptor.MediaType == "application/vnd.oci.image.layer.v1.tar+gzip" {
-			tarballDescriptor = descriptor
-			break
-		}
-	}
-	if tarballDescriptor.MediaType == "" {
+	tarballDescriptor, ok := bundleLayer(manifest)
+	if !ok {
 		return nil, errors.New("no tarball descriptor found in the layers")
 	}
 	etag := tarballDescriptor.Digest.Hex()
@@ -261,26 +285,39 @@ func (d *OCIDownloader) download(ctx context.Context, m metrics.Metrics) (*downl
 		}, nil
 	}
 	fileReader, err := os.Open(bundleFilePath)
+	if err != nil {
+		return nil, err
+	}
+	defer fileReader.Close()
 
 	cnt := &count{}
 	r := io.TeeReader(fileReader, cnt)
 	tee := io.TeeReader(r, &buf)
 
-	if err != nil {
-		return nil, err
-	}
 	loader := bundle.NewTarballLoaderWithBaseURL(tee, d.localStorePath)
+
+	// Setting the size limit on the loader allows early exit in the case
+	// of any file exceeding the limit, without the file getting loaded
+	if d.sizeLimitBytes != nil {
+		loader = loader.WithSizeLimitBytes(*d.sizeLimitBytes)
+	}
+
 	reader := bundle.NewCustomReader(loader).
 		WithMetrics(m).
 		WithBundleVerificationConfig(d.bvc).
 		WithBundleEtag(etag).
-		WithRegoVersion(d.bundleParserOpts.RegoVersion)
+		WithRegoVersion(d.bundleParserOpts.RegoVersion).
+		WithProcessAnnotations(d.bundleParserOpts.ProcessAnnotation).
+		WithBundlePersistence(d.persist)
+
+	if d.sizeLimitBytes != nil {
+		reader = reader.WithSizeLimitBytes(*d.sizeLimitBytes)
+	}
+
 	bundleInfo, err := reader.Read()
 	if err != nil {
 		return &downloaderResponse{}, fmt.Errorf("unexpected error %w", err)
 	}
-
-	m.Timer(metrics.BundleRequest).Stop()
 
 	return &downloaderResponse{
 		b:        &bundleInfo,
@@ -301,17 +338,17 @@ func (d *OCIDownloader) pull(ctx context.Context, ref string) (*ocispec.Descript
 
 	d.logger.Debug("OCIDownloader: using auth plugin: %T", plugin)
 
-	resolver, err := dockerResolver(plugin, d.client.Config(), d.logger)
+	target, err := newOCITarget(plugin, d.client.Config(), ref)
 	if err != nil {
 		return nil, fmt.Errorf("invalid host url %s: %w", d.client.Config().URL, err)
 	}
 
-	target := remoteManager{
-		resolver: resolver,
-		srcRef:   ref,
+	parsed, err := registry.ParseReference(ref)
+	if err != nil {
+		return nil, fmt.Errorf("invalid reference %q: %w", ref, err)
 	}
 
-	manifestDescriptor, err := oraslib.Copy(ctx, &target, ref, d.store, "", oraslib.DefaultCopyOptions)
+	manifestDescriptor, err := oraslib.Copy(ctx, target, parsed.Reference, d.store, "", oraslib.DefaultCopyOptions)
 	if err != nil {
 		return nil, fmt.Errorf("download for '%s' failed: %w", ref, err)
 	}
@@ -319,8 +356,19 @@ func (d *OCIDownloader) pull(ctx context.Context, ref string) (*ocispec.Descript
 	return &manifestDescriptor, nil
 }
 
-func dockerResolver(plugin rest.HTTPAuthPlugin, config *rest.Config, logger logging.Logger) (remotes.Resolver, error) {
-	client, err := plugin.NewClient(*config)
+// ociTarget implements oraslib.ReadOnlyTarget using ORAS's auth.Client for HTTP
+// authentication without the strict response validation of remote.Repository.
+// Notably, it does NOT implement registry.ReferenceFetcher, forcing oraslib.Copy
+// to use the HEAD (Resolve) + GET-by-digest (Fetch) path.
+type ociTarget struct {
+	client    *auth.Client
+	registry  string
+	repo      string
+	plainHTTP bool
+}
+
+func newOCITarget(plugin rest.HTTPAuthPlugin, config *rest.Config, ref string) (*ociTarget, error) {
+	httpClient, err := plugin.NewClient(*config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create auth client: %w", err)
 	}
@@ -330,85 +378,175 @@ func dockerResolver(plugin rest.HTTPAuthPlugin, config *rest.Config, logger logg
 		return nil, fmt.Errorf("failed to parse url: %w", err)
 	}
 
-	authorizer := pluginAuthorizer{
-		plugin: plugin,
-		client: client,
-		logger: logger,
+	parsed, err := registry.ParseReference(ref)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse reference: %w", err)
 	}
 
-	registryHost := docker.RegistryHost{
-		Host:         urlInfo.Host,
-		Scheme:       urlInfo.Scheme,
-		Capabilities: docker.HostCapabilityPull | docker.HostCapabilityResolve | docker.HostCapabilityPush,
-		Client:       client,
-		Path:         "/v2",
-		Authorizer:   &authorizer,
-	}
-
-	opts := docker.ResolverOptions{
-		Hosts: func(string) ([]docker.RegistryHost, error) {
-			return []docker.RegistryHost{registryHost}, nil
+	return &ociTarget{
+		client: &auth.Client{
+			Client: &http.Client{
+				Transport: &pluginRoundTripper{
+					base:   httpClient.Transport,
+					plugin: plugin,
+				},
+			},
+			Cache: auth.NewCache(),
 		},
-	}
-
-	return docker.NewResolver(opts), nil
+		registry:  urlInfo.Host,
+		repo:      parsed.Repository,
+		plainHTTP: urlInfo.Scheme == "http",
+	}, nil
 }
 
-type pluginAuthorizer struct {
+func (t *ociTarget) url(path string) string {
+	scheme := "https"
+	if t.plainHTTP {
+		scheme = "http"
+	}
+	return fmt.Sprintf("%s://%s/v2/%s/%s", scheme, t.registry, t.repo, path)
+}
+
+// manifestMediaTypes lists the OCI and Docker manifest media types that registries
+// such as ghcr.io require in the Accept header to return manifests correctly.
+var manifestMediaTypes = strings.Join([]string{
+	"application/vnd.oci.image.manifest.v1+json",
+	"application/vnd.oci.image.index.v1+json",
+	"application/vnd.docker.distribution.manifest.v2+json",
+	"application/vnd.docker.distribution.manifest.list.v2+json",
+	"*/*",
+}, ", ")
+
+func (t *ociTarget) Resolve(ctx context.Context, reference string) (ocispec.Descriptor, error) {
+	url := t.url("manifests/" + reference)
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	if err != nil {
+		return ocispec.Descriptor{}, err
+	}
+	req.Header.Set("Accept", manifestMediaTypes)
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return ocispec.Descriptor{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return ocispec.Descriptor{}, fmt.Errorf("%s %s: %d %s", req.Method, url, resp.StatusCode, http.StatusText(resp.StatusCode))
+	}
+
+	mediaType := resp.Header.Get("Content-Type")
+	digestStr := resp.Header.Get("Docker-Content-Digest")
+	if digestStr == "" {
+		return ocispec.Descriptor{}, errors.New("missing Docker-Content-Digest header in response")
+	}
+	dgst, err := digest.Parse(digestStr)
+	if err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("invalid digest %q: %w", digestStr, err)
+	}
+
+	return ocispec.Descriptor{
+		MediaType: mediaType,
+		Digest:    dgst,
+		Size:      resp.ContentLength,
+	}, nil
+}
+
+func (t *ociTarget) Fetch(ctx context.Context, target ocispec.Descriptor) (io.ReadCloser, error) {
+	// Use blobs endpoint for non-manifest content, manifests endpoint for manifests
+	var url string
+	isManifest := false
+	switch target.MediaType {
+	case "application/vnd.oci.image.manifest.v1+json",
+		"application/vnd.oci.image.index.v1+json",
+		"application/vnd.docker.distribution.manifest.v2+json",
+		"application/vnd.docker.distribution.manifest.list.v2+json":
+		url = t.url("manifests/" + target.Digest.String())
+		isManifest = true
+	default:
+		url = t.url("blobs/" + target.Digest.String())
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if isManifest {
+		req.Header.Set("Accept", target.MediaType)
+	}
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("%s %s: %d %s", req.Method, url, resp.StatusCode, http.StatusText(resp.StatusCode))
+	}
+
+	return resp.Body, nil
+}
+
+// Exists is required by oraslib.ReadOnlyTarget, through content.ReadOnlyStorage,
+// but nothing calls it: oraslib.Copy only probes the destination, and
+// cas.Proxy.Exists, the one path that would reach a source, is unused in oras-go.
+func (t *ociTarget) Exists(ctx context.Context, target ocispec.Descriptor) (bool, error) {
+	rc, err := t.Fetch(ctx, target)
+	if err != nil {
+		return false, nil
+	}
+	rc.Close()
+	return true, nil
+}
+
+// pluginRoundTripper injects authentication headers via the rest.HTTPAuthPlugin
+// on requests that don't already carry an Authorization header. This allows ORAS's
+// auth.Client to handle Docker token exchange challenges while still using the
+// plugin's credentials for both direct auth and token-service authentication.
+type pluginRoundTripper struct {
+	base   http.RoundTripper
 	plugin rest.HTTPAuthPlugin
-	client *http.Client
-
-	// authorizer will be populated by the first call to pluginAuthorizer.Prepare
-	// since it requires a first pass through the plugin.Prepare method.
-	authorizer docker.Authorizer
-
-	logger logging.Logger
 }
 
-var _ docker.Authorizer = &pluginAuthorizer{}
+func (t *pluginRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Header.Get("Authorization") == "" {
+		if err := t.plugin.Prepare(req); err != nil {
+			return nil, fmt.Errorf("failed to prepare request: %w", err)
+		}
+	}
 
-func (a *pluginAuthorizer) AddResponses(ctx context.Context, responses []*http.Response) error {
-	return a.authorizer.AddResponses(ctx, responses)
+	if t.base != nil {
+		return t.base.RoundTrip(req)
+	}
+	return http.DefaultTransport.RoundTrip(req)
 }
 
-// Authorize uses a rest.HTTPAuthPlugin to Prepare a request before passing it on
-// to the docker.Authorizer.
-func (a *pluginAuthorizer) Authorize(ctx context.Context, req *http.Request) error {
-	if err := a.plugin.Prepare(req); err != nil {
-		err = fmt.Errorf("failed to prepare docker request: %w", err)
+// maxIndexDepth bounds how far manifestFromDesc descends through nested image
+// indexes before giving up.
+const maxIndexDepth = 4
 
-		// Make sure to log this before passing the error back to docker
-		a.logger.Error(err.Error())
-
-		return err
+// bundleLayer returns the layer holding the bundle tarball, if the manifest has one.
+func bundleLayer(manifest *ocispec.Manifest) (ocispec.Descriptor, bool) {
+	for _, layer := range manifest.Layers {
+		if layer.MediaType == ocispec.MediaTypeImageLayerGzip {
+			return layer, true
+		}
 	}
-
-	if a.authorizer == nil {
-		// Some registry authentication implementations require a token fetch from
-		// a separate authenticated token server. This flow is described in the
-		// docker token auth spec:
-		// https://docs.docker.com/registry/spec/auth/token/#requesting-a-token
-		//
-		// Unfortunately, the containerd implementation does not use the Prepare
-		// mechanism to authenticate these token requests and we need to add
-		// auth information in form of a static docker.WithAuthHeader.
-		//
-		// Since rest.HTTPAuthPlugins will set the auth header on the request
-		// passed to HTTPAuthPlugin.Prepare, we can use it afterwards to build
-		// our docker.Authorizer.
-		a.authorizer = docker.NewDockerAuthorizer(
-			docker.WithAuthHeader(req.Header),
-			docker.WithAuthClient(a.client),
-		)
-	}
-
-	return a.authorizer.Authorize(ctx, req)
+	return ocispec.Descriptor{}, false
 }
 
 func manifestFromDesc(ctx context.Context, target oraslib.Target, desc *ocispec.Descriptor) (*ocispec.Manifest, error) {
+	return manifestFromDescDepth(ctx, target, *desc, 0, map[digest.Digest]struct{}{desc.Digest: {}})
+}
+
+// visited holds the digests already walked. Descriptors are content-addressed,
+// so a digest seen twice resolves the same way twice; skipping repeats keeps a
+// wide, deeply nested index from costing an exponential number of fetches.
+func manifestFromDescDepth(ctx context.Context, target oraslib.Target, desc ocispec.Descriptor, depth int, visited map[digest.Digest]struct{}) (*ocispec.Manifest, error) {
 	var manifest ocispec.Manifest
 
-	descReader, err := target.Fetch(ctx, *desc)
+	descReader, err := target.Fetch(ctx, desc)
 	if err != nil {
 		return nil, fmt.Errorf("unable to fetch descriptor with digest %q: %w", desc.Digest, err)
 	}
@@ -423,39 +561,43 @@ func manifestFromDesc(ctx context.Context, target oraslib.Target, desc *ocispec.
 		return nil, fmt.Errorf("unable to unmarshal manifest: %w", err)
 	}
 
-	if len(manifest.Layers) < 1 {
+	if len(manifest.Layers) > 0 {
+		return &manifest, nil
+	}
+
+	var index ocispec.Index
+	if err := json.Unmarshal(descBytes, &index); err != nil || len(index.Manifests) == 0 {
 		return nil, errors.New("no layers in manifest")
 	}
 
-	return &manifest, nil
-}
-
-type remoteManager struct {
-	resolver remotes.Resolver
-	srcRef   string
-}
-
-func (r *remoteManager) Resolve(ctx context.Context, ref string) (ocispec.Descriptor, error) {
-	_, desc, err := r.resolver.Resolve(ctx, ref)
-	if err != nil {
-		return ocispec.Descriptor{}, err
-	}
-	return desc, nil
-}
-
-func (r *remoteManager) Fetch(ctx context.Context, target ocispec.Descriptor) (io.ReadCloser, error) {
-	fetcher, err := r.resolver.Fetcher(ctx, r.srcRef)
-	if err != nil {
-		return nil, err
-	}
-	return fetcher.Fetch(ctx, target)
-}
-
-func (r *remoteManager) Exists(ctx context.Context, target ocispec.Descriptor) (bool, error) {
-	_, err := r.Fetch(ctx, target)
-	if err == nil {
-		return true, nil
+	if depth >= maxIndexDepth {
+		return nil, fmt.Errorf("image index %q is nested more than %d levels deep", desc.Digest, maxIndexDepth)
 	}
 
-	return !errdefs.IsNotFound(err), err
+	var errs []error
+	for _, entry := range index.Manifests {
+		// buildx attaches provenance and SBOM manifests to the index under an
+		// "unknown" platform; they never carry a bundle.
+		if entry.Platform != nil && entry.Platform.OS == "unknown" && entry.Platform.Architecture == "unknown" {
+			continue
+		}
+
+		if _, ok := visited[entry.Digest]; ok {
+			continue
+		}
+		visited[entry.Digest] = struct{}{}
+
+		child, err := manifestFromDescDepth(ctx, target, entry, depth+1, visited)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if _, ok := bundleLayer(child); ok {
+			return child, nil
+		}
+	}
+
+	errs = append(errs, fmt.Errorf("no manifest in image index %q contains a %s layer", desc.Digest, ocispec.MediaTypeImageLayerGzip))
+
+	return nil, errors.Join(errs...)
 }

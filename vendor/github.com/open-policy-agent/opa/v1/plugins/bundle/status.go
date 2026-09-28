@@ -25,12 +25,12 @@ const (
 type Status struct {
 	Name                     string          `json:"name"`
 	ActiveRevision           string          `json:"active_revision,omitempty"`
-	LastSuccessfulActivation time.Time       `json:"last_successful_activation,omitempty"`
+	LastSuccessfulActivation time.Time       `json:"last_successful_activation"`
 	Type                     string          `json:"type,omitempty"`
 	Size                     int             `json:"size,omitempty"`
-	LastSuccessfulDownload   time.Time       `json:"last_successful_download,omitempty"`
-	LastSuccessfulRequest    time.Time       `json:"last_successful_request,omitempty"`
-	LastRequest              time.Time       `json:"last_request,omitempty"`
+	LastSuccessfulDownload   time.Time       `json:"last_successful_download"`
+	LastSuccessfulRequest    time.Time       `json:"last_successful_request"`
+	LastRequest              time.Time       `json:"last_request"`
 	Code                     string          `json:"code,omitempty"`
 	Message                  string          `json:"message,omitempty"`
 	Errors                   []error         `json:"errors,omitempty"`
@@ -63,18 +63,12 @@ func (s *Status) SetBundleSize(size int) {
 // SetError updates the status object to reflect a failure to download or
 // activate. If err is nil, the error status is cleared.
 func (s *Status) SetError(err error) {
-	var (
-		astErrors ast.Errors
-		httpError download.HTTPError
-	)
-	switch {
-	case err == nil:
+	if err == nil {
 		s.Code = ""
 		s.HTTPCode = ""
 		s.Message = ""
 		s.Errors = nil
-
-	case errors.As(err, &astErrors):
+	} else if astErrors, ok := errors.AsType[ast.Errors](err); ok {
 		s.Code = errCode
 		s.HTTPCode = ""
 		s.Message = types.MsgCompileModuleError
@@ -82,14 +76,12 @@ func (s *Status) SetError(err error) {
 		for i := range astErrors {
 			s.Errors[i] = astErrors[i]
 		}
-
-	case errors.As(err, &httpError):
+	} else if httpError, ok := errors.AsType[download.HTTPError](err); ok {
 		s.Code = errCode
 		s.HTTPCode = json.Number(strconv.Itoa(httpError.StatusCode))
 		s.Message = err.Error()
 		s.Errors = nil
-
-	default:
+	} else {
 		s.Code = errCode
 		s.HTTPCode = ""
 		s.Message = err.Error()
