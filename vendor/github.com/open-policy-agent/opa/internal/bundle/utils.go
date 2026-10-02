@@ -72,13 +72,13 @@ func LoadWasmResolversFromStore(ctx context.Context, store storage.Store, txn st
 	var resolvers []*wasm.Resolver
 	if len(resolversToLoad) > 0 {
 		// Get a full snapshot of the current data (including any from "outside" the bundles)
-		data, err := store.Read(ctx, txn, storage.Path{})
+		data, err := store.Read(ctx, txn, storage.RootPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize wasm runtime: %s", err)
 		}
 
 		for _, wmf := range resolversToLoad {
-			resolver, err := wasm.New(wmf.Entrypoints, wmf.Raw, data)
+			resolver, err := wasm.NewWithContext(ctx, wmf.Entrypoints, wmf.Raw, data)
 			if err != nil {
 				return nil, fmt.Errorf("failed to initialize wasm module for entrypoints '%s': %s", wmf.Entrypoints, err)
 			}
