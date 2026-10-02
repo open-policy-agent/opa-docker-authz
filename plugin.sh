@@ -19,7 +19,8 @@ docker image rm -f rootfsimage > /dev/null
 rm -rf ./rootfs
 
 
-platforms=("linux/amd64" "linux/arm64" "darwin/amd64" "darwin/arm64" "windows/amd64")
+# managed plugins only run on Linux engines (Docker Desktop on macOS/Windows runs a Linux VM)
+platforms=("linux/amd64" "linux/arm64")
 for platform in "${platforms[@]}"
 do
 	platform_split=(${platform//\// })
