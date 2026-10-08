@@ -220,6 +220,52 @@ func TestEvaluate(t *testing.T) {
 			expectedError:  false,
 		},
 		{
+			name:       "Deny create of container by registry",
+			policyFile: "example.rego",
+			allowPath:  "data.docker.authz.allow",
+			request: authorization.Request{
+				RequestMethod: "POST",
+				RequestURI:    "/v1.47/containers/create",
+				RequestBody:   []byte(`{"Image": "quay.io/foo/bar"}`),
+				RequestHeaders: map[string]string{
+					"Content-Type": "application/json",
+					"Authz-User":   "alice",
+				},
+			},
+			expectedResult: false,
+			expectedError:  false,
+		},
+		{
+			name:       "Deny image without registry",
+			policyFile: "testdata/image_registries.rego",
+			allowPath:  "data.docker.authz.allow",
+			request: authorization.Request{
+				RequestMethod: "POST",
+				RequestURI:    "/v1.47/containers/create",
+				RequestBody:   []byte(`{"Image": "foobar"}`),
+				RequestHeaders: map[string]string{
+					"Content-Type": "application/json",
+				},
+			},
+			expectedResult: false,
+			expectedError:  false,
+		},
+		{
+			name:       "Allow image with allow listed registry",
+			policyFile: "testdata/image_registries.rego",
+			allowPath:  "data.docker.authz.allow",
+			request: authorization.Request{
+				RequestMethod: "POST",
+				RequestURI:    "/v1.47/containers/create",
+				RequestBody:   []byte(`{"Image": "public.ecr.aws/docker/library/docker:dind"}`),
+				RequestHeaders: map[string]string{
+					"Content-Type": "application/json",
+				},
+			},
+			expectedResult: true,
+			expectedError:  false,
+		},
+		{
 			name:           "Policy file OK with non-GET method",
 			policyFile:     "example.rego",
 			allowPath:      "data.docker.authz.allow",
