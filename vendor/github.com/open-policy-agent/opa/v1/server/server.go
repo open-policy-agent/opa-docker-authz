@@ -146,6 +146,11 @@ type Server struct {
 	cipherSuites                *[]uint16
 	hooks                       hooks.Hooks
 
+	// Set by Init, so Shutdown can take the reload trigger back off the store.
+	// A server that is replaced rather than shut down would otherwise leave a
+	// trigger behind pointing at itself.
+	storeTriggerHandle storage.TriggerHandle
+
 	compileUnknownsCache     *lru.Cache[string, []ast.Ref]
 	compileMaskingRulesCache *lru.Cache[string, ast.Ref]
 }
@@ -223,10 +228,12 @@ func (s *Server) Init(ctx context.Context) (*Server, error) {
 	config := storage.TriggerConfig{
 		OnCommit: s.reload,
 	}
-	if _, err := s.store.Register(ctx, txn, config); err != nil {
+	handle, err := s.store.Register(ctx, txn, config)
+	if err != nil {
 		s.store.Abort(ctx, txn)
 		return nil, err
 	}
+	s.storeTriggerHandle = handle
 
 	s.preparedEvalQueries = newCache(pqMaxCacheSize)
 	s.defaultDecisionPath = s.generateDefaultDecisionPath()
@@ -257,10 +264,28 @@ func (s *Server) Init(ctx context.Context) (*Server, error) {
 	return s, s.store.Commit(ctx, txn)
 }
 
+// unregisterStoreTrigger takes the reload trigger registered by Init back off
+// the store. A no-op if Init never ran, or if the server has already shut down.
+func (s *Server) unregisterStoreTrigger(ctx context.Context) {
+	if s.storeTriggerHandle == nil {
+		return
+	}
+
+	if err := storage.Txn(ctx, s.store, storage.WriteParams, func(txn storage.Transaction) error {
+		s.storeTriggerHandle.Unregister(ctx, txn)
+		return nil
+	}); err != nil {
+		s.manager.Logger().Error("Error unregistering store trigger: %v", err)
+	}
+	s.storeTriggerHandle = nil
+}
+
 // Shutdown will attempt to gracefully shutdown each of the http servers
 // currently in use by the OPA Server. If any exceed the deadline specified
 // by the context an error will be returned.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.unregisterStoreTrigger(ctx)
+
 	errChan := make(chan error)
 	for _, srvr := range s.httpListeners {
 		go func(s httpListener) {
@@ -662,8 +687,11 @@ func (s *Server) getListener(addr string, h http.Handler, t httpListenerType) ([
 		// otherwise use the fsnotify default behavior
 		if s.certRefresh > 0 {
 			loops = []Loop{loop, s.certLoopPolling(logger)}
-		} else if s.certFile != "" || s.certPoolFile != "" {
-			loops = []Loop{loop, s.certLoopNotify(logger)}
+		} else if err == nil && (s.certFile != "" || s.certPoolFile != "") {
+			var notify Loop
+			if notify, err = s.certLoopNotify(logger); err == nil {
+				loops = []Loop{loop, notify}
+			}
 		}
 	default:
 		err = fmt.Errorf("invalid url scheme %q", parsedURL.Scheme)
@@ -1185,6 +1213,18 @@ func (s *Server) canEval(ctx context.Context) bool {
 	return false
 }
 
+// bundlesNotActivatedError names the bundles that have not been activated yet,
+// if the bundle plugin is available to report them.
+func (s *Server) bundlesNotActivatedError() error {
+	const msg = "one or more bundles are not activated"
+	if bp := bundlePlugin.Lookup(s.manager); bp != nil {
+		if names := bp.NotActivated(); len(names) > 0 {
+			return fmt.Errorf("%s: %s", msg, strings.Join(names, ", "))
+		}
+	}
+	return errors.New(msg)
+}
+
 func (*Server) bundlesReady(pluginStatuses map[string]*plugins.Status) bool {
 	// Look for a discovery plugin first, if it exists and isn't ready
 	// then don't bother with the others.
@@ -1229,7 +1269,7 @@ func (s *Server) unversionedGetHealth(w http.ResponseWriter, r *http.Request) {
 	// normal bundles that are configured.
 	if includeBundleStatus && !s.bundlesReady(pluginStatuses) {
 		// For backwards compatibility we don't return a payload with statuses for the bundle endpoint
-		writeHealthResponse(w, errors.New("one or more bundles are not activated"))
+		writeHealthResponse(w, s.bundlesNotActivatedError())
 		return
 	}
 
@@ -1346,14 +1386,13 @@ func (s *Server) v1CompilePost(w http.ResponseWriter, r *http.Request) {
 	m.Timer(metrics.ServerHandler).Start()
 	m.Timer(metrics.RegoQueryParse).Start()
 
-	// decompress the input if sent as zip
-	body, err := util.ReadMaybeCompressedBody(r)
+	req, err := readRequest(r, compileRequestFromMap)
 	if err != nil {
-		writer.Error(w, http.StatusBadRequest, types.NewErrorV1(types.CodeInvalidParameter, "could not decompress the body"))
+		writer.Error(w, http.StatusBadRequest, types.NewErrorV1(types.CodeInvalidParameter, "%v", err))
 		return
 	}
 
-	request, reqErr := readInputCompilePostV1(body, s.manager.ParserOptions())
+	request, reqErr := readInputCompilePostV1(req, s.manager.ParserOptions())
 	if reqErr != nil {
 		writer.Error(w, http.StatusBadRequest, reqErr)
 		return
@@ -2097,7 +2136,7 @@ func (s *Server) v1PoliciesGet(w http.ResponseWriter, r *http.Request) {
 	resp := types.PolicyGetResponseV1{
 		Result: types.PolicyV1{
 			ID:  path,
-			Raw: string(bs),
+			Raw: util.ByteSliceToString(bs),
 			AST: s.getCompiler().Modules[path],
 		},
 	}
@@ -2134,7 +2173,7 @@ func (s *Server) v1PoliciesList(w http.ResponseWriter, r *http.Request) {
 		}
 		policy := types.PolicyV1{
 			ID:  id,
-			Raw: string(bs),
+			Raw: util.ByteSliceToString(bs),
 			AST: c.Modules[id],
 		}
 		policies = append(policies, policy)
@@ -2325,10 +2364,9 @@ func (s *Server) v1QueryPost(w http.ResponseWriter, r *http.Request) {
 	ctx := logging.WithDecisionID(r.Context(), decisionID)
 	annotateSpan(ctx, decisionID)
 
-	var request types.QueryRequestV1
-	err := util.NewJSONDecoder(r.Body).Decode(&request)
+	request, err := readRequest(r, queryRequestFromMap)
 	if err != nil {
-		writer.Error(w, http.StatusBadRequest, types.NewErrorV1(types.CodeInvalidParameter, "error(s) occurred while decoding request: %v", err.Error()))
+		writer.Error(w, http.StatusBadRequest, types.NewErrorV1(types.CodeInvalidParameter, "%v", err))
 		return
 	}
 	qStr := request.Query
@@ -2421,7 +2459,7 @@ func (s *Server) checkPolicyIDScope(ctx context.Context, txn storage.Transaction
 		return err
 	}
 
-	module, err := ast.ParseModuleWithOpts(id, string(bs), s.manager.ParserOptions())
+	module, err := ast.ParseModuleWithOpts(id, util.ByteSliceToString(bs), s.manager.ParserOptions())
 	if err != nil {
 		return err
 	}
@@ -2557,7 +2595,7 @@ func (s *Server) loadModules(ctx context.Context, txn storage.Transaction) (map[
 			return nil, err
 		}
 
-		parsed, err := ast.ParseModuleWithOpts(id, string(bs), s.manager.ParserOptions())
+		parsed, err := ast.ParseModuleWithOpts(id, util.ByteSliceToString(bs), s.manager.ParserOptions())
 		if err != nil {
 			return nil, err
 		}
@@ -2862,7 +2900,7 @@ func readInputV0(r *http.Request) (ast.Value, *any, error) {
 	// decompress the input if sent as zip
 	bodyBytes, err := util.ReadMaybeCompressedBody(r)
 	if err != nil {
-		return nil, nil, fmt.Errorf("could not decompress the body: %w", err)
+		return nil, nil, readBodyError(err)
 	}
 
 	var x any
@@ -2886,7 +2924,7 @@ func readInputV0(r *http.Request) (ast.Value, *any, error) {
 
 func readInputGetV1(str string) (ast.Value, *any, error) {
 	var input any
-	if err := util.UnmarshalJSON([]byte(str), &input); err != nil {
+	if err := util.UnmarshalJSON(util.StringToByteSlice(str), &input); err != nil {
 		return nil, nil, fmt.Errorf("parameter contains malformed input document: %w", err)
 	}
 	v, err := ast.InterfaceToValue(input)
@@ -2916,7 +2954,7 @@ func readInputPostV1(r *http.Request) (*parsedInput, error) {
 	// decompress the input if sent as zip
 	bodyBytes, err := util.ReadMaybeCompressedBody(r)
 	if err != nil {
-		return nil, fmt.Errorf("could not decompress the body: %w", err)
+		return nil, readBodyError(err)
 	}
 
 	ct := r.Header.Get("Content-Type")
@@ -2955,14 +2993,7 @@ type compileRequestOptions struct {
 	NondeterminsiticBuiltins bool
 }
 
-func readInputCompilePostV1(reqBytes []byte, queryParserOptions ast.ParserOptions) (*compileRequest, *types.ErrorV1) {
-	var request types.CompileRequestV1
-
-	err := util.NewJSONDecoder(bytes.NewBuffer(reqBytes)).Decode(&request)
-	if err != nil {
-		return nil, types.NewErrorV1(types.CodeInvalidParameter, "error(s) occurred while decoding request: %v", err.Error())
-	}
-
+func readInputCompilePostV1(request types.CompileRequestV1, queryParserOptions ast.ParserOptions) (*compileRequest, *types.ErrorV1) {
 	query, err := ast.ParseBodyWithOpts(request.Query, queryParserOptions)
 	if err != nil {
 		switch err := err.(type) {

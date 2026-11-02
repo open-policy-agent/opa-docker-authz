@@ -30,6 +30,7 @@ type PollingConfig struct {
 	parsedMinDelaySeconds     *int64 // nanosecond resolution of MinDelaySeconds
 	parsedMaxDelaySeconds     *int64 // nanosecond resolution of MaxDelaySeconds
 	LongPollingTimeoutSeconds *int64 `json:"long_polling_timeout_seconds,omitempty"` // max amount of time the server should wait before issuing a timeout if there's no update available
+	SupersededETagTTLSeconds  *int64 `json:"superseded_etag_ttl_seconds,omitempty"`  // how long etags of replaced bundles keep being sent in If-None-Match
 }
 
 // Config represents the configuration for the downloader.
@@ -41,7 +42,6 @@ type Config struct {
 // ValidateAndInjectDefaults checks for configuration errors and ensures all
 // values are set on the Config object.
 func (c *Config) ValidateAndInjectDefaults() error {
-
 	if c.Trigger == nil {
 		t := plugins.DefaultTriggerMode
 		c.Trigger = &t
@@ -49,7 +49,6 @@ func (c *Config) ValidateAndInjectDefaults() error {
 
 	switch *c.Trigger {
 	case plugins.TriggerPeriodic, plugins.TriggerManual:
-		break
 	default:
 		return fmt.Errorf("invalid trigger mode %q (want %q or %q)", *c.Trigger, plugins.TriggerPeriodic, plugins.TriggerManual)
 	}
@@ -81,6 +80,10 @@ func (c *Config) ValidateAndInjectDefaults() error {
 		if *c.Polling.LongPollingTimeoutSeconds < 1 {
 			return errors.New("'long_polling_timeout_seconds' must be at least 1")
 		}
+	}
+
+	if c.Polling.SupersededETagTTLSeconds != nil && *c.Polling.SupersededETagTTLSeconds < 0 {
+		return errors.New("'superseded_etag_ttl_seconds' must not be negative")
 	}
 
 	return nil

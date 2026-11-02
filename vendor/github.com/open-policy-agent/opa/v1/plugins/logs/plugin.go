@@ -309,6 +309,8 @@ const (
 	logBufferEventDropCounterName       = "decision_logs_dropped_buffer_size_limit_exceeded"
 	logBufferSizeLimitExDropCounterName = "decision_logs_dropped_buffer_size_limit_bytes_exceeded"
 	logEncodingFailureCounterName       = "decision_logs_encoding_failure"
+	logChunkUploadedCounterName         = "decision_logs_chunks_uploaded"
+	logChunkUploadFailedCounterName     = "decision_logs_chunks_upload_failed"
 	defaultResourcePath                 = "/logs"
 	sizeBufferType                      = "size"
 	eventBufferType                     = "event"
@@ -504,6 +506,9 @@ type buffer interface {
 	WithMetrics(metrics.Metrics)
 	Stop(context.Context)
 	Flush() []*EventV1
+	// Size returns how much is waiting in the buffer, in the unit its limit is
+	// configured in: items for the event buffer, bytes for the size buffer.
+	Size() int64
 }
 
 // Plugin implements decision log buffering and uploading.
@@ -739,6 +744,15 @@ func (p *Plugin) Config() *Config {
 	return &p.config
 }
 
+// BufferSize returns the configured buffer type and how much is waiting in the
+// buffer to be uploaded: items for the event buffer, bytes for the size buffer.
+func (p *Plugin) BufferSize() (bufferType string, size int64) {
+	p.reconfigMtx.RLock()
+	b := p.b
+	p.reconfigMtx.RUnlock()
+	return b.Name(), b.Size()
+}
+
 func (p *Plugin) flushDecisions(ctx context.Context) {
 	p.logger.Info("Flushing decision logs.")
 
@@ -814,6 +828,16 @@ func (p *Plugin) Log(ctx context.Context, decision *server.Info) error {
 		event.RequestContext = &RequestContext{HTTPRequest: &HTTPRequestContext{Headers: headers}}
 	}
 
+	// Metrics and Error must be attached before the policy input is built, otherwise
+	// the mask and drop policies cannot observe them. EventV1.AST() serializes both.
+	if decision.Metrics != nil {
+		event.Metrics = decision.Metrics.All()
+	}
+
+	if decision.Error != nil {
+		event.Error = decision.Error
+	}
+
 	input, err := event.AST()
 	if err != nil {
 		return err
@@ -828,14 +852,6 @@ func (p *Plugin) Log(ctx context.Context, decision *server.Info) error {
 	if drop {
 		p.logger.Debug("Decision log event to path %v dropped", event.Path)
 		return nil
-	}
-
-	if decision.Metrics != nil {
-		event.Metrics = decision.Metrics.All()
-	}
-
-	if decision.Error != nil {
-		event.Error = decision.Error
 	}
 
 	if err := p.maskEvent(ctx, decision.Txn, input, &event); err != nil {
@@ -1196,7 +1212,20 @@ func (p *Plugin) dropEvent(ctx context.Context, txn storage.Transaction, input a
 	return rs.Allowed(), nil
 }
 
-func uploadChunk(ctx context.Context, client rest.Client, uploadPath string, data []byte) error {
+// uploadChunk uploads a single chunk and counts the outcome on m, if set.
+func uploadChunk(ctx context.Context, client rest.Client, uploadPath string, data []byte, m metrics.Metrics) error {
+	err := doUploadChunk(ctx, client, uploadPath, data)
+	if m != nil {
+		if err != nil {
+			m.Counter(logChunkUploadFailedCounterName).Incr()
+		} else {
+			m.Counter(logChunkUploadedCounterName).Incr()
+		}
+	}
+	return err
+}
+
+func doUploadChunk(ctx context.Context, client rest.Client, uploadPath string, data []byte) error {
 
 	resp, err := client.
 		WithHeader("Content-Type", "application/json").

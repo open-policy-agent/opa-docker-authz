@@ -147,7 +147,7 @@ github.com/lestrrat-go/option/v2
 # github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822
 ## explicit
 github.com/munnerz/goautoneg
-# github.com/open-policy-agent/opa v1.21.3
+# github.com/open-policy-agent/opa v1.22.0
 ## explicit; go 1.26.0
 github.com/open-policy-agent/opa/capabilities
 github.com/open-policy-agent/opa/internal/bundle
@@ -176,6 +176,8 @@ github.com/open-policy-agent/opa/internal/methodlesstemplate
 github.com/open-policy-agent/opa/internal/methodlesstemplate/internal/fmtsort
 github.com/open-policy-agent/opa/internal/pathwatcher
 github.com/open-policy-agent/opa/internal/planner
+github.com/open-policy-agent/opa/internal/pluginset
+github.com/open-policy-agent/opa/internal/prefixtrie
 github.com/open-policy-agent/opa/internal/providers/aws
 github.com/open-policy-agent/opa/internal/providers/aws/crypto
 github.com/open-policy-agent/opa/internal/providers/aws/v4
@@ -285,9 +287,6 @@ github.com/prometheus/common/model
 github.com/prometheus/procfs
 github.com/prometheus/procfs/internal/fs
 github.com/prometheus/procfs/internal/util
-# github.com/rcrowley/go-metrics v0.0.0-20250401214520-65e299d6c5c9
-## explicit
-github.com/rcrowley/go-metrics
 # github.com/segmentio/asm v1.2.1
 ## explicit; go 1.18
 github.com/segmentio/asm/base64
@@ -300,9 +299,6 @@ github.com/segmentio/asm/internal/unsafebytes
 # github.com/sirupsen/logrus v1.10.2
 ## explicit; go 1.23
 github.com/sirupsen/logrus
-# github.com/tchap/go-patricia/v2 v2.3.3
-## explicit; go 1.16
-github.com/tchap/go-patricia/v2/patricia
 # github.com/tetratelabs/wazero v1.12.0
 ## explicit; go 1.25.0
 github.com/tetratelabs/wazero
@@ -341,7 +337,7 @@ github.com/tetratelabs/wazero/sys
 ## explicit; go 1.24
 github.com/valyala/fastjson
 github.com/valyala/fastjson/fastfloat
-# github.com/vektah/gqlparser/v2 v2.5.37
+# github.com/vektah/gqlparser/v2 v2.5.58
 ## explicit; go 1.22
 github.com/vektah/gqlparser/v2/ast
 github.com/vektah/gqlparser/v2/gqlerror

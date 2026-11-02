@@ -76,23 +76,16 @@ func (vc *VerificationConfig) UnsignedDeltaBundlesAllowed() bool {
 func (vc *VerificationConfig) ValidateAndInjectDefaults(keys map[string]*KeyConfig) error {
 	// This is only reachable from an explicit `signing` block. Such a block with
 	// no keys to verify against can never load a signed bundle, so reject it here
-	// rather than starting up with a config that cannot work.
-	if len(keys) == 0 {
+	// rather than starting up with a config that cannot work. A block naming a
+	// key id falls through to the lookup below, which reports the missing key.
+	if len(keys) == 0 && vc.KeyID == "" {
 		return errors.New("no verification keys configured")
 	}
 
 	vc.PublicKeys = keys
 
 	if vc.KeyID != "" {
-		found := false
-		for key := range keys {
-			if key == vc.KeyID {
-				found = true
-				break
-			}
-		}
-
-		if !found {
+		if _, found := keys[vc.KeyID]; !found {
 			return fmt.Errorf("key id %s not found", vc.KeyID)
 		}
 	}
@@ -159,7 +152,7 @@ func (s *SigningConfig) GetPrivateKey() (any, error) {
 			if err != nil {
 				return nil, err
 			}
-			keyData = string(bs)
+			keyData = util.ByteSliceToString(bs)
 		} else if os.IsNotExist(err) {
 			// Not a file, treat as raw key data
 			keyData = s.Key
@@ -170,11 +163,11 @@ func (s *SigningConfig) GetPrivateKey() (any, error) {
 
 	// For HMAC algorithms, return the key as bytes
 	if alg == jwa.HS256() || alg == jwa.HS384() || alg == jwa.HS512() {
-		return []byte(keyData), nil
+		return util.StringToByteSlice(keyData), nil
 	}
 
 	// For RSA/ECDSA algorithms, parse the PEM-encoded key
-	block, _ := pem.Decode([]byte(keyData))
+	block, _ := pem.Decode(util.StringToByteSlice(keyData))
 	if block == nil {
 		return nil, errors.New("failed to parse PEM block containing the key")
 	}
