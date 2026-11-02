@@ -206,7 +206,7 @@ func New(parsedConfig *Config, manager *plugins.Manager) *Plugin {
 		queryCh:        make(chan chan *UpdateRequestV1),
 		logger:         manager.Logger().WithFields(map[string]any{"plugin": Name}),
 		trigger:        make(chan trigger),
-		collectors:     newCollectors(parsedConfig.PrometheusConfig),
+		collectors:     newCollectors(parsedConfig.PrometheusConfig, manager),
 	}
 
 	p.manager.UpdatePluginStatus(Name, &plugins.Status{State: plugins.StateNotReady})
@@ -572,6 +572,15 @@ func (p *Plugin) updatePrometheusMetrics(u *UpdateRequestV1) {
 	p.collectors.pluginStatus.Reset()
 	for name, plugin := range u.Plugins {
 		p.collectors.pluginStatus.WithLabelValues(name, string(plugin.State)).Set(1)
+	}
+	p.collectors.decisionLogsStatus.Reset()
+	if dl := u.DecisionLogs; dl != nil {
+		p.collectors.decisionLogsStatus.WithLabelValues(dl.Code, dl.HTTPCode.String()).Set(1)
+	}
+	for _, all := range u.Metrics {
+		if all, ok := all.(map[string]any); ok {
+			p.collectors.decisionLogsCounters.update(all)
+		}
 	}
 	p.collectors.lastSuccessfulActivation.Reset()
 	for _, bundle := range u.Bundles {
