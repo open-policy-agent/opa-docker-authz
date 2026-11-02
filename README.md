@@ -151,6 +151,8 @@ has the schema
 ```
 
 where 'Resolved' is either the empty string ("") or the full host path that corresponds to `Source` after resolving any symbolic links. 
+Like Docker, `..` elements are removed lexically before symbolic links are resolved, and path elements that do not exist yet (which Docker
+creates when the container starts) are kept as they are.
 This allows for effective policy checking of bind mount sources, including where the true source path is obfuscated with symlinks. This
 mitigates against a known trivial bypass of policy that check for binds, for example
 
