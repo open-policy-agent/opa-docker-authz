@@ -10,9 +10,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/url"
 	"os"
@@ -223,15 +225,78 @@ func listBindMounts(body map[string]interface{}) []BindMount {
 	// resolve bind mount paths to symlink targets
 	// and expand /example/../ to avoid bypassing rules
 	for idx, bindMount := range result {
-		resolved, err := filepath.EvalSymlinks(bindMount.Source)
+		resolved, err := resolvePath(bindMount.Source)
 		if err == nil {
-			resolved = filepath.Clean(resolved)
 			result[idx].Resolved = resolved
 		}
-
 	}
 
 	return result
+}
+
+// maxSymlinks limits the number of symlinks followed by resolvePath, in order
+// to detect symlink loops.
+const maxSymlinks = 255
+
+// resolvePath returns the host path that Docker bind mounts for the given
+// source path. Like Docker, the path is first cleaned lexically, after which
+// any symlinks are followed. Unlike filepath.EvalSymlinks, path components that
+// do not exist are kept as is rather than causing an error, since Docker
+// creates missing bind mount sources on demand. This prevents policy checks on
+// the resolved path from being bypassed by appending a non-existent
+// subdirectory to a symlink.
+func resolvePath(source string) (string, error) {
+	if !filepath.IsAbs(source) {
+		return "", fmt.Errorf("path %q is not absolute", source)
+	}
+
+	resolved := "/"
+	rest := filepath.Clean(source)
+	symlinks := 0
+
+	for rest != "" {
+		var name string
+		name, rest, _ = strings.Cut(rest, "/")
+
+		switch name {
+		case "", ".":
+			continue
+		case "..":
+			resolved = filepath.Dir(resolved)
+			continue
+		}
+
+		next := filepath.Join(resolved, name)
+
+		fi, err := os.Lstat(next)
+		if errors.Is(err, fs.ErrNotExist) {
+			resolved = next
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		if fi.Mode()&fs.ModeSymlink == 0 {
+			resolved = next
+			continue
+		}
+
+		symlinks++
+		if symlinks > maxSymlinks {
+			return "", fmt.Errorf("path %q contains too many levels of symlinks", source)
+		}
+
+		target, err := os.Readlink(next)
+		if err != nil {
+			return "", err
+		}
+		if filepath.IsAbs(target) {
+			resolved = "/"
+		}
+		rest = target + "/" + rest
+	}
+
+	return resolved, nil
 }
 
 func makeInput(r authorization.Request) (interface{}, error) {
